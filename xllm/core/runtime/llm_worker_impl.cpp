@@ -101,8 +101,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step(const ForwardInput& inputs) {
     eplb_executor_->eplb_execute(inputs.eplb_info);
   }
   std::vector<folly::SemiFuture<bool>> futures;
-  if (options_.instance_role() == InstanceRole::PREFILL &&
-      options_.kv_cache_transfer_mode() == "PUSH" &&
+  if (options_.kv_cache_transfer_mode() == "PUSH" &&
       !inputs.transfer_kv_infos.empty()) {
 #if defined(USE_NPU)
     std::shared_ptr<NPULayerSynchronizerImpl> layer_synchronizer =
@@ -139,14 +138,12 @@ std::optional<ForwardOutput> LLMWorkerImpl::step(const ForwardInput& inputs) {
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_ &&
       !options_.enable_speculative_decode()) {
 #if defined(USE_NPU)
-    // torch::npu::synchronize();
     aclrtSynchronizeStream(
         c10_npu::getCurrentNPUStream(device_.index()).stream());
 #elif defined(USE_MLU)
     // TODO(mlu): implement mlu synchronize stream
 #endif
-    if (options_.instance_role() == InstanceRole::PREFILL &&
-        options_.kv_cache_transfer_mode() == "PUSH" &&
+    if (options_.kv_cache_transfer_mode() == "PUSH" &&
         !inputs.transfer_kv_infos.empty()) {
       auto results =
           folly::collectAll(futures).within(std::chrono::seconds(60)).get();
@@ -195,8 +192,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step(const ForwardInput& inputs) {
   // TODO(mlu): implement mlu synchronize stream
 #endif
 
-  if (options_.instance_role() == InstanceRole::PREFILL &&
-      options_.kv_cache_transfer_mode() == "PUSH" &&
+  if (options_.kv_cache_transfer_mode() == "PUSH" &&
       !inputs.transfer_kv_infos.empty()) {
     auto results =
         folly::collectAll(futures).within(std::chrono::seconds(60)).get();
