@@ -256,8 +256,8 @@ class DeepseekV2MtpForCausalLMImpl : public torch::nn::Module {
 
   // load model
   void load_model(std::unique_ptr<ModelLoader> loader) {
-    for (const auto& state_dict : loader->get_state_dicts()) {
-      model_->load_state_dict(state_dict->get_dict_with_prefix("model."));
+    for (const auto& state_dict : *loader) {
+      model_->load_state_dict(state_dict.get_dict_with_prefix("model."));
       // lm_head_->load_state_dict(state_dict.get_dict_with_prefix("model.shared_head.head."));
     }
 

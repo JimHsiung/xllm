@@ -31,7 +31,9 @@ class HFModelLoader : public ModelLoader {
 
   std::unique_ptr<Tokenizer> tokenizer() const override;
 
-  std::vector<std::unique_ptr<StateDict>>& get_state_dicts() override;
+  StateDictIterator begin() const override;
+
+  StateDictIterator end() const override;
 
  private:
   bool load_args(const std::string& model_weights_path);
@@ -46,8 +48,5 @@ class HFModelLoader : public ModelLoader {
 
   // sorted model weights files
   std::vector<std::string> model_weights_files_;
-
-  // models weights tensors
-  std::vector<std::unique_ptr<StateDict>> state_dicts_;
 };
 }  // namespace xllm

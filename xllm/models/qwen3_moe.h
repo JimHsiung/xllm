@@ -263,9 +263,9 @@ class Qwen3MoeForCausalLMImpl : public torch::nn::Module {
   }
 
   void load_model(std::unique_ptr<ModelLoader> loader) {
-    for (const auto& state_dict : loader->get_state_dicts()) {
-      model_->load_state_dict(state_dict->get_dict_with_prefix("model."));
-      lm_head_->load_state_dict(state_dict->get_dict_with_prefix("lm_head."));
+    for (const auto& state_dict : *loader) {
+      model_->load_state_dict(state_dict.get_dict_with_prefix("model."));
+      lm_head_->load_state_dict(state_dict.get_dict_with_prefix("lm_head."));
     }
 
     // verify

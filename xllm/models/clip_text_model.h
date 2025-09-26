@@ -787,9 +787,9 @@ class CLIPTextModelImpl : public torch::nn::Module {
 
   void load_model(std::unique_ptr<ModelLoader> loader) {
     LOG(INFO) << "Loading CLIPTextModel from ModelLoader...";
-    for (const auto& state_dict : loader->get_state_dicts()) {
+    for (const auto& state_dict : *loader) {
       transformer_->load_state_dict(
-          state_dict->get_dict_with_prefix("text_model."));
+          state_dict.get_dict_with_prefix("text_model."));
     }
 
     // verify

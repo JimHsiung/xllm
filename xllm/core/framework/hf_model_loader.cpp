@@ -57,17 +57,12 @@ std::unique_ptr<Tokenizer> HFModelLoader::tokenizer() const {
                                             tokenizer_args_);
 }
 
-std::vector<std::unique_ptr<StateDict>>& HFModelLoader::get_state_dicts() {
-  if (state_dicts_.empty()) {
-    // load state dict
-    state_dicts_.reserve(model_weights_files_.size());
-    for (auto& model_weights_file : model_weights_files_) {
-      LOG(INFO) << "Loading model weights from " << model_weights_file;
-      state_dicts_.emplace_back(
-          StateDictFromSafeTensor::load(model_weights_file));
-    }
-  }
-  return state_dicts_;
+StateDictIterator HFModelLoader::begin() const {
+  return StateDictIterator(model_weights_files_, 0);
+}
+
+StateDictIterator HFModelLoader::end() const {
+  return StateDictIterator(model_weights_files_, model_weights_files_.size());
 }
 
 bool HFModelLoader::load_args(const std::string& model_weights_path) {

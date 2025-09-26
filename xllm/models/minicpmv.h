@@ -1230,14 +1230,14 @@ class MiniCPMV2_6Impl : public torch::nn::Module {
 
   void load_model(std::unique_ptr<ModelLoader> loader) {
     // load weight
-    for (const auto& state_dict : loader->get_state_dicts()) {
+    for (const auto& state_dict : *loader) {
       if (!model_args_.image_embedding_mode()) {
         if (use_vision_adapter_)
-          mlp_->load_state_dict(state_dict->get_dict_with_prefix("mlp."));
+          mlp_->load_state_dict(state_dict.get_dict_with_prefix("mlp."));
       }
       resampler_->load_state_dict(
-          state_dict->get_dict_with_prefix("resampler."));
-      vpm_->load_state_dict(state_dict->get_dict_with_prefix("vpm."));
+          state_dict.get_dict_with_prefix("resampler."));
+      vpm_->load_state_dict(state_dict.get_dict_with_prefix("vpm."));
     }
     language_model_->load_model(std::move(loader),
                                 "llm.");  // llm. weight name prefix

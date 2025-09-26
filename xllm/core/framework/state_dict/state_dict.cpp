@@ -204,4 +204,15 @@ std::unique_ptr<StateDict> StateDictFromSafeTensor::load(
                                                    std::move(dict));
 }
 
+const StateDict* StateDictIterator::get_state_dict() const {
+  CHECK(index_ < model_weights_files_.size());
+
+  // lazy loading
+  if (!state_dict_) {
+    LOG(INFO) << "Loading model weights from " << model_weights_files_[index_];
+    state_dict_ = StateDictFromSafeTensor::load(model_weights_files_[index_]);
+  }
+  return state_dict_.get();
+}
+
 }  // namespace xllm

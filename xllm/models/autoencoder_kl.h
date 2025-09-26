@@ -2146,11 +2146,11 @@ class VAEImpl : public torch::nn::Module {
   // TODO: Implement the forward method
 
   void load_model(std::unique_ptr<ModelLoader> loader) {
-    for (const auto& state_dict : loader->get_state_dicts()) {
-      encoder_->load_state_dict(state_dict->get_dict_with_prefix("encoder."));
-      decoder_->load_state_dict(state_dict->get_dict_with_prefix("decoder."));
+    for (const auto& state_dict : *loader) {
+      encoder_->load_state_dict(state_dict.get_dict_with_prefix("encoder."));
+      decoder_->load_state_dict(state_dict.get_dict_with_prefix("decoder."));
       if (args_.use_quant_conv()) {
-        const auto weight = state_dict->get_tensor("quant_conv.weight");
+        const auto weight = state_dict.get_tensor("quant_conv.weight");
         if (weight.defined()) {
           DCHECK_EQ(quant_conv_->weight.sizes(), weight.sizes())
               << "quant_conv weight size mismatch";
@@ -2158,7 +2158,7 @@ class VAEImpl : public torch::nn::Module {
           is_quant_conv_loaded = true;
         }
 
-        const auto bias = state_dict->get_tensor("quant_conv.bias");
+        const auto bias = state_dict.get_tensor("quant_conv.bias");
         if (bias.defined() && quant_conv_->bias.defined()) {
           DCHECK_EQ(quant_conv_->bias.sizes(), bias.sizes())
               << "quant_conv bias size mismatch";
@@ -2166,13 +2166,13 @@ class VAEImpl : public torch::nn::Module {
         }
       }
       if (args_.use_post_quant_conv()) {
-        const auto weight = state_dict->get_tensor("post_quant_conv.weight");
+        const auto weight = state_dict.get_tensor("post_quant_conv.weight");
         if (weight.defined()) {
           post_quant_conv_->weight.data().copy_(weight);
           is_post_quant_conv_loaded = true;
         }
 
-        const auto bias = state_dict->get_tensor("post_quant_conv.bias");
+        const auto bias = state_dict.get_tensor("post_quant_conv.bias");
         if (bias.defined() && post_quant_conv_->bias.defined()) {
           post_quant_conv_->bias.data().copy_(bias);
         }

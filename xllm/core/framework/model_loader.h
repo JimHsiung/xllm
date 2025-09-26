@@ -40,7 +40,8 @@ class ModelLoader {
     return tokenizer_args_;
   }
   virtual std::unique_ptr<Tokenizer> tokenizer() const = 0;
-  virtual std::vector<std::unique_ptr<StateDict>>& get_state_dicts() = 0;
+  virtual StateDictIterator begin() const = 0;
+  virtual StateDictIterator end() const = 0;
   virtual std::string model_weights_path() const = 0;
 
  protected:

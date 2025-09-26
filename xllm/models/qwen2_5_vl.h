@@ -736,8 +736,8 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
   }
 
   void load_model(std::unique_ptr<ModelLoader> loader) {
-    for (const auto& state_dict : loader->get_state_dicts()) {
-      visual_->load_state_dict(state_dict->get_dict_with_prefix("visual."));
+    for (const auto& state_dict : *loader) {
+      visual_->load_state_dict(state_dict.get_dict_with_prefix("visual."));
     }
     // verify
     visual_->verify_loaded_weights("visual.");

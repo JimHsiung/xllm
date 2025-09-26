@@ -940,8 +940,8 @@ class T5EncoderModelImpl : public torch::nn::Module {
   }
 
   void load_model(std::unique_ptr<ModelLoader> loader) {
-    for (const auto& state_dict : loader->get_state_dicts()) {
-      const auto embedding_weight = state_dict->get_tensor("shared.weight");
+    for (const auto& state_dict : *loader) {
+      const auto embedding_weight = state_dict.get_tensor("shared.weight");
       if (embedding_weight.defined()) {
         DCHECK_EQ(embedding_weight.sizes(), embed_tokens_->weight.sizes())
             << "Embedding weight size mismatch: expected "
@@ -950,7 +950,7 @@ class T5EncoderModelImpl : public torch::nn::Module {
         embed_tokens_->weight.data().copy_(embedding_weight);
       }
       const auto final_layer_norm_weight =
-          state_dict->get_tensor("encoder.final_layer_norm.weight");
+          state_dict.get_tensor("encoder.final_layer_norm.weight");
       if (final_layer_norm_weight.defined()) {
         DCHECK_EQ(final_layer_norm_weight.sizes(),
                   final_layer_norm_->weight.sizes())
@@ -962,7 +962,7 @@ class T5EncoderModelImpl : public torch::nn::Module {
       for (int64_t i = 0; i < blocks_.size(); ++i) {
         const auto block_prefix = "encoder.block." + std::to_string(i) + ".";
         blocks_[i]->load_state_dict(
-            state_dict->get_dict_with_prefix(block_prefix));
+            state_dict.get_dict_with_prefix(block_prefix));
       }
     }
     LOG(INFO) << "T5EncoderModel loaded successfully.";

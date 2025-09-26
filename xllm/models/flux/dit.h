@@ -1899,28 +1899,28 @@ class FluxTransformer2DModelImpl : public torch::nn::Module {
     proj_out_->to(device_);
     // Load model parameters from the loader
     LOG(INFO) << "load weights for FluxTransformereDModel";
-    for (const auto& state_dict : loader->get_state_dicts()) {
+    for (const auto& state_dict : *loader) {
       // context_embedder
-      const auto weight = state_dict->get_tensor("context_embedder.weight");
+      const auto weight = state_dict.get_tensor("context_embedder.weight");
       if (weight.defined()) {
         DCHECK_EQ(weight.sizes(), context_embedder_->weight.sizes())
             << "context_embedder weight size mismatch";
         context_embedder_->weight.data().copy_(weight.to(dtype_).to(device_));
       }
-      const auto bias = state_dict->get_tensor("context_embedder.bias");
+      const auto bias = state_dict.get_tensor("context_embedder.bias");
       if (bias.defined()) {
         DCHECK_EQ(bias.sizes(), context_embedder_->bias.sizes())
             << "context_embedder bias size mismatch";
         context_embedder_->bias.data().copy_(bias.to(dtype_).to(device_));
       }
       // x_embedder
-      const auto x_weight = state_dict->get_tensor("x_embedder.weight");
+      const auto x_weight = state_dict.get_tensor("x_embedder.weight");
       if (x_weight.defined()) {
         DCHECK_EQ(x_weight.sizes(), x_embedder_->weight.sizes())
             << "x_embedder weight size mismatch";
         x_embedder_->weight.data().copy_(x_weight.to(dtype_).to(device_));
       }
-      const auto x_bias = state_dict->get_tensor("x_embedder.bias");
+      const auto x_bias = state_dict.get_tensor("x_embedder.bias");
       if (x_bias.defined()) {
         DCHECK_EQ(x_bias.sizes(), x_embedder_->bias.sizes())
             << "x_embedder bias size mismatch";
@@ -1929,34 +1929,34 @@ class FluxTransformer2DModelImpl : public torch::nn::Module {
       // time_text_embed
       if (time_text_embed_) {
         time_text_embed_->load_state_dict(
-            state_dict->get_dict_with_prefix("time_text_embed."));
+            state_dict.get_dict_with_prefix("time_text_embed."));
       } else {
         time_text_guidance_embed_->load_state_dict(
-            state_dict->get_dict_with_prefix("time_text_embed."));
+            state_dict.get_dict_with_prefix("time_text_embed."));
       }
       // transformer_blocks
       for (int64_t i = 0; i < transformer_blocks_->size(); ++i) {
         auto block = transformer_blocks_[i]->as<FluxTransformerBlock>();
-        block->load_state_dict(state_dict->get_dict_with_prefix(
+        block->load_state_dict(state_dict.get_dict_with_prefix(
             "transformer_blocks." + std::to_string(i) + "."));
       }
       // single_transformer_blocks
       for (int64_t i = 0; i < single_transformer_blocks_->size(); ++i) {
         auto block =
             single_transformer_blocks_[i]->as<FluxSingleTransformerBlock>();
-        block->load_state_dict(state_dict->get_dict_with_prefix(
+        block->load_state_dict(state_dict.get_dict_with_prefix(
             "single_transformer_blocks." + std::to_string(i) + "."));
       }
       // norm_out
-      norm_out_->load_state_dict(state_dict->get_dict_with_prefix("norm_out."));
+      norm_out_->load_state_dict(state_dict.get_dict_with_prefix("norm_out."));
       // proj_out
-      const auto proj_out_weight = state_dict->get_tensor("proj_out.weight");
+      const auto proj_out_weight = state_dict.get_tensor("proj_out.weight");
       if (proj_out_weight.defined()) {
         DCHECK_EQ(proj_out_weight.sizes(), proj_out_->weight.sizes())
             << "proj_out weight size mismatch";
         proj_out_->weight.data().copy_(proj_out_weight.to(dtype_).to(device_));
       }
-      const auto proj_out_bias = state_dict->get_tensor("proj_out.bias");
+      const auto proj_out_bias = state_dict.get_tensor("proj_out.bias");
       if (proj_out_bias.defined()) {
         DCHECK_EQ(proj_out_bias.sizes(), proj_out_->bias.sizes())
             << "proj_out bias size mismatch";

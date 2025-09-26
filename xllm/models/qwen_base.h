@@ -355,15 +355,15 @@ class QWenForCausalLMImplBase : public torch::nn::Module {
 
   void load_model(std::unique_ptr<ModelLoader> loader,
                   std::string prefix = "" /*llm model weight prefix*/) {
-    for (const auto& state_dict : loader->get_state_dicts()) {
+    for (const auto& state_dict : *loader) {
       model_->load_state_dict(
-          state_dict->get_dict_with_prefix(prefix + "model."));
+          state_dict.get_dict_with_prefix(prefix + "model."));
       if (tie_word_embeddings) {
         lm_head_->load_state_dict(
-            state_dict->get_dict_with_prefix(prefix + "model.embed_tokens."));
+            state_dict.get_dict_with_prefix(prefix + "model.embed_tokens."));
       } else {
         lm_head_->load_state_dict(
-            state_dict->get_dict_with_prefix(prefix + "lm_head."));
+            state_dict.get_dict_with_prefix(prefix + "lm_head."));
       }
     }
     // verify

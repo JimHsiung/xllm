@@ -78,4 +78,40 @@ class StateDictFromSafeTensor : public StateDict {
   std::unique_ptr<folly::MemoryMapping> mem_map_;
 };
 
+class StateDictIterator {
+ public:
+  StateDictIterator(const std::vector<std::string>& model_weights_files,
+                    size_t index)
+      : model_weights_files_(model_weights_files), index_(index) {}
+
+  virtual ~StateDictIterator() = default;
+
+  void operator++() {
+    state_dict_.reset();
+    index_++;
+  }
+
+  const StateDict& operator*() const { return *get_state_dict(); }
+
+  const StateDict* operator->() const { return get_state_dict(); }
+
+  bool operator==(const StateDictIterator& other) const {
+    return model_weights_files_ == other.model_weights_files_ &&
+           index_ == other.index_;
+  }
+
+  bool operator!=(const StateDictIterator& other) const {
+    return !(*this == other);
+  }
+
+ private:
+  const StateDict* get_state_dict() const;
+
+  std::vector<std::string> model_weights_files_;
+
+  size_t index_ = 0;
+
+  mutable std::unique_ptr<StateDict> state_dict_;
+};
+
 }  // namespace xllm
