@@ -343,6 +343,25 @@ class Qwen3MoeForCausalLMImpl : public LlmForCausalLMImplBase<Qwen3MoeModel> {
  public:
   Qwen3MoeForCausalLMImpl(const ModelContext& context)
       : LlmForCausalLMImplBase<Qwen3MoeModel>(context) {}
+
+  std::vector<at::Tensor>& get_decoder_layer_weight(int32_t id) {
+    static std::vector<at::Tensor> empty_vector;
+    return empty_vector;
+  }
+  std::vector<at::Tensor>& get_lm_head_weight() {
+    static std::vector<at::Tensor> empty_vector;
+    return empty_vector;
+  }
+  std::vector<at::Tensor>& get_word_embedding_weight() {
+    static std::vector<at::Tensor> empty_vector;
+    return empty_vector;
+  }
+  std::vector<at::Tensor>& get_norm_weight() {
+    static std::vector<at::Tensor> empty_vector;
+    return empty_vector;
+  }
+
+  void refresh_loaded_weights() {}
 };
 TORCH_MODULE(Qwen3MoeForCausalLM);
 

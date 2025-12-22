@@ -75,6 +75,7 @@ cc_library(
     $<$<BOOL:${USE_NPU}>:atb_customize>
     $<$<BOOL:${USE_NPU}>:platform_npu>
     :eplb
+    :weight_transfer
     glog::glog
     Folly::folly
     absl::strings

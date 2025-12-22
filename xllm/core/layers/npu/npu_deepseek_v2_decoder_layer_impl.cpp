@@ -520,6 +520,16 @@ void NpuDeepseekV2DecoderLayerImpl::merge_loaded_weights() {
   init_layer();
 }
 
+void NpuDeepseekV2DecoderLayerImpl::refresh_loaded_weights() {
+  auto& at_weight_tensors = loader_->get_at_weight_tensors();
+  c10_npu::NPUCachingAllocator::emptyCache();
+  for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
+    atb_weight_tensors_[i] =
+        atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[i]);
+  }
+  init_layer();
+}
+
 torch::Tensor NpuDeepseekV2DecoderLayerImpl::build_expert_routing_map(
     std::vector<int32_t> expert_lists) {
   std::unordered_map<int64_t, std::vector<int64_t>> expert_routing_map;
@@ -1012,3 +1022,4 @@ void NpuDeepseekV2DecoderLayerImpl::build_node_variant_pack(
 
 }  // namespace layer
 }  // namespace xllm
+

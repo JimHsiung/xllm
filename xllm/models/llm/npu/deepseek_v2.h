@@ -63,11 +63,19 @@ class DeepseekV2DecoderLayerImpl : public torch::nn::Module {
 
   void merge_loaded_weights() { decoder_layer_->merge_loaded_weights(); }
 
+  void refresh_loaded_weights() {
+    decoder_layer_->refresh_loaded_weights();
+  }
+
   void prepare_expert_weight(const std::vector<int32_t>& expert_list) {
     decoder_layer_->prepare_expert_weight(expert_list);
   }
 
   void update_expert_weight() { decoder_layer_->update_expert_weight(); }
+
+  std::vector<at::Tensor>& get_decoder_layer_weight() {
+    return decoder_layer_->get_at_weight_tensors();
+  }
 
  private:
   layer::NpuDeepseekV2DecoderLayer decoder_layer_{nullptr};
@@ -212,6 +220,14 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
     norm_->merge_loaded_weights();
   }
 
+  void refresh_loaded_weights() {
+    npu_embed_tokens_->refresh_loaded_weights();
+    for (int i = 0; i < layers_.size(); i++) {
+      layers_[i]->refresh_loaded_weights();
+    }
+    norm_->refresh_loaded_weights();
+  }
+
   void prepare_expert_weight(int32_t layer_id,
                              const std::vector<int32_t>& expert_ids) {
     layers_[layer_id]->prepare_expert_weight(expert_ids);
@@ -225,6 +241,18 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
 
   void set_npu_word_embedding(layer::NpuWordEmbedding& npu_word_embedding) {
     npu_embed_tokens_ = npu_word_embedding;
+  }
+
+  std::vector<at::Tensor>& get_word_embedding_weight() {
+    return npu_embed_tokens_->get_at_weight_tensors();
+  }
+
+  std::vector<at::Tensor>& get_norm_weight() {
+    return norm_->get_at_weight_tensors();
+  }
+
+  std::vector<at::Tensor>& get_decoder_layer_weight_by_id(int32_t layer_id) {
+    return layers_[layer_id]->get_decoder_layer_weight();
   }
 
  private:

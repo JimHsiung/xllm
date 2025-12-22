@@ -49,6 +49,8 @@ class NpuWordEmbeddingImpl : public BaseLayer {
 
   void merge_loaded_weights() override;
 
+  void refresh_loaded_weights() override;
+
   void param_from_args(atb_speed::common::WordEmbeddingParam& param,
                        const xllm::ModelArgs& args,
                        const xllm::ParallelArgs& parallel_args);
