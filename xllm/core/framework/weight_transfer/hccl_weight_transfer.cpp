@@ -1,6 +1,7 @@
 #include "hccl_weight_transfer.h"
 
 #include <glog/logging.h>
+#include <torch_npu/csrc/core/npu/NPUFormat.h>
 
 #include "util/net.h"  // 假设你有获取 local ip 的工具
 
@@ -48,6 +49,7 @@ class WeightTransferServiceImpl : public xllm::proto::WeightTransferService {
       for (int i = 0; i < t.dim(); ++i) {
         meta->add_shape(t.size(i));
       }
+      meta->set_npu_format(at_npu::native::get_npu_format(t));
     }
   }
 
@@ -85,7 +87,6 @@ HcclWeightTransfer::~HcclWeightTransfer() {
 void HcclWeightTransfer::register_layer(
     int32_t layer_id,
     const std::vector<at::Tensor>& tensors) {
-  LOG(INFO) << "layer_id: " << layer_id;
   layer_registry_[layer_id] = tensors;
 }
 
@@ -305,7 +306,8 @@ bool HcclWeightTransfer::pull_layer(int32_t layer_id,
                        .dtype(static_cast<at::ScalarType>(meta.dtype()))
                        .device("npu:" + std::to_string(device_id_));
 
-    local_tensors[i] = torch::empty(shape, options);
+    local_tensors[i] =
+        at_npu::native::empty_with_format(shape, options, meta.npu_format());
   }
 
   rpc_thread_pool_->schedule([this, layer_id]() {
