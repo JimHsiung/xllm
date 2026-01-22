@@ -15,7 +15,6 @@ cc_library(
     glog::glog
     torch
     $<$<BOOL:${USE_NPU}>:torch_npu>
-    $<$<BOOL:${USE_NPU}>:hccl_transfer>
     proto::xllm_proto
     :util
     brpc

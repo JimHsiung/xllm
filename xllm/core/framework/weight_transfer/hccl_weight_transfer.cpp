@@ -3,7 +3,7 @@
 #include <glog/logging.h>
 #include <torch_npu/csrc/core/npu/NPUFormat.h>
 
-#include "util/net.h"  // 假设你有获取 local ip 的工具
+#include "util/net.h"
 
 namespace xllm {
 
@@ -73,8 +73,8 @@ HcclWeightTransfer::HcclWeightTransfer(int32_t device_id, int32_t listen_port)
 
   std::string ip = net::get_local_ip_addr();
   local_addr_ = ip + ":" + std::to_string(listen_port);
-  hccl_thread_pool_ = std::make_shared<hccl_transfer::ThreadPool>();
-  rpc_thread_pool_ = std::make_shared<hccl_transfer::ThreadPool>();
+  hccl_thread_pool_ = std::make_shared<ThreadPool>();
+  rpc_thread_pool_ = std::make_shared<ThreadPool>();
 }
 
 HcclWeightTransfer::~HcclWeightTransfer() {
@@ -133,15 +133,15 @@ bool HcclWeightTransfer::handle_init_comm(const std::string& remote_addr,
 void HcclWeightTransfer::process_send_request(int32_t layer_id) {
   int wait_retry = 0;
   while (!is_comm_initialized_) {
-    if (wait_retry % 100 == 0) {  // 每 1秒打印一次日志
+    if (wait_retry % 100 == 0) {
       LOG(WARNING)
           << "Sender: Waiting for HCCL Init to finish before sending layer "
           << layer_id << "...";
     }
-    usleep(10000);  // 睡眠 10ms
+    usleep(10000);
     wait_retry++;
 
-    if (wait_retry > 2000) {  // 等待超过 20秒 则放弃，防止死锁
+    if (wait_retry > 2000) {
       LOG(ERROR) << "Sender: FATAL TIMEOUT waiting for HCCL Init.";
       return;
     }
@@ -201,7 +201,7 @@ bool HcclWeightTransfer::connect_to_remote(const std::string& remote_addr) {
   options.connect_timeout_ms = 2000;
   options.max_retry = 3;
 
-  // 1. 初始化 Channel
+  // Initialize Channel
   if (channel_->Init(remote_addr.c_str(), &options) != 0) {
     LOG(ERROR) << "BRPC Channel init failed";
     return false;
@@ -209,7 +209,7 @@ bool HcclWeightTransfer::connect_to_remote(const std::string& remote_addr) {
   stub_ =
       std::make_unique<xllm::proto::WeightTransferService_Stub>(channel_.get());
 
-  // 2. 准备 HCCL Root Info
+  // Prepare HCCL Root Info
   aclrtSetDevice(device_id_);
   HcclRootInfo root_info;
   auto ret = HcclGetRootInfo(&root_info);
@@ -218,9 +218,9 @@ bool HcclWeightTransfer::connect_to_remote(const std::string& remote_addr) {
     return false;
   }
 
-  // 3. 【关键修改】循环尝试连接 (Poling)
-  // Sender 可能正在加载权重，我们需要一直试，直到它端口打开
-  int max_wait_retries = 100;  // 最多等 100 次
+  // Loop to try connecting (Polling)
+  // Sender may be loading weights, we need to keep trying until its port opens
+  int max_wait_retries = 100;  // Wait at most 100 times
   bool connect_success = false;
 
   xllm::proto::InitCommRequest req;
@@ -231,11 +231,11 @@ bool HcclWeightTransfer::connect_to_remote(const std::string& remote_addr) {
   for (int i = 0; i < max_wait_retries; ++i) {
     brpc::Controller cntl;
 
-    // 尝试发起 RPC
+    // Try to initiate RPC
     stub_->InitComm(&cntl, &req, &resp, nullptr);
 
     if (!cntl.Failed()) {
-      // RPC 成功，说明连上了！
+      // RPC succeeded, meaning connection established!
       if (resp.success()) {
         LOG(INFO) << "Receiver: Successfully connected to Sender at "
                   << remote_addr;
@@ -247,14 +247,13 @@ bool HcclWeightTransfer::connect_to_remote(const std::string& remote_addr) {
       }
     }
 
-    // 既然是 Connection refused，说明对方还没起，打印日志并等待
     if (i % 5 == 0) {
       LOG(WARNING) << "Receiver: Waiting for Sender (" << remote_addr
                    << ") to come online... (Attempt " << i + 1 << "/"
                    << max_wait_retries << ")";
     }
 
-    // 睡眠 1 秒后再试
+    // Sleep 1 second before retry
     sleep(1);
   }
 
@@ -265,7 +264,7 @@ bool HcclWeightTransfer::connect_to_remote(const std::string& remote_addr) {
     return false;
   }
 
-  // 4. 接收端初始化 HCCL (Rank 1)
+  // Receiver initializes HCCL (Rank 1)
   LOG(INFO) << "Receiver: Initializing HCCL Comm (Rank 1)...";
   ret = HcclCommInitRootInfo(2, &root_info, 0, &hccl_comm_);
   if (ret != HCCL_SUCCESS) {

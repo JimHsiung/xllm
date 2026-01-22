@@ -296,6 +296,16 @@ void NpuGlm4MoeDecoderImpl::merge_loaded_weights() {
   init_layer();
 }
 
+void NpuGlm4MoeDecoderImpl::refresh_loaded_weights() {
+  auto& at_weight_tensors = loader_->get_at_weight_tensors();
+  c10_npu::NPUCachingAllocator::emptyCache();
+  for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
+    atb_weight_tensors_[i] =
+        atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[i]);
+  }
+  init_layer();
+}
+
 int64_t NpuGlm4MoeDecoderImpl::init_layer() {
   BaseLayer::name_ = "glm4_moe_decoder_layer " + std::to_string(layer_id_);
   model_name_ = "Glm4_Moe";

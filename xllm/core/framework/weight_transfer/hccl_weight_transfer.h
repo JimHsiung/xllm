@@ -4,7 +4,6 @@
 #include <brpc/channel.h>
 #include <brpc/server.h>
 #include <hccl/hccl.h>
-#include <hccl_transfer.h>
 #include <torch/torch.h>
 
 #include <future>
@@ -16,10 +15,10 @@
 #include <vector>
 
 #include "hccl_weight_transfer.pb.h"
+#include "util/threadpool.h"
 
 namespace xllm {
 
-// 前向声明服务实现类
 class WeightTransferServiceImpl;
 
 class HcclWeightTransfer {
@@ -59,8 +58,8 @@ class HcclWeightTransfer {
 
   std::unordered_map<int32_t, std::vector<at::Tensor>> layer_registry_;
 
-  std::shared_ptr<hccl_transfer::ThreadPool> hccl_thread_pool_;
-  std::shared_ptr<hccl_transfer::ThreadPool> rpc_thread_pool_;
+  std::shared_ptr<ThreadPool> hccl_thread_pool_;
+  std::shared_ptr<ThreadPool> rpc_thread_pool_;
 };
 
 }  // namespace xllm

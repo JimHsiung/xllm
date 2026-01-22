@@ -26,7 +26,6 @@ limitations under the License.
 #include "forward_params.h"
 #include "framework/model_context.h"
 #if defined(USE_NPU)
-#include "framework/kv_cache/hccl_kv_cache_transfer.h"
 #include "framework/kv_cache/llm_data_dist_transfer.h"
 #include "framework/weight_transfer/hccl_weight_transfer.h"
 #endif

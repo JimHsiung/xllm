@@ -61,6 +61,12 @@ class Glm4MoeDecoderLayerImpl : public torch::nn::Module {
 
   void merge_loaded_weights() { decoder_layer_->merge_loaded_weights(); }
 
+  void refresh_loaded_weights() { decoder_layer_->refresh_loaded_weights(); }
+
+  std::vector<at::Tensor>& get_decoder_layer_weight() {
+    return decoder_layer_->get_at_weight_tensors();
+  }
+
  private:
   layer::NpuGlm4MoeDecoder decoder_layer_{nullptr};
 };
@@ -255,10 +261,30 @@ class Glm4MoeModelImpl : public torch::nn::Module {
     norm_->merge_loaded_weights();
   }
 
+  void refresh_loaded_weights() {
+    npu_embed_tokens_->refresh_loaded_weights();
+    for (int i = 0; i < layers_.size(); i++) {
+      layers_[i]->refresh_loaded_weights();
+    }
+    norm_->refresh_loaded_weights();
+  }
+
   layer::NpuWordEmbedding get_npu_word_embedding() { return npu_embed_tokens_; }
 
   void set_npu_word_embedding(layer::NpuWordEmbedding& npu_word_embedding) {
     npu_embed_tokens_ = npu_word_embedding;
+  }
+
+  std::vector<at::Tensor>& get_word_embedding_weight() {
+    return npu_embed_tokens_->get_at_weight_tensors();
+  }
+
+  std::vector<at::Tensor>& get_norm_weight() {
+    return norm_->get_at_weight_tensors();
+  }
+
+  std::vector<at::Tensor>& get_decoder_layer_weight_by_id(int32_t layer_id) {
+    return layers_[layer_id]->get_decoder_layer_weight();
   }
 
  private:
@@ -288,25 +314,6 @@ class Glm4MoeForCausalLMImpl : public LlmForCausalLMImplBase<Glm4MoeModel> {
  public:
   Glm4MoeForCausalLMImpl(const ModelContext& context)
       : LlmForCausalLMImplBase<Glm4MoeModel>(context) {}
-
-  std::vector<at::Tensor>& get_decoder_layer_weight(int32_t id) {
-    static std::vector<at::Tensor> empty_vector;
-    return empty_vector;
-  }
-  std::vector<at::Tensor>& get_lm_head_weight() {
-    static std::vector<at::Tensor> empty_vector;
-    return empty_vector;
-  }
-  std::vector<at::Tensor>& get_word_embedding_weight() {
-    static std::vector<at::Tensor> empty_vector;
-    return empty_vector;
-  }
-  std::vector<at::Tensor>& get_norm_weight() {
-    static std::vector<at::Tensor> empty_vector;
-    return empty_vector;
-  }
-
-  void refresh_loaded_weights() {}
 };
 TORCH_MODULE(Glm4MoeForCausalLM);
 
