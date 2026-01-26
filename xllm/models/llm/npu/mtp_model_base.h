@@ -339,6 +339,8 @@ class MtpForCausalLMImplBase : public torch::nn::Module {
 
   void refresh_loaded_weights() {}
 
+  virtual std::vector<int> get_expert_weight_indices() const { return {}; }
+
  protected:
   MtpModelType model_{nullptr};
   layer::NpuLmHead lm_head_{nullptr};

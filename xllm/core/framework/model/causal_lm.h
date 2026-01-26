@@ -153,6 +153,11 @@ class CausalLM : public torch::nn::Module {
     return empty_vector;
   };
 
+  virtual std::vector<int> get_expert_weight_indices() const {
+    static std::vector<int> empty_vector;
+    return empty_vector;
+  }
+
   virtual void refresh_loaded_weights() {};
 };
 
@@ -255,6 +260,10 @@ class CausalLMImpl : public CausalLM {
 
   std::vector<at::Tensor>& get_norm_weight() override {
     return model_->get_norm_weight();
+  }
+
+  std::vector<int> get_expert_weight_indices() const override {
+    return model_->get_expert_weight_indices();
   }
 
   void refresh_loaded_weights() override { model_->refresh_loaded_weights(); }

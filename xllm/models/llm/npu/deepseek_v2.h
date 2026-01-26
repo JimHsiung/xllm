@@ -63,9 +63,7 @@ class DeepseekV2DecoderLayerImpl : public torch::nn::Module {
 
   void merge_loaded_weights() { decoder_layer_->merge_loaded_weights(); }
 
-  void refresh_loaded_weights() {
-    decoder_layer_->refresh_loaded_weights();
-  }
+  void refresh_loaded_weights() { decoder_layer_->refresh_loaded_weights(); }
 
   void prepare_expert_weight(const std::vector<int32_t>& expert_list) {
     decoder_layer_->prepare_expert_weight(expert_list);
@@ -75,6 +73,10 @@ class DeepseekV2DecoderLayerImpl : public torch::nn::Module {
 
   std::vector<at::Tensor>& get_decoder_layer_weight() {
     return decoder_layer_->get_at_weight_tensors();
+  }
+
+  std::vector<int> get_expert_weight_indices() const {
+    return decoder_layer_->get_expert_weight_indices();
   }
 
  private:
@@ -255,6 +257,10 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
     return layers_[layer_id]->get_decoder_layer_weight();
   }
 
+  std::vector<int> get_expert_weight_indices() const {
+    return layers_[0]->get_expert_weight_indices();
+  }
+
  private:
   torch::nn::ModuleList blocks_{nullptr};
   std::vector<DeepseekV2DecoderLayer> layers_;
@@ -291,6 +297,10 @@ class DeepseekV2ForCausalLMImpl
 
   void update_expert_weight(int32_t layer_id) override {
     model_->update_expert_weight(layer_id + first_k_dense_replace_);
+  }
+
+  std::vector<int> get_expert_weight_indices() const override {
+    return model_->get_expert_weight_indices();
   }
 
  private:

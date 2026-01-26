@@ -419,6 +419,8 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
     npu_lm_head_->refresh_loaded_weights();
   }
 
+  virtual std::vector<int> get_expert_weight_indices() const { return {}; }
+
  protected:
   // parameter members, must be registered
   LlmModelType model_{nullptr};

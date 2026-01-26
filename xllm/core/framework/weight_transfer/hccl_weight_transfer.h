@@ -14,6 +14,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "framework/model/causal_lm.h"
+#include "framework/model_context.h"
 #include "hccl_weight_transfer.pb.h"
 #include "util/threadpool.h"
 
@@ -23,7 +25,10 @@ class WeightTransferServiceImpl;
 
 class HcclWeightTransfer {
  public:
-  HcclWeightTransfer(const int32_t device_id, const int32_t listen_port);
+  HcclWeightTransfer(const ModelContext& context,
+                     CausalLM* model,
+                     const int32_t device_id,
+                     const int32_t listen_port);
   ~HcclWeightTransfer();
 
   void register_layer(int32_t layer_id, const std::vector<at::Tensor>& tensors);
@@ -42,6 +47,9 @@ class HcclWeightTransfer {
   std::vector<at::Tensor> get_registered_tensors(int32_t layer_id);
 
  private:
+  ModelContext context_;
+  CausalLM* model_;
+
   int32_t device_id_;
   int32_t listen_port_;
   std::string local_addr_;

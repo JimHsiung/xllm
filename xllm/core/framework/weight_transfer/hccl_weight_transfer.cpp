@@ -66,8 +66,14 @@ class WeightTransferServiceImpl : public xllm::proto::WeightTransferService {
   HcclWeightTransfer* hccl_weight_transfer_;
 };
 
-HcclWeightTransfer::HcclWeightTransfer(int32_t device_id, int32_t listen_port)
-    : device_id_(device_id), listen_port_(listen_port) {
+HcclWeightTransfer::HcclWeightTransfer(const ModelContext& context,
+                                       CausalLM* model,
+                                       const int32_t device_id,
+                                       const int32_t listen_port)
+    : context_(context),
+      model_(model),
+      device_id_(device_id),
+      listen_port_(listen_port) {
   aclrtSetDevice(device_id_);
   aclrtCreateStream(&stream_);
 

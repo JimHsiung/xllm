@@ -577,13 +577,16 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   }
 
   hccl_weight_transfer_ = std::make_unique<HcclWeightTransfer>(
-      device_.index(), options_.weight_transfer_port());
+      context_, model_.get(), device_.index(), options_.weight_transfer_port());
 
   if (options_.weight_load_mode() == "disk") {
     this->load_model(std::move(model_loader));
   } else {
     this->load_model_from_instance(options_.remote_addr());
   }
+
+  auto expert_weight_indices = model_->get_expert_weight_indices();
+  LOG(INFO) << "expert_weight_indices : " << expert_weight_indices;
 
   std::vector<at::Tensor> global_tensors = {
       model_->get_word_embedding_weight()[0],

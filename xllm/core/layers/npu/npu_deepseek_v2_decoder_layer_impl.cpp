@@ -711,6 +711,24 @@ void NpuDeepseekV2DecoderLayerImpl::update_expert_weight() {
   expert_routing_map_ = expert_routing_map_.contiguous();
 }
 
+std::vector<int> NpuDeepseekV2DecoderLayerImpl::get_expert_weight_indices()
+    const {
+  return {
+      IN_MLP_GATEUP_WEIGHT_EXPERT,
+      IN_MLP_GATEUP_BIAS_EXPERT,
+      IN_MLP_GATEUP_DESCALE_EXPERT,
+      IN_MLP_GATEUP_OFFSET_EXPERT,
+      IN_MLP_GATEUP_SCALE_EXPERT,
+      IN_MLP_GATEUP_COMPRESS_IDX_EXPERT,
+      IN_MLP_DOWN_WEIGHT_EXPERT,
+      IN_MLP_DOWN_BIAS_EXPERT,
+      IN_MLP_DOWN_DESCALE_EXPERT,
+      IN_MLP_DOWN_OFFSET_EXPERT,
+      IN_MLP_DOWN_SCALE_EXPERT,
+      IN_MLP_DOWN_COMPRESS_IDX_EXPERT,
+  };
+}
+
 int64_t NpuDeepseekV2DecoderLayerImpl::init_layer() {
   name_ = "deepseek_v2_decoder_layer " + std::to_string(layer_id_);
   model_name_ = "DeepSeek_V2";
@@ -1022,4 +1040,3 @@ void NpuDeepseekV2DecoderLayerImpl::build_node_variant_pack(
 
 }  // namespace layer
 }  // namespace xllm
-
