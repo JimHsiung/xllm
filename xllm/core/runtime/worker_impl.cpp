@@ -579,10 +579,15 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   hccl_weight_transfer_ = std::make_unique<HcclWeightTransfer>(
       context_, model_.get(), device_.index(), options_.weight_transfer_port());
 
+  Timer load_timer;
   if (options_.weight_load_mode() == "disk") {
     this->load_model(std::move(model_loader));
+    LOG(INFO) << "Model loaded from disk. Total time: "
+              << load_timer.elapsed_milliseconds() << " ms";
   } else {
     this->load_model_from_instance(options_.remote_addr());
+    LOG(INFO) << "Model loaded from instance. Total time: "
+              << load_timer.elapsed_milliseconds() << " ms";
   }
 
   auto expert_weight_indices = model_->get_expert_weight_indices();
@@ -627,18 +632,46 @@ void WorkerImpl::load_model_from_instance(const std::string& addr) {
   if (!hccl_weight_transfer_->connect_to_remote(addr)) {
     LOG(FATAL) << "Connect failed";
   }
-  std::vector<at::Tensor> global_tensors;
-  hccl_weight_transfer_->pull_layer(-1, global_tensors);
 
-  model_->get_word_embedding_weight()[0] = global_tensors[0];
-  model_->get_norm_weight()[0] = global_tensors[1];
-  model_->get_lm_head_weight()[0] = global_tensors[2];
-  int32_t num_layers = context_.get_model_args().n_layers();
+  bool use_consolidated_transfer =
+      true;  // Set this to false to use old strategy
 
-  for (int i = 0; i < num_layers; ++i) {
-    auto& layer_tensors = model_->get_decoder_layer_weight(i);
-    hccl_weight_transfer_->pull_layer(i, layer_tensors);
+  if (use_consolidated_transfer) {
+    std::vector<int32_t> layer_ids = {-1};
+    int32_t num_layers = context_.get_model_args().n_layers();
+    for (int i = 0; i < num_layers; ++i) layer_ids.push_back(i);
+
+    std::vector<std::vector<at::Tensor>*> local_tensors_ptrs;
+    static std::vector<at::Tensor> global_tensors;
+    local_tensors_ptrs.push_back(&global_tensors);
+
+    for (int i = 0; i < num_layers; ++i) {
+      local_tensors_ptrs.push_back(&model_->get_decoder_layer_weight(i));
+    }
+
+    if (!hccl_weight_transfer_->pull_weight(layer_ids, local_tensors_ptrs)) {
+      LOG(FATAL) << "Consolidated pull weights failed";
+    }
+
+    model_->get_word_embedding_weight()[0] = global_tensors[0];
+    model_->get_norm_weight()[0] = global_tensors[1];
+    model_->get_lm_head_weight()[0] = global_tensors[2];
+
+  } else {
+    std::vector<at::Tensor> global_tensors;
+    hccl_weight_transfer_->pull_layer(-1, global_tensors);
+
+    model_->get_word_embedding_weight()[0] = global_tensors[0];
+    model_->get_norm_weight()[0] = global_tensors[1];
+    model_->get_lm_head_weight()[0] = global_tensors[2];
+    int32_t num_layers = context_.get_model_args().n_layers();
+
+    for (int i = 0; i < num_layers; ++i) {
+      auto& layer_tensors = model_->get_decoder_layer_weight(i);
+      hccl_weight_transfer_->pull_layer(i, layer_tensors);
+    }
   }
+
   model_->refresh_loaded_weights();
 }
 

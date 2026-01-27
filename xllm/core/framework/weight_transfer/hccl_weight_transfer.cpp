@@ -3,6 +3,10 @@
 #include <glog/logging.h>
 #include <torch_npu/csrc/core/npu/NPUFormat.h>
 
+#include <iomanip>
+
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "util/net.h"
 
 namespace xllm {
@@ -59,6 +63,37 @@ class WeightTransferServiceImpl : public xllm::proto::WeightTransferService {
                    google::protobuf::Closure* done) override {
     brpc::ClosureGuard done_guard(done);
     hccl_weight_transfer_->process_send_request(request->layer_id());
+    response->set_success(true);
+  }
+
+  void GetWeightsMeta(google::protobuf::RpcController* controller,
+                      const xllm::proto::GetWeightsMetaRequest* request,
+                      xllm::proto::GetWeightsMetaResponse* response,
+                      google::protobuf::Closure* done) override {
+    brpc::ClosureGuard done_guard(done);
+    for (int32_t layer_id : request->layer_ids()) {
+      auto* layer_meta = response->add_layer_metas();
+      layer_meta->set_layer_id(layer_id);
+      auto tensors = hccl_weight_transfer_->get_registered_tensors(layer_id);
+      for (const auto& t : tensors) {
+        auto* meta = layer_meta->add_metas();
+        meta->set_dtype(static_cast<int32_t>(t.scalar_type()));
+        for (int i = 0; i < t.dim(); ++i) {
+          meta->add_shape(t.size(i));
+        }
+        meta->set_npu_format(at_npu::native::get_npu_format(t));
+      }
+    }
+  }
+
+  void TriggerWeightsSend(google::protobuf::RpcController* controller,
+                          const xllm::proto::TriggerWeightsSendRequest* request,
+                          xllm::proto::TriggerWeightsSendResponse* response,
+                          google::protobuf::Closure* done) override {
+    brpc::ClosureGuard done_guard(done);
+    std::vector<int32_t> layer_ids;
+    for (int32_t id : request->layer_ids()) layer_ids.push_back(id);
+    hccl_weight_transfer_->process_weights_send_request(layer_ids);
     response->set_success(true);
   }
 
@@ -140,9 +175,9 @@ void HcclWeightTransfer::process_send_request(int32_t layer_id) {
   int wait_retry = 0;
   while (!is_comm_initialized_) {
     if (wait_retry % 100 == 0) {
-      LOG(WARNING)
-          << "Sender: Waiting for HCCL Init to finish before sending layer "
-          << layer_id << "...";
+      LOG(WARNING) << "Sender: Waiting for HCCL Init to "
+                      "finish before sending layer "
+                   << layer_id << "...";
     }
     usleep(10000);
     wait_retry++;
@@ -163,28 +198,66 @@ void HcclWeightTransfer::process_send_request(int32_t layer_id) {
   auto promise = std::make_shared<std::promise<bool>>();
   std::future<bool> future = promise->get_future();
 
-  hccl_thread_pool_->schedule([&]() mutable {
+  hccl_thread_pool_->schedule([&, layer_id, tensors]() mutable {
     aclrtSetDevice(device_id_);
     // LOG(INFO) << "[Sender Thread] Task started for Layer " << layer_id;
 
+    auto expert_indices = model_->get_expert_weight_indices();
+    std::unordered_set<int> expert_indices_set(expert_indices.begin(),
+                                               expert_indices.end());
+
+    absl::Time start_time = absl::Now();
+    size_t total_nbytes = 0;
+
+    std::vector<HcclSendRecvItem> items;
     for (size_t i = 0; i < tensors.size(); ++i) {
       const auto& tensor = tensors[i];
       size_t nbytes = tensor.nbytes();
+      total_nbytes += nbytes;
 
-      auto hccl_ret = HcclSend(tensor.data_ptr(),
-                               nbytes,
-                               HCCL_DATA_TYPE_UINT8,
-                               0,
-                               hccl_comm_,
-                               stream_);
+      if (expert_indices_set.count(i) && tensor.dim() == 3) {
+        int64_t expert_num = tensor.size(0);
+        size_t expert_nbytes = nbytes / expert_num;
+        for (int64_t e = 0; e < expert_num; ++e) {
+          void* data_ptr =
+              static_cast<uint8_t*>(tensor.data_ptr()) + e * expert_nbytes;
+          items.push_back({HCCL_SEND,
+                           data_ptr,
+                           (uint64_t)expert_nbytes,
+                           HCCL_DATA_TYPE_UINT8,
+                           0});
+        }
+      } else {
+        items.push_back({HCCL_SEND,
+                         tensor.data_ptr(),
+                         (uint64_t)nbytes,
+                         HCCL_DATA_TYPE_UINT8,
+                         0});
+      }
+    }
 
+    if (!items.empty()) {
+      auto hccl_ret =
+          HcclBatchSendRecv(items.data(), items.size(), hccl_comm_, stream_);
       if (hccl_ret != HCCL_SUCCESS) {
-        LOG(ERROR) << "[Sender Thread] HcclSend Failed at index " << i;
+        LOG(ERROR) << "[Sender Thread] HcclBatchSendRecv Failed.";
         promise->set_value(false);
         return;
       }
     }
     auto sync_ret = aclrtSynchronizeStream(stream_);
+
+    absl::Time end_time = absl::Now();
+    double duration_s = absl::ToDoubleSeconds(end_time - start_time);
+    double duration_ms = absl::ToDoubleMilliseconds(end_time - start_time);
+    double total_gb = total_nbytes / (1024.0 * 1024.0 * 1024.0);
+    double bandwidth_gb_s = total_gb / duration_s;
+
+    LOG(INFO) << "[Sender Thread] Layer " << layer_id
+              << " transfer: " << std::fixed << std::setprecision(2) << total_gb
+              << " GB, "
+              << "Time: " << duration_ms << " ms, "
+              << "Bandwidth: " << bandwidth_gb_s << " GB/s";
 
     if (sync_ret != ACL_SUCCESS) {
       promise->set_value(false);
@@ -199,11 +272,91 @@ void HcclWeightTransfer::process_send_request(int32_t layer_id) {
   }
 }
 
+void HcclWeightTransfer::process_weights_send_request(
+    const std::vector<int32_t>& layer_ids) {
+  aclrtSetDevice(device_id_);
+
+  auto promise = std::make_shared<std::promise<bool>>();
+  std::future<bool> future = promise->get_future();
+
+  hccl_thread_pool_->schedule([&, layer_ids]() mutable {
+    aclrtSetDevice(device_id_);
+
+    auto expert_indices = model_->get_expert_weight_indices();
+    std::unordered_set<int> expert_indices_set(expert_indices.begin(),
+                                               expert_indices.end());
+
+    absl::Time start_time = absl::Now();
+    size_t total_nbytes = 0;
+
+    std::vector<HcclSendRecvItem> items;
+    for (int32_t layer_id : layer_ids) {
+      auto tensors = get_registered_tensors(layer_id);
+      for (size_t i = 0; i < tensors.size(); ++i) {
+        const auto& tensor = tensors[i];
+        size_t nbytes = tensor.nbytes();
+        total_nbytes += nbytes;
+
+        if (expert_indices_set.count(i) && tensor.dim() == 3) {
+          int64_t expert_num = tensor.size(0);
+          size_t expert_nbytes = nbytes / expert_num;
+          for (int64_t e = 0; e < expert_num; ++e) {
+            void* data_ptr =
+                static_cast<uint8_t*>(tensor.data_ptr()) + e * expert_nbytes;
+            items.push_back({HCCL_SEND,
+                             data_ptr,
+                             (uint64_t)expert_nbytes,
+                             HCCL_DATA_TYPE_UINT8,
+                             0});
+          }
+        } else {
+          items.push_back({HCCL_SEND,
+                           tensor.data_ptr(),
+                           (uint64_t)nbytes,
+                           HCCL_DATA_TYPE_UINT8,
+                           0});
+        }
+      }
+    }
+
+    if (!items.empty()) {
+      auto hccl_ret =
+          HcclBatchSendRecv(items.data(), items.size(), hccl_comm_, stream_);
+      if (hccl_ret != HCCL_SUCCESS) {
+        LOG(ERROR)
+            << "[Sender Thread] HcclBatchSendRecv (Multiple Layers) Failed.";
+        promise->set_value(false);
+        return;
+      }
+    }
+    auto sync_ret = aclrtSynchronizeStream(stream_);
+
+    absl::Time end_time = absl::Now();
+    double duration_s = absl::ToDoubleSeconds(end_time - start_time);
+    double duration_ms = absl::ToDoubleMilliseconds(end_time - start_time);
+    double total_gb = total_nbytes / (1024.0 * 1024.0 * 1024.0);
+    double bandwidth_gb_s = total_gb / duration_s;
+
+    LOG(INFO) << "[Sender Thread] Batch transfer (layers: " << layer_ids.size()
+              << "): " << std::fixed << std::setprecision(2) << total_gb
+              << " GB, "
+              << "Time: " << duration_ms << " ms, "
+              << "Bandwidth: " << bandwidth_gb_s << " GB/s";
+
+    if (sync_ret != ACL_SUCCESS) {
+      promise->set_value(false);
+    } else {
+      promise->set_value(true);
+    }
+  });
+  future.wait();
+}
+
 bool HcclWeightTransfer::connect_to_remote(const std::string& remote_addr) {
   aclrtSetDevice(device_id_);
   channel_ = std::make_unique<brpc::Channel>();
   brpc::ChannelOptions options;
-  options.timeout_ms = 5000;
+  options.timeout_ms = 10000;
   options.connect_timeout_ms = 2000;
   options.max_retry = 3;
 
@@ -340,17 +493,45 @@ bool HcclWeightTransfer::pull_layer(int32_t layer_id,
       return;
     }
 
+    auto expert_indices = model_->get_expert_weight_indices();
+    std::unordered_set<int> expert_indices_set(expert_indices.begin(),
+                                               expert_indices.end());
+
+    absl::Time start_time = absl::Now();
+    size_t total_nbytes = 0;
+
+    std::vector<HcclSendRecvItem> items;
     for (size_t i = 0; i < local_tensors.size(); ++i) {
       auto& tensor = local_tensors[i];
-      auto hccl_ret = HcclRecv(tensor.data_ptr(),
-                               tensor.nbytes(),
-                               HCCL_DATA_TYPE_UINT8,
-                               1,
-                               hccl_comm_,
-                               stream_);
+      size_t nbytes = tensor.nbytes();
+      total_nbytes += nbytes;
 
+      if (expert_indices_set.count(i) && tensor.dim() == 3) {
+        int64_t expert_num = tensor.size(0);
+        size_t expert_nbytes = nbytes / expert_num;
+        for (int64_t e = 0; e < expert_num; ++e) {
+          void* data_ptr =
+              static_cast<uint8_t*>(tensor.data_ptr()) + e * expert_nbytes;
+          items.push_back({HCCL_RECV,
+                           data_ptr,
+                           (uint64_t)expert_nbytes,
+                           HCCL_DATA_TYPE_UINT8,
+                           1});
+        }
+      } else {
+        items.push_back({HCCL_RECV,
+                         tensor.data_ptr(),
+                         (uint64_t)nbytes,
+                         HCCL_DATA_TYPE_UINT8,
+                         1});
+      }
+    }
+
+    if (!items.empty()) {
+      auto hccl_ret =
+          HcclBatchSendRecv(items.data(), items.size(), hccl_comm_, stream_);
       if (hccl_ret != HCCL_SUCCESS) {
-        LOG(ERROR) << "[Receiver Thread] HcclRecv Failed.";
+        LOG(ERROR) << "[Receiver Thread] HcclBatchSendRecv Failed.";
         promise->set_value(false);
         return;
       }
@@ -358,12 +539,158 @@ bool HcclWeightTransfer::pull_layer(int32_t layer_id,
 
     auto sync_ret = aclrtSynchronizeStream(stream_);
 
+    absl::Time end_time = absl::Now();
+    double duration_s = absl::ToDoubleSeconds(end_time - start_time);
+    double duration_ms = absl::ToDoubleMilliseconds(end_time - start_time);
+    double total_gb = total_nbytes / (1024.0 * 1024.0 * 1024.0);
+    double bandwidth_gb_s = total_gb / duration_s;
+
+    LOG(INFO) << "[Receiver Thread] Layer " << layer_id
+              << " transfer: " << std::fixed << std::setprecision(2) << total_gb
+              << " GB, "
+              << "Time: " << duration_ms << " ms, "
+              << "Bandwidth: " << bandwidth_gb_s << " GB/s";
+
     promise->set_value(sync_ret == ACL_SUCCESS);
   });
 
   bool result = future.get();
   if (!result) {
     LOG(ERROR) << "Push layer failed!";
+  }
+
+  return result;
+}
+
+bool HcclWeightTransfer::pull_weight(
+    const std::vector<int32_t>& layer_ids,
+    const std::vector<std::vector<at::Tensor>*>& local_tensors_ptrs) {
+  if (!is_comm_initialized_) return false;
+
+  brpc::Controller cntl_meta;
+  xllm::proto::GetWeightsMetaRequest req_meta;
+  xllm::proto::GetWeightsMetaResponse resp_meta;
+  for (int32_t id : layer_ids) req_meta.add_layer_ids(id);
+
+  stub_->GetWeightsMeta(&cntl_meta, &req_meta, &resp_meta, nullptr);
+  if (cntl_meta.Failed()) {
+    LOG(ERROR) << "GetWeightsMeta failed: " << cntl_meta.ErrorText();
+    return false;
+  }
+
+  aclrtSetDevice(device_id_);
+
+  for (int i = 0; i < resp_meta.layer_metas_size(); ++i) {
+    const auto& layer_meta = resp_meta.layer_metas(i);
+    auto& tensors = *local_tensors_ptrs[i];
+    tensors.resize(layer_meta.metas_size());
+
+    for (int j = 0; j < layer_meta.metas_size(); ++j) {
+      const auto& meta = layer_meta.metas(j);
+      std::vector<int64_t> shape;
+      for (int64_t d : meta.shape()) shape.push_back(d);
+
+      auto options = torch::TensorOptions()
+                         .dtype(static_cast<at::ScalarType>(meta.dtype()))
+                         .device("npu:" + std::to_string(device_id_));
+
+      tensors[j] =
+          at_npu::native::empty_with_format(shape, options, meta.npu_format());
+    }
+  }
+
+  rpc_thread_pool_->schedule([this, layer_ids]() {
+    brpc::Controller cntl_trig;
+    xllm::proto::TriggerWeightsSendRequest req_trig;
+    xllm::proto::TriggerWeightsSendResponse resp_trig;
+    for (int32_t id : layer_ids) req_trig.add_layer_ids(id);
+
+    stub_->TriggerWeightsSend(&cntl_trig, &req_trig, &resp_trig, nullptr);
+
+    if (cntl_trig.Failed() || !resp_trig.success()) {
+      LOG(ERROR) << "TriggerWeightsSend failed: " << cntl_trig.ErrorText();
+    }
+  });
+
+  auto promise = std::make_shared<std::promise<bool>>();
+  std::future<bool> future = promise->get_future();
+
+  hccl_thread_pool_->schedule([&, local_tensors_ptrs, layer_ids]() mutable {
+    aclError ret = aclrtSetDevice(device_id_);
+    if (ret != ACL_SUCCESS) {
+      LOG(ERROR) << "[Receiver Thread] SetContext Failed: " << ret;
+      promise->set_value(false);
+      return;
+    }
+
+    auto expert_indices = model_->get_expert_weight_indices();
+    std::unordered_set<int> expert_indices_set(expert_indices.begin(),
+                                               expert_indices.end());
+
+    absl::Time start_time = absl::Now();
+    size_t total_nbytes = 0;
+
+    std::vector<HcclSendRecvItem> items;
+    for (auto* tensors_ptr : local_tensors_ptrs) {
+      auto& local_tensors = *tensors_ptr;
+      for (size_t i = 0; i < local_tensors.size(); ++i) {
+        auto& tensor = local_tensors[i];
+        size_t nbytes = tensor.nbytes();
+        total_nbytes += nbytes;
+
+        if (expert_indices_set.count(i) && tensor.dim() == 3) {
+          int64_t expert_num = tensor.size(0);
+          size_t expert_nbytes = nbytes / expert_num;
+          for (int64_t e = 0; e < expert_num; ++e) {
+            void* data_ptr =
+                static_cast<uint8_t*>(tensor.data_ptr()) + e * expert_nbytes;
+            items.push_back({HCCL_RECV,
+                             data_ptr,
+                             (uint64_t)expert_nbytes,
+                             HCCL_DATA_TYPE_UINT8,
+                             1});
+          }
+        } else {
+          items.push_back({HCCL_RECV,
+                           tensor.data_ptr(),
+                           (uint64_t)nbytes,
+                           HCCL_DATA_TYPE_UINT8,
+                           1});
+        }
+      }
+    }
+
+    if (!items.empty()) {
+      auto hccl_ret =
+          HcclBatchSendRecv(items.data(), items.size(), hccl_comm_, stream_);
+      if (hccl_ret != HCCL_SUCCESS) {
+        LOG(ERROR)
+            << "[Receiver Thread] HcclBatchSendRecv (Multiple Layers) Failed.";
+        promise->set_value(false);
+        return;
+      }
+    }
+
+    auto sync_ret = aclrtSynchronizeStream(stream_);
+
+    absl::Time end_time = absl::Now();
+    double duration_s = absl::ToDoubleSeconds(end_time - start_time);
+    double duration_ms = absl::ToDoubleMilliseconds(end_time - start_time);
+    double total_gb = total_nbytes / (1024.0 * 1024.0 * 1024.0);
+    double bandwidth_gb_s = total_gb / duration_s;
+
+    LOG(INFO) << "[Receiver Thread] Batch transfer (layers: "
+              << layer_ids.size() << "): " << std::fixed << std::setprecision(2)
+              << total_gb << " GB, "
+              << "Time: " << duration_ms << " ms, "
+              << "Bandwidth: " << bandwidth_gb_s << " GB/s";
+
+    promise->set_value(sync_ret == ACL_SUCCESS);
+  });
+
+  bool result = future.get();
+  if (!result) {
+    LOG(ERROR) << "Batch pull weight failed!";
   }
 
   return result;

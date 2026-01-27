@@ -37,10 +37,35 @@ message TriggerSendResponse {
   bool success = 1;
 }
 
+message GetWeightsMetaRequest {
+  repeated int32 layer_ids = 1;
+}
+
+message LayerWeightsMeta {
+  int32 layer_id = 1;
+  repeated TensorMeta metas = 2;
+}
+
+message GetWeightsMetaResponse {
+  repeated LayerWeightsMeta layer_metas = 1;
+}
+
+message TriggerWeightsSendRequest {
+  repeated int32 layer_ids = 1;
+}
+
+message TriggerWeightsSendResponse {
+  bool success = 1;
+}
+
 service WeightTransferService {
   rpc InitComm(InitCommRequest) returns (InitCommResponse);
   
   rpc GetLayerMeta(GetLayerMetaRequest) returns (GetLayerMetaResponse);
   
   rpc TriggerSend(TriggerSendRequest) returns (TriggerSendResponse);
+
+  rpc GetWeightsMeta(GetWeightsMetaRequest) returns (GetWeightsMetaResponse);
+
+  rpc TriggerWeightsSend(TriggerWeightsSendRequest) returns (TriggerWeightsSendResponse);
 }

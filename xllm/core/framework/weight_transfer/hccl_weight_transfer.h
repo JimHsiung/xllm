@@ -37,9 +37,15 @@ class HcclWeightTransfer {
 
   void process_send_request(int32_t layer_id);
 
+  void process_weights_send_request(const std::vector<int32_t>& layer_ids);
+
   bool connect_to_remote(const std::string& remote_addr);
 
   bool pull_layer(int32_t layer_id, std::vector<at::Tensor>& local_tensors);
+
+  bool pull_weight(
+      const std::vector<int32_t>& layer_ids,
+      const std::vector<std::vector<at::Tensor>*>& local_tensors_ptrs);
 
   bool handle_init_comm(const std::string& remote_addr,
                         const void* root_info_ptr);
