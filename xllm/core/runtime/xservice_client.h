@@ -37,9 +37,9 @@ class XServiceClient {
   }
 
   ~XServiceClient();
-  bool init(const std::string& etcd_addr,
-            const std::string& instance_name = "",
-            const BlockManagerPool* block_manager_pool = nullptr);
+  bool init_client(const std::string& etcd_addr,
+                   const std::string& instance_name = "");
+  void start_heartbeat(const BlockManagerPool* block_manager_pool);
   void set_scheduler(Scheduler* scheduler);
   bool initialize_done() { return initialize_done_; }
 
@@ -47,6 +47,9 @@ class XServiceClient {
   void register_instance(const InstanceInfo& instance_info);
   void heartbeat();
   InstanceInfo get_instance_info(const std::string& instance_name);
+  std::vector<std::string> get_matching_instance(int32_t world_size,
+                                                 int32_t dp_size,
+                                                 int32_t ep_size);
   std::vector<std::string> get_static_decode_list();
   std::vector<std::string> get_static_prefill_list();
 

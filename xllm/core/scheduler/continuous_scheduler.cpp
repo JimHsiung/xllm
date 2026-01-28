@@ -84,6 +84,9 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
   instance_info_.name = options_.instance_name().value_or("");
   instance_info_.type = options_.instance_role().value().to_string();
   instance_info_.dp_size = options.dp_size();
+  instance_info_.ep_size = options.ep_size();
+  instance_info_.world_size = options.nnodes();
+  instance_info_.weight_transfer_addrs = engine_->get_weight_transfer_addrs();
 
   if (options_.enable_schedule_overlap()) {
     min_speculative_tokens_required_ = options_.num_speculative_tokens() * 2;

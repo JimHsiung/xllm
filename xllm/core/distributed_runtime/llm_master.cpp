@@ -48,19 +48,23 @@ LLMMaster::LLMMaster(const Options& options)
              options.draft_model_path().value_or("").empty()
                  ? EngineType::LLM
                  : EngineType::SSM) {
+  XServiceClient* xservice_client = nullptr;
+  if (options_.enable_service_routing()) {
+    xservice_client = XServiceClient::get_instance();
+    if (!xservice_client->init_client(options_.etcd_addr().value_or(""),
+                                      options_.instance_name().value_or(""))) {
+      LOG(FATAL) << "XServiceClient init fail!";
+      return;
+    }
+  }
+
   CHECK(engine_->init());
   task_type_ = options_.task_type();
 
   model_args_ = engine_->model_args();
 
   if (options_.enable_service_routing()) {
-    XServiceClient* xservice_client = XServiceClient::get_instance();
-    if (!xservice_client->init(options_.etcd_addr().value_or(""),
-                               options_.instance_name().value_or(""),
-                               engine_->block_manager_pool())) {
-      LOG(FATAL) << "XServiceClient init fail!";
-      return;
-    }
+    xservice_client->start_heartbeat(engine_->block_manager_pool());
   }
 
   ContinuousScheduler::Options scheduler_options;
@@ -71,6 +75,7 @@ LLMMaster::LLMMaster(const Options& options)
       .num_speculative_tokens(options_.num_speculative_tokens())
       .nnodes(options_.nnodes())
       .dp_size(options_.dp_size())
+      .ep_size(options_.ep_size())
       .enable_disagg_pd(options_.enable_disagg_pd())
       .enable_pd_ooc(options_.enable_pd_ooc())
       .enable_schedule_overlap(options_.enable_schedule_overlap())

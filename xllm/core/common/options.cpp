@@ -66,8 +66,7 @@ std::string Options::to_string() const {
      << ", enable_forward_interruption: " << enable_forward_interruption()
      << ", server_idx: " << server_idx()
      << ", weight_load_mode: " << weight_load_mode()
-     << ", weight_transfer_port: " << weight_transfer_port()
-     << ", remote_addr: " << remote_addr();
+     << ", weight_transfer_port: " << weight_transfer_port();
   ss << "]";
   return ss.str();
 }

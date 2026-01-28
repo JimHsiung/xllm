@@ -29,12 +29,12 @@ limitations under the License.
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
 #include "util/timer.h"
+#include "worker.pb.h"
 
 namespace xllm {
 
-bool WorkerClient::init_model(const std::string& model_weights_path,
-                              int32_t random_seed) {
-  return worker_->init_model(model_weights_path, random_seed);
+bool WorkerClient::init_model(const InitModelParams& params) {
+  return worker_->init_model(params);
 }
 
 bool WorkerClient::allocate_kv_cache(
@@ -122,9 +122,8 @@ folly::SemiFuture<folly::Unit> WorkerClient::process_group_test_async() {
 
 // initialize model, cache manager. async call
 folly::SemiFuture<bool> WorkerClient::init_model_async(
-    const std::string& model_weights_path,
-    int32_t random_seed) {
-  return worker_->init_model_async(model_weights_path, random_seed);
+    const InitModelParams& params) {
+  return worker_->init_model_async(params);
 }
 
 folly::SemiFuture<bool> WorkerClient::allocate_kv_cache_async(
@@ -198,6 +197,10 @@ int64_t WorkerClient::get_active_activation_memory() {
 
 folly::SemiFuture<int64_t> WorkerClient::get_active_activation_memory_async() {
   return worker_->get_active_activation_memory_async();
+}
+
+std::string WorkerClient::get_weight_transfer_addr() {
+  return worker_->get_weight_transfer_addr();
 }
 
 }  // namespace xllm

@@ -52,6 +52,8 @@ class HcclWeightTransfer {
 
   std::vector<at::Tensor> get_registered_tensors(int32_t layer_id);
 
+  std::string get_weight_transfer_addr() const { return local_addr_; }
+
  private:
   ModelContext context_;
   CausalLM* model_;

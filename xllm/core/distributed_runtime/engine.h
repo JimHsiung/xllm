@@ -116,6 +116,11 @@ class Engine {
     LOG(FATAL) << " get_cache_info is notimplemented!";
   };
 
+  virtual std::vector<std::string> get_weight_transfer_addrs() {
+    LOG(FATAL) << " get_weight_transfer_addrs is notimplemented!";
+    return {};
+  };
+
   virtual bool link_cluster(const std::vector<uint64_t>& cluster_ids,
                             const std::vector<std::string>& addrs,
                             const std::vector<std::string>& device_ips,

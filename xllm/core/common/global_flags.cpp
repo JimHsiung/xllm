@@ -504,5 +504,3 @@ DEFINE_string(weight_load_mode,
               "The mode to load model weights: 'disk' or 'remote'.");
 
 DEFINE_int32(weight_transfer_port, 26001, "The WeightTranfer listen port.");
-
-DEFINE_string(remote_addr, "127.0.0.1:26002", "Remote weight load addr.");

@@ -389,6 +389,15 @@ std::unique_ptr<RecMaster::RecMasterPipeline> RecMaster::create_pipeline(
 
 RecMaster::RecMaster(const Options& options)
     : Master(options, EngineType::REC) {
+  XServiceClient* xservice_client = nullptr;
+  if (options_.enable_service_routing()) {
+    xservice_client = XServiceClient::get_instance();
+    if (!xservice_client->init_client(options_.etcd_addr().value_or(""),
+                                      options_.instance_name().value_or(""))) {
+      LOG(FATAL) << "XServiceClient init fail!";
+      return;
+    }
+  }
   // Initialize with Rec engine type
   // The rest of the initialization follows the same pattern as LLMMaster
   CHECK(engine_->init());
@@ -400,13 +409,7 @@ RecMaster::RecMaster(const Options& options)
   }
 
   if (options_.enable_service_routing()) {
-    XServiceClient* xservice_client = XServiceClient::get_instance();
-    if (!xservice_client->init(options_.etcd_addr().value_or(""),
-                               options_.instance_name().value_or(""),
-                               engine_->block_manager_pool())) {
-      LOG(FATAL) << "XServiceClient init fail!";
-      return;
-    }
+    xservice_client->start_heartbeat(engine_->block_manager_pool());
   }
 
   ContinuousScheduler::Options scheduler_options;

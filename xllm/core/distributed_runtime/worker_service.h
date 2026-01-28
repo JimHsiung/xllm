@@ -125,6 +125,11 @@ class WorkerService : public proto::DistributeWorker {
                                  proto::ActivationMemory* resp,
                                  ::google::protobuf::Closure* done) override;
 
+  void GetWeightTransferAddr(::google::protobuf::RpcController* controller,
+                             const proto::Empty* req,
+                             proto::WeightTransferAddr* resp,
+                             ::google::protobuf::Closure* done) override;
+
  private:
   void step(ForwardInput& fwd_input,
             torch::Tensor& next_tokens,

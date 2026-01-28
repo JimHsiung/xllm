@@ -35,6 +35,9 @@ message InstanceMetaInfo {
   repeated string addrs = 8;
   repeated string device_ips = 9;
   repeated uint32 ports = 10;
+  repeated string weight_transfer_addrs = 11;
+  int32 world_size = 12;
+  int32 ep_size = 13;
 }
 
 message KvCacheEvent {
@@ -67,12 +70,24 @@ message InstanceIDs {
   repeated string names = 1;
 }
 
+message WeightTransferAddrs {
+  repeated string addrs = 1;
+}
+
+message MatchInstanceRequest {
+  string instance_name = 1;
+  int32 world_size = 2;
+  int32 dp_size = 3;
+  int32 ep_size = 4;
+}
+
 service XllmRpcService {
   rpc RegisterInstance(InstanceMetaInfo) returns (StatusCode) {}
   rpc GetInstanceInfo(InstanceID) returns (InstanceMetaInfo) {}
   rpc Heartbeat(HeartbeatRequest) returns (Status) {}
   rpc GetStaticDecodeList(InstanceID) returns (InstanceIDs) {}
   rpc GetStaticPrefillList(InstanceID) returns (InstanceIDs) {}
+  rpc GetMatchingInstance(MatchInstanceRequest) returns (WeightTransferAddrs) {}
   // xllm service receive response from decode instance directly in disagg pd mode.
   // This can eliminate the cost brought by forwarding through prefill.
   rpc Generations(xllm.proto.DisaggStreamGenerations) returns (xllm.proto.StatusSet) {}

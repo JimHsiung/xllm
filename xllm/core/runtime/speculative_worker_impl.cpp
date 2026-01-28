@@ -179,20 +179,18 @@ SpeculativeWorkerImpl::SpeculativeWorkerImpl(const ParallelArgs& parallel_args,
   }
 }
 
-bool SpeculativeWorkerImpl::init_model(const std::string& model_weights_path,
-                                       int32_t random_seed) {
+bool SpeculativeWorkerImpl::init_model(const InitModelParams& params) {
   // initialize model
   bool result = true;
   if (impl_->get_status() == WorkerImpl::Status::UNINITIALIZED) {
-    result = impl_->WorkerImpl::init_model(model_weights_path, random_seed);
+    result = impl_->WorkerImpl::init_model(params);
     if (result) {
       dtype_ = impl_->dtype();
       embedding_size_ = impl_->hidden_size();
     }
   } else {
     CHECK_EQ(draft_impl_->get_status(), WorkerImpl::Status::UNINITIALIZED);
-    result =
-        draft_impl_->WorkerImpl::init_model(model_weights_path, random_seed);
+    result = draft_impl_->WorkerImpl::init_model(params);
   }
 
   if (draft_impl_->get_status() == WorkerImpl::Status::LOADED) {

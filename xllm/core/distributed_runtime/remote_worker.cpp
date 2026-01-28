@@ -104,9 +104,8 @@ bool RemoteWorker::unlink_cluster(const std::vector<uint64_t>& cluster_ids,
   return channel_->unlink_cluster(cluster_ids, addrs, device_ips, ports);
 }
 
-bool RemoteWorker::init_model(const std::string& model_weights_path,
-                              int32_t random_seed) {
-  return channel_->init_model(model_weights_path, random_seed);
+bool RemoteWorker::init_model(const InitModelParams& params) {
+  return channel_->init_model(params);
 }
 
 std::tuple<int64_t, int64_t> RemoteWorker::estimate_kv_cache_capacity() {
@@ -193,16 +192,12 @@ folly::SemiFuture<folly::Unit> RemoteWorker::process_group_test_async() {
 }
 
 folly::SemiFuture<bool> RemoteWorker::init_model_async(
-    const std::string& model_weights_path,
-    int32_t random_seed) {
+    const InitModelParams& params) {
   folly::Promise<bool> promise;
   auto future = promise.getSemiFuture();
-  threadpool_.schedule([this,
-                        model_weights_path,
-                        random_seed,
-                        promise = std::move(promise)]() mutable {
+  threadpool_.schedule([this, params, promise = std::move(promise)]() mutable {
     // call InitModel with callback
-    channel_->init_model_async(model_weights_path, random_seed, promise);
+    channel_->init_model_async(params, promise);
   });
   return future;
 }
@@ -355,6 +350,10 @@ folly::SemiFuture<int64_t> RemoteWorker::get_active_activation_memory_async() {
     channel_->get_active_activation_memory_async(promise);
   });
   return future;
+}
+
+std::string RemoteWorker::get_weight_transfer_addr() {
+  return channel_->get_weight_transfer_addr();
 }
 
 }  // namespace xllm

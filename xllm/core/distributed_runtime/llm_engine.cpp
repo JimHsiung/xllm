@@ -36,6 +36,7 @@ limitations under the License.
 #include "framework/xtensor/multi_layer_xtensor_transfer.h"
 #include "runtime/llm_worker_impl.h"
 #include "runtime/worker.h"
+#include "runtime/xservice_client.h"
 #include "server/xllm_server_registry.h"
 #include "util/env_var.h"
 #include "util/pretty_print.h"
@@ -183,12 +184,29 @@ bool LLMEngine::init_model() {
   LOG(INFO) << "Initializing model with tokenizer args: " << tokenizer_args_;
   LOG(INFO) << "Initializing model with random seed: " << FLAGS_random_seed;
 
+  // get matching instance info
+  std::vector<std::string> weight_transfer_addrs;
+  if (options_.weight_load_mode() != "disk" &&
+      options_.enable_service_routing()) {
+    CHECK(XServiceClient::get_instance()->initialize_done());
+    weight_transfer_addrs =
+        XServiceClient::get_instance()->get_matching_instance(
+            options_.nnodes(), options_.dp_size(), options_.ep_size());
+  }
+
   // init model for each worker in parallel
   // multiple workers, call async init
   std::vector<folly::SemiFuture<bool>> futures;
   futures.reserve(worker_clients_num_);
-  for (auto& worker : worker_clients_) {
-    futures.push_back(worker->init_model_async(model_path, FLAGS_random_seed));
+  bool use_remote_addr = weight_transfer_addrs.size() == worker_clients_num_;
+  for (size_t i = 0; i < worker_clients_.size(); ++i) {
+    InitModelParams params;
+    params.model_weights_path = model_path;
+    params.random_seed = FLAGS_random_seed;
+    if (use_remote_addr) {
+      params.remote_addr = weight_transfer_addrs[i];
+    }
+    futures.push_back(worker_clients_[i]->init_model_async(params));
   }
   // wait for all futures to complete
   auto results = folly::collectAll(futures).get();
@@ -620,6 +638,17 @@ void LLMEngine::get_cache_info(std::vector<uint64_t>& cluster_ids,
     k_cache_ids.emplace_back(k_cache_id);
     v_cache_ids.emplace_back(v_cache_id);
   }
+}
+
+std::vector<std::string> LLMEngine::get_weight_transfer_addrs() {
+  std::vector<std::string> weight_transfer_addrs;
+  weight_transfer_addrs.reserve(worker_clients_num_);
+  for (size_t worker_rank = 0; worker_rank < worker_clients_num_;
+       ++worker_rank) {
+    weight_transfer_addrs.emplace_back(
+        worker_clients_[worker_rank]->get_weight_transfer_addr());
+  }
+  return weight_transfer_addrs;
 }
 
 bool LLMEngine::link_cluster(const std::vector<uint64_t>& cluster_ids,

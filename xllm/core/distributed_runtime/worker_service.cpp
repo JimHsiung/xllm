@@ -231,10 +231,11 @@ void WorkerService::InitModel(::google::protobuf::RpcController* controller,
                               ::google::protobuf::Closure* done) {
   threadpool_->schedule([this, controller, request, response, done]() mutable {
     brpc::ClosureGuard done_guard(done);
-    auto model_weights_path = request->model_weights_path();
-    auto random_seed = request->random_seed();
-    auto init_future =
-        worker_->init_model_async(model_weights_path, random_seed);
+    InitModelParams params;
+    params.model_weights_path = request->model_weights_path();
+    params.random_seed = request->random_seed();
+    params.remote_addr = request->remote_addr();
+    auto init_future = worker_->init_model_async(params);
     bool status = std::move(init_future).get();
     if (!status) {
       response->set_ok(false);
@@ -676,6 +677,21 @@ void WorkerService::GetActiveActivationMemory(
     int64_t active_activation_memory = std::move(future).get();
     resp->set_active_activation_memory(active_activation_memory);
   });
+  return;
+}
+
+void WorkerService::GetWeightTransferAddr(
+    ::google::protobuf::RpcController* controller,
+    const proto::Empty* req,
+    proto::WeightTransferAddr* resp,
+    ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!initialized_) {
+    auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+    ctrl->SetFailed("Server is not initialized");
+    return;
+  }
+  resp->set_addr(worker_->get_weight_transfer_addr());
   return;
 }
 }  // namespace xllm

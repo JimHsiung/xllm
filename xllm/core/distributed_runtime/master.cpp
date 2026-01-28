@@ -229,9 +229,8 @@ Master::Master(const Options& options, EngineType type) : options_(options) {
         .is_local(options_.is_local())
         .server_idx(options_.server_idx())
         .weight_load_mode(options_.weight_load_mode())
-        .weight_transfer_port(options_.weight_transfer_port())
-        .remote_addr(options_.remote_addr());
-        
+        .weight_transfer_port(options_.weight_transfer_port());
+
     if (options_.device_ip().has_value()) {
       eng_options.device_ip(options_.device_ip().value());
     }

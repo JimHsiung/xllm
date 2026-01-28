@@ -169,7 +169,10 @@ bool VLMEngine::init_model() {
   std::vector<folly::SemiFuture<bool>> futures;
   futures.reserve(worker_clients_num_);
   for (auto& worker : worker_clients_) {
-    futures.push_back(worker->init_model_async(model_path, FLAGS_random_seed));
+    InitModelParams params;
+    params.model_weights_path = model_path;
+    params.random_seed = FLAGS_random_seed;
+    futures.push_back(worker->init_model_async(params));
   }
   // wait for all futures to complete
   auto results = folly::collectAll(futures).get();

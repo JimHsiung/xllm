@@ -211,12 +211,12 @@ bool CommChannel::unlink_cluster(const std::vector<uint64_t>& cluster_ids,
   return true;
 }
 
-bool CommChannel::init_model(const std::string& model_weights_path,
-                             int32_t random_seed) {
+bool CommChannel::init_model(const InitModelParams& params) {
   proto::InitModelRequest request;
+  request.set_model_weights_path(params.model_weights_path);
+  request.set_random_seed(params.random_seed);
+  request.set_remote_addr(params.remote_addr);
 
-  request.set_model_weights_path(model_weights_path);
-  request.set_random_seed(random_seed);
   proto::Status response;
   brpc::Controller cntl;
   stub_->InitModel(&cntl, &request, &response, nullptr);
@@ -227,13 +227,13 @@ bool CommChannel::init_model(const std::string& model_weights_path,
   return true;
 }
 
-bool CommChannel::init_model_async(const std::string& model_weights_path,
-                                   int32_t random_seed,
+bool CommChannel::init_model_async(const InitModelParams& params,
                                    folly::Promise<bool>& promise) {
   proto::InitModelRequest request;
+  request.set_model_weights_path(params.model_weights_path);
+  request.set_random_seed(params.random_seed);
+  request.set_remote_addr(params.remote_addr);
 
-  request.set_model_weights_path(model_weights_path);
-  request.set_random_seed(random_seed);
   auto done = new InitModelClosure();
   done->promise = std::move(promise);
   stub_->InitModel(&done->cntl, &request, &done->response, done);
@@ -563,6 +563,18 @@ void TransferBlocksClosure::Run() {
     promise.setValue(response.success_cnt());
   }
   return;
+}
+
+std::string CommChannel::get_weight_transfer_addr() {
+  brpc::Controller cntl;
+  proto::Empty req;
+  proto::WeightTransferAddr resp;
+  stub_->GetWeightTransferAddr(&cntl, &req, &resp, nullptr);
+  if (cntl.Failed()) {
+    LOG(ERROR) << "GetWeightTransferAddr failed: " << cntl.ErrorText();
+    return "";
+  }
+  return resp.addr();
 }
 
 }  // namespace xllm

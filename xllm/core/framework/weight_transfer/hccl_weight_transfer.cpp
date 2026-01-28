@@ -274,6 +274,21 @@ void HcclWeightTransfer::process_send_request(int32_t layer_id) {
 
 void HcclWeightTransfer::process_weights_send_request(
     const std::vector<int32_t>& layer_ids) {
+  int wait_retry = 0;
+  while (!is_comm_initialized_) {
+    if (wait_retry % 100 == 0) {
+      LOG(WARNING) << "Sender: Waiting for HCCL Init to "
+                      "finish before sending weights ";
+    }
+    usleep(10000);
+    wait_retry++;
+
+    if (wait_retry > 2000) {
+      LOG(ERROR) << "Sender: FATAL TIMEOUT waiting for HCCL Init.";
+      return;
+    }
+  }
+
   aclrtSetDevice(device_id_);
 
   auto promise = std::make_shared<std::promise<bool>>();

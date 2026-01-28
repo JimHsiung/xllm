@@ -248,7 +248,10 @@ bool RecEngine::LlmRecEnginePipeline::init_model_workers(
   std::vector<folly::SemiFuture<bool>> futures;
   futures.reserve(engine_.worker_clients_num_);
   for (auto& worker : engine_.worker_clients_) {
-    futures.push_back(worker->init_model_async(model_path, FLAGS_random_seed));
+    InitModelParams params;
+    params.model_weights_path = model_path;
+    params.random_seed = FLAGS_random_seed;
+    futures.push_back(worker->init_model_async(params));
   }
   auto results = folly::collectAll(futures).get();
   for (const auto& result : results) {
@@ -546,7 +549,10 @@ bool RecEngine::OneRecEnginePipeline::init_model_workers(
   std::vector<folly::SemiFuture<bool>> futures;
   futures.reserve(engine_.workers_.size());
   for (auto& worker : engine_.workers_) {
-    futures.push_back(worker->init_model_async(model_path, FLAGS_random_seed));
+    InitModelParams params;
+    params.model_weights_path = model_path;
+    params.random_seed = FLAGS_random_seed;
+    futures.push_back(worker->init_model_async(params));
   }
   auto results = folly::collectAll(futures).get();
   for (const auto& result : results) {

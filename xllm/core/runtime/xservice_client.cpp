@@ -58,9 +58,8 @@ bool check_instance_name(const std::string& name) {
 
 }  // namespace
 
-bool XServiceClient::init(const std::string& etcd_addr,
-                          const std::string& instance_name,
-                          const BlockManagerPool* block_manager_pool) {
+bool XServiceClient::init_client(const std::string& etcd_addr,
+                                 const std::string& instance_name) {
   if (etcd_addr.empty()) {
     LOG(ERROR) << "etcd_addr address is empty.";
     return false;
@@ -95,6 +94,12 @@ bool XServiceClient::init(const std::string& etcd_addr,
   xservice_stub_ = std::make_unique<xllm_service::proto::XllmRpcService_Stub>(
       xservice_channel_.get());
 
+  initialize_done_ = true;
+  return true;
+}
+
+void XServiceClient::start_heartbeat(
+    const BlockManagerPool* block_manager_pool) {
   // heartbeat thread
   heartbeat_thread_ =
       std::make_unique<std::thread>(&XServiceClient::heartbeat, this);
@@ -106,9 +111,6 @@ bool XServiceClient::init(const std::string& etcd_addr,
   etcd_client_->add_watch(ETCD_MASTER_SERVICE_KEY, func);
 
   block_manager_pool_ = block_manager_pool;
-
-  initialize_done_ = true;
-  return true;
 }
 
 void XServiceClient::set_scheduler(Scheduler* scheduler) {
@@ -207,6 +209,40 @@ InstanceInfo XServiceClient::get_instance_info(
   }
   for (auto& port : resp.ports()) {
     result.ports.emplace_back(port);
+  }
+  for (auto& addr : resp.weight_transfer_addrs()) {
+    result.weight_transfer_addrs.emplace_back(addr);
+  }
+  result.world_size = resp.world_size();
+  result.ep_size = resp.ep_size();
+
+  return result;
+}
+
+std::vector<std::string> XServiceClient::get_matching_instance(
+    int32_t world_size,
+    int32_t dp_size,
+    int32_t ep_size) {
+  std::vector<std::string> result;
+  brpc::Controller cntl;
+  xllm_service::proto::MatchInstanceRequest req;
+  xllm_service::proto::WeightTransferAddrs resp;
+  req.set_instance_name(instance_name_);
+  req.set_world_size(world_size);
+  req.set_dp_size(dp_size);
+  req.set_ep_size(ep_size);
+  {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    xservice_stub_->GetMatchingInstance(&cntl, &req, &resp, nullptr);
+  }
+  if (cntl.Failed()) {
+    LOG(ERROR) << "Fail to get matching instance info from xservice server "
+               << xservice_addr_ << ", error text: " << cntl.ErrorText();
+    return result;
+  }
+
+  for (auto& addr : resp.addrs()) {
+    result.push_back(addr);
   }
 
   return result;

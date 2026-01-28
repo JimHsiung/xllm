@@ -119,7 +119,6 @@ void DisaggPDScheduler::register_instance_info(const std::string& server_name,
                          instance_info_.addrs,
                          instance_info_.k_cache_ids,
                          instance_info_.v_cache_ids);
-  instance_info_.dp_size = options_.dp_size();
 
   engine->get_device_info(instance_info_.device_ips, instance_info_.ports);
 }

@@ -245,5 +245,3 @@ DECLARE_string(npu_kernel_backend);
 DECLARE_string(weight_load_mode);
 
 DECLARE_int32(weight_transfer_port);
-
-DECLARE_string(remote_addr);

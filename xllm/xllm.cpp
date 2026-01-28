@@ -236,8 +236,7 @@ int run() {
       .enable_shm(FLAGS_enable_shm)
       .is_local(is_local)
       .weight_load_mode(FLAGS_weight_load_mode)
-      .weight_transfer_port(FLAGS_weight_transfer_port)
-      .remote_addr(FLAGS_remote_addr);
+      .weight_transfer_port(FLAGS_weight_transfer_port);
   InstanceName::name()->set_name(options.instance_name().value_or(""));
 
   // working node

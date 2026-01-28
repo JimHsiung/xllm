@@ -43,18 +43,22 @@ namespace xllm {
 
 VLMMaster::VLMMaster(const Options& options)
     : Master(options, EngineType::VLM) {
+  XServiceClient* xservice_client = nullptr;
+  if (options_.enable_service_routing()) {
+    xservice_client = XServiceClient::get_instance();
+    if (!xservice_client->init_client(options_.etcd_addr().value_or(""),
+                                      options_.instance_name().value_or(""))) {
+      LOG(FATAL) << "XServiceClient init fail!";
+      return;
+    }
+  }
+
   CHECK(engine_->init());
 
   model_args_ = engine_->model_args();
 
   if (options_.enable_service_routing()) {
-    XServiceClient* xservice_client = XServiceClient::get_instance();
-    if (!xservice_client->init(options_.etcd_addr().value_or(""),
-                               options_.instance_name().value_or(""),
-                               engine_->block_manager_pool())) {
-      LOG(FATAL) << "XServiceClient init fail!";
-      return;
-    }
+    xservice_client->start_heartbeat(engine_->block_manager_pool());
   }
 
   ContinuousScheduler::Options scheduler_options;

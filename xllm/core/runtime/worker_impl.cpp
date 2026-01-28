@@ -502,23 +502,19 @@ folly::SemiFuture<folly::Unit> WorkerImpl::process_group_test_async() {
 
 // initialize model, cache manager. async call
 folly::SemiFuture<bool> WorkerImpl::init_model_async(
-    const std::string& model_weights_path,
-    int32_t random_seed) {
+    const InitModelParams& params) {
   folly::Promise<bool> promise;
   auto future = promise.getSemiFuture();
-  threadpool_.schedule([this,
-                        model_weights_path,
-                        random_seed,
-                        promise = std::move(promise)]() mutable {
-    auto status = this->init_model(model_weights_path, random_seed);
-    promise.setValue(status);
+  threadpool_.schedule([this, promise = std::move(promise), params]() mutable {
+    promise.setValue(init_model(params));
   });
-
   return future;
 }
 
-bool WorkerImpl::init_model(const std::string& model_weights_path,
-                            int32_t random_seed) {
+bool WorkerImpl::init_model(const InitModelParams& params) {
+  const std::string& model_weights_path = params.model_weights_path;
+  int32_t random_seed = params.random_seed;
+  const std::string& remote_addr = params.remote_addr;
   // set same random seed for all worker
   device_.set_seed(random_seed);
 
@@ -580,12 +576,12 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
       context_, model_.get(), device_.index(), options_.weight_transfer_port());
 
   Timer load_timer;
-  if (options_.weight_load_mode() == "disk") {
+  if (options_.weight_load_mode() == "disk" || remote_addr.empty()) {
     this->load_model(std::move(model_loader));
     LOG(INFO) << "Model loaded from disk. Total time: "
               << load_timer.elapsed_milliseconds() << " ms";
   } else {
-    this->load_model_from_instance(options_.remote_addr());
+    this->load_model_from_instance(remote_addr);
     LOG(INFO) << "Model loaded from instance. Total time: "
               << load_timer.elapsed_milliseconds() << " ms";
   }
@@ -621,6 +617,15 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
                             .contiguous();
   }
   return true;
+}
+
+std::string WorkerImpl::get_weight_transfer_addr() {
+#if defined(USE_NPU)
+  if (hccl_weight_transfer_ != nullptr) {
+    return hccl_weight_transfer_->get_weight_transfer_addr();
+  }
+#endif
+  return "";
 }
 
 void WorkerImpl::load_model(std::unique_ptr<ModelLoader> loader) {

@@ -16,6 +16,7 @@ message CommInfo {
 message InitModelRequest {
   string model_weights_path = 1;
   int32 random_seed = 2;
+  string remote_addr = 3;
 }
 
 message ActivationMemory {
@@ -25,6 +26,10 @@ message ActivationMemory {
 message DeviceMemory {
   int64 available_memory = 1;
   int64 total_memory = 2;
+}
+
+message WeightTransferAddr {
+  string addr = 1;
 }
 
 message KVCacheShape {
@@ -281,4 +286,5 @@ service DistributeWorker {
   rpc GetActiveActivationMemory (Empty) returns (ActivationMemory);
   rpc TransferBlocks(BlockTransferInfos) returns (TransferStatus) {}
   rpc PrefetchFromStorage(BlockTransferInfos) returns (Status) {}
+  rpc GetWeightTransferAddr (Empty) returns (WeightTransferAddr);
 }
