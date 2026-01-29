@@ -468,4 +468,25 @@ void APIService::ModelVersionsHttp(
   return;
 }
 
+void APIService::GetExpertDistribution(
+    ::google::protobuf::RpcController* controller,
+    const proto::Empty* request,
+    proto::GetExpertDistributionResponse* response,
+    ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | respose | controller is null";
+    return;
+  }
+
+  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+
+  std::vector<int32_t> dims;
+  std::vector<int32_t> data;
+  master_->get_expert_distribution(dims, data);
+
+  response->mutable_dims()->Add(dims.begin(), dims.end());
+  response->mutable_data()->Add(data.begin(), data.end());
+}
+
 }  // namespace xllm

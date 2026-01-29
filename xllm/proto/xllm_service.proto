@@ -5,6 +5,7 @@ package xllm.proto;
 option cc_enable_arenas = true;
 option cc_generic_services = true;
 
+import "common.proto";
 import "completion.proto";
 import "chat.proto";
 import "embedding.proto";
@@ -17,6 +18,11 @@ message HttpRequest {
 
 message HttpResponse {
 };
+
+message GetExpertDistributionResponse {
+  repeated int32 dims = 1;
+  repeated int32 data = 2;
+}
 
 service XllmAPIService {
   rpc Completions (CompletionRequest) returns (CompletionResponse);
@@ -38,4 +44,6 @@ service XllmAPIService {
   rpc ModelsHttp (HttpRequest) returns (HttpResponse);
 
   rpc ModelVersionsHttp (HttpRequest) returns (HttpResponse);
+
+  rpc GetExpertDistribution (Empty) returns (GetExpertDistributionResponse);
 };

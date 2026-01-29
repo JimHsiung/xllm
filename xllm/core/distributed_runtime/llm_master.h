@@ -73,6 +73,9 @@ class LLMMaster : public Master {
   // this is a blocking call
   void generate();
 
+  void get_expert_distribution(std::vector<int32_t>& dims,
+                               std::vector<int32_t>& data);
+
  private:
   std::shared_ptr<Request> generate_request(
       std::string prompt,
