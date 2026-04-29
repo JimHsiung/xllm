@@ -18,6 +18,21 @@ message InitModelRequest {
   string model_weights_path = 1;
   int32 random_seed = 2;
   MasterStatus master_status = 3;
+  string remote_addr = 4;
+  RankExpertTransferPlan rank_expert_transfer_plan = 5;
+}
+
+message SourceExpertIds {
+  string source_addr = 1;
+  repeated int32 expert_ids = 2;
+}
+
+message LayerExpertTransferPlan {
+  repeated SourceExpertIds source_experts = 1;
+}
+
+message RankExpertTransferPlan {
+  repeated LayerExpertTransferPlan layer_plans = 1;
 }
 
 message ActivationMemory {
@@ -27,6 +42,10 @@ message ActivationMemory {
 message DeviceMemory {
   int64 available_memory = 1;
   int64 total_memory = 2;
+}
+
+message WeightTransferAddr {
+  string addr = 1;
 }
 
 message KVCacheShape {
@@ -355,4 +374,5 @@ service DistributeWorker {
   rpc PrefetchFromStorage(BlockTransferInfos) returns (Status) {}
   rpc Sleep (SleepRequest)  returns (Status);
   rpc Wakeup (WakeupRequest) returns (Status);
+  rpc GetWeightTransferAddr (Empty) returns (WeightTransferAddr);
 }

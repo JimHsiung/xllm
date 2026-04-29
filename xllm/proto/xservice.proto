@@ -37,6 +37,9 @@ message InstanceMetaInfo {
   repeated uint32 ports = 10;
   string incarnation_id = 11;
   uint64 register_ts_ms = 12;
+  repeated string weight_transfer_addrs = 13;
+  int32 world_size = 14;
+  int32 ep_size = 15;
 }
 
 message KvCacheEvent {
@@ -91,12 +94,43 @@ message InstanceIDs {
   repeated string names = 1;
 }
 
+message SourceExpertIds {
+  string source_addr = 1;
+  repeated int32 expert_ids = 2;
+}
+
+message LayerExpertTransferPlan {
+  repeated SourceExpertIds source_experts = 1;
+}
+
+message RankExpertTransferPlan {
+  repeated LayerExpertTransferPlan layer_plans = 1;
+}
+
+message ExpertTransferPlan {
+  repeated RankExpertTransferPlan rank_plans = 1;
+}
+
+message WeightTransferPlanRequest {
+  string instance_name = 1;
+  int32 world_size = 2;
+  int32 dp_size = 3;
+  int32 ep_size = 4;
+}
+
+message WeightTransferPlanResponse {
+  bool has_weight_transfer_source = 1;
+  repeated string weight_transfer_addrs = 2;
+  ExpertTransferPlan expert_transfer_plan = 3;
+}
+
 service XllmRpcService {
   rpc RegisterInstance(InstanceMetaInfo) returns (StatusCode) {}
   rpc GetInstanceInfo(InstanceID) returns (InstanceMetaInfo) {}
   rpc Heartbeat(HeartbeatRequest) returns (Status) {}
   rpc GetStaticDecodeList(InstanceID) returns (InstanceIDs) {}
   rpc GetStaticPrefillList(InstanceID) returns (InstanceIDs) {}
+  rpc GetWeightTransferPlan(WeightTransferPlanRequest) returns (WeightTransferPlanResponse) {}
   // xllm service receive response from decode instance directly in disagg pd mode.
   // This can eliminate the cost brought by forwarding through prefill.
   rpc Generations(xllm.proto.DisaggStreamGenerations) returns (xllm.proto.StatusSet) {}

@@ -48,6 +48,10 @@ class NpuLmHeadImpl : public BaseLayer {
 
   ~NpuLmHeadImpl() override = default;
 
+  void merge_loaded_weights() override;
+
+  void refresh_loaded_weights() override;
+
   torch::Tensor forward(const torch::Tensor& hidden_states,
                         const torch::Tensor& seleted_idxes,
                         int nodeId);

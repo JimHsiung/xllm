@@ -41,6 +41,8 @@ class NpuGlm4MoeDecoderImpl : public BaseLayer {
 
   void merge_loaded_weights();
 
+  virtual void refresh_loaded_weights() override;
+
   torch::Tensor block_tables_placeholder_;
 
   torch::Tensor forward(torch::Tensor& x,

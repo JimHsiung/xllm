@@ -80,11 +80,21 @@ class DeepseekV2DecoderLayerImpl : public torch::nn::Module {
 
   void refresh_rolling_weights() { decoder_layer_->refresh_rolling_weights(); }
 
+  void refresh_loaded_weights() { decoder_layer_->refresh_loaded_weights(); }
+
   void prepare_expert_weight(const std::vector<int32_t>& expert_list) {
     decoder_layer_->prepare_expert_weight(expert_list);
   }
 
   void update_expert_weight() { decoder_layer_->update_expert_weight(); }
+
+  std::vector<at::Tensor>& get_decoder_layer_weight() {
+    return decoder_layer_->get_at_weight_tensors();
+  }
+
+  std::vector<int> get_expert_weight_indices() const {
+    return decoder_layer_->get_expert_weight_indices();
+  }
 
  private:
   layer::NpuDeepseekV2DecoderLayer decoder_layer_{nullptr};
@@ -288,6 +298,14 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
 
   void set_rolling_load_manager(RollingLoadManager* mgr) { rolling_mgr_ = mgr; }
 
+  void refresh_loaded_weights() {
+    npu_embed_tokens_->refresh_loaded_weights();
+    for (int i = 0; i < layers_.size(); i++) {
+      layers_[i]->refresh_loaded_weights();
+    }
+    norm_->refresh_loaded_weights();
+  }
+
   void prepare_expert_weight(int32_t layer_id,
                              const std::vector<int32_t>& expert_ids) {
     layers_[layer_id]->prepare_expert_weight(expert_ids);
@@ -301,6 +319,22 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
 
   void set_npu_word_embedding(layer::NpuWordEmbedding& npu_word_embedding) {
     npu_embed_tokens_ = npu_word_embedding;
+  }
+
+  std::vector<at::Tensor>& get_word_embedding_weight() {
+    return npu_embed_tokens_->get_at_weight_tensors();
+  }
+
+  std::vector<at::Tensor>& get_norm_weight() {
+    return norm_->get_at_weight_tensors();
+  }
+
+  std::vector<at::Tensor>& get_decoder_layer_weight_by_id(int32_t layer_id) {
+    return layers_[layer_id]->get_decoder_layer_weight();
+  }
+
+  std::vector<int> get_expert_weight_indices() const {
+    return layers_[0]->get_expert_weight_indices();
   }
 
  private:
@@ -340,6 +374,31 @@ class DeepseekV2ForCausalLMImpl
 
   void update_expert_weight(int32_t layer_id) override {
     model_->update_expert_weight(layer_id + first_k_dense_replace_);
+  }
+
+  std::vector<at::Tensor>& get_decoder_layer_weight(int32_t layer_id) {
+    return model_->get_decoder_layer_weight_by_id(layer_id);
+  }
+
+  std::vector<at::Tensor>& get_lm_head_weight() {
+    return npu_lm_head_->get_at_weight_tensors();
+  }
+
+  std::vector<at::Tensor>& get_word_embedding_weight() {
+    return model_->get_word_embedding_weight();
+  }
+
+  std::vector<at::Tensor>& get_norm_weight() {
+    return model_->get_norm_weight();
+  }
+
+  void refresh_loaded_weights() {
+    model_->refresh_loaded_weights();
+    npu_lm_head_->refresh_loaded_weights();
+  }
+
+  std::vector<int> get_expert_weight_indices() const override {
+    return model_->get_expert_weight_indices();
   }
 
  private:

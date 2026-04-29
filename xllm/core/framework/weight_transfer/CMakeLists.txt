@@ -1,0 +1,36 @@
+include(cc_binary)
+include(cc_library)
+include(cc_test)
+
+
+cc_library(
+  NAME
+    weight_transfer
+  HDRS
+    hccl_weight_transfer.h
+    hccl_weight_transfer_impl.h
+    weight_transfer_types.h
+    weight_transfer_common.h
+    weight_transfer_alltoall_planner.h
+    weight_transfer_session_manager.h
+    weight_transfer_sender_engine.h
+    weight_transfer_receiver_engine.h
+    weight_transfer_service_impl.h
+  SRCS
+    hccl_weight_transfer.cpp
+    hccl_weight_transfer_impl.cpp
+    weight_transfer_common.cpp
+    weight_transfer_alltoall_planner.cpp
+    weight_transfer_session_manager.cpp
+    weight_transfer_sender_engine.cpp
+    weight_transfer_receiver_engine.cpp
+    weight_transfer_service_impl.cpp
+  DEPS
+    :common
+    glog::glog
+    torch
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+    proto::xllm_proto
+    :util
+    brpc
+)

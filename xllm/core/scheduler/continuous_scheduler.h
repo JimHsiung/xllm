@@ -64,6 +64,8 @@ class ContinuousScheduler : public Scheduler {
 
     PROPERTY(int32_t, cp_size) = 1;
 
+    PROPERTY(int32_t, ep_size) = 1;
+
     // enable disaggregated PD mode.
     PROPERTY(bool, enable_disagg_pd) = false;
 

@@ -79,10 +79,8 @@ Worker::Worker(const ParallelArgs& parallel_args,
 
 Worker::~Worker() { delete impl_; }
 
-bool Worker::init_model(const std::string& model_weights_path,
-                        int32_t random_seed,
-                        MasterStatus master_status) {
-  return impl_->init_model(model_weights_path, random_seed, master_status);
+bool Worker::init_model(const InitModelParams& params) {
+  return impl_->init_model(params);
 }
 
 bool Worker::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
@@ -152,11 +150,8 @@ folly::SemiFuture<folly::Unit> Worker::process_group_test_async() {
 
 // initialize model, cache manager. async call
 folly::SemiFuture<bool> Worker::init_model_async(
-    const std::string& model_weights_path,
-    int32_t random_seed,
-    MasterStatus master_status) {
-  return impl_->init_model_async(
-      model_weights_path, random_seed, master_status);
+    const InitModelParams& params) {
+  return impl_->init_model_async(params);
 }
 
 folly::SemiFuture<bool> Worker::allocate_kv_cache_async(
@@ -236,5 +231,9 @@ folly::SemiFuture<bool> Worker::wakeup_async(const WakeupOptions& options) {
     promise.setValue(this->wakeup(options));
   });
   return future;
+}
+
+std::string Worker::get_weight_transfer_addr() {
+  return impl_->get_weight_transfer_addr();
 }
 }  // namespace xllm

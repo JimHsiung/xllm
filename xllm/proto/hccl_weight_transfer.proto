@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+option go_package = "jd.com/jd-infer/xllm;xllm";
+package xllm.proto;
+
+option cc_enable_arenas = true;
+option cc_generic_services = true;
+
+enum CommMode {
+  COMM_MODE_P2P = 0;
+  COMM_MODE_EXPERT_ALLTOALLV = 1;
+}
+
+message InitCommRequest {
+  string addr = 1;
+  bytes root_info = 2; // HcclRootInfo
+  uint32 n_ranks = 3;
+  uint32 rank = 4;
+  string session_id = 5;
+  CommMode comm_mode = 6;
+}
+
+message InitCommResponse {
+  bool success = 1;
+}
+
+message TensorMeta {
+  int32 dtype = 1;       // at::ScalarType
+  repeated int64 shape = 2;
+  int64 npu_format = 3;
+}
+
+message GetWeightsMetaRequest {
+  repeated int32 layer_ids = 1;
+}
+
+message LayerWeightsMeta {
+  int32 layer_id = 1;
+  repeated TensorMeta metas = 2;
+}
+
+message GetWeightsMetaResponse {
+  repeated LayerWeightsMeta layer_metas = 1;
+}
+
+message LayerExpertIds {
+  int32 layer_id = 1;
+  repeated int32 expert_ids = 2;
+}
+
+message AlltoAllRoundDesc {
+  int32 layer_id = 1;
+  int32 tensor_idx = 2;
+  int32 local_expert_start = 3;
+  int32 local_expert_count = 4;
+}
+
+message TriggerWeightsSendRequest {
+  repeated int32 layer_ids = 1;
+  repeated LayerExpertIds layer_expert_ids = 2;
+  bool include_non_expert = 3;
+  string session_id = 4;
+  bool use_alltoallv = 5;
+  uint32 receiver_rank = 6;
+  repeated AlltoAllRoundDesc alltoall_rounds = 7;
+}
+
+message TriggerWeightsSendResponse {
+  bool success = 1;
+  uint64 transferred_bytes = 2;
+  string error_msg = 3;
+}
+
+service WeightTransferService {
+  rpc InitComm(InitCommRequest) returns (InitCommResponse);
+
+  rpc GetWeightsMeta(GetWeightsMetaRequest) returns (GetWeightsMetaResponse);
+
+  rpc TriggerWeightsSend(TriggerWeightsSendRequest) returns (TriggerWeightsSendResponse);
+}

@@ -29,9 +29,7 @@ class Eagle3WorkerImpl : public MTPWorkerImpl {
   ~Eagle3WorkerImpl() override = default;
 
   // Override init_model to load hot_token_id_ for EAGLE-3
-  bool init_model(const std::string& model_weights_path,
-                  int32_t random_seed,
-                  MasterStatus master_status) override;
+  bool init_model(const InitModelParams& params) override;
 
   // EAGLE-3 draft input_embedding is 3 * target_hidden_size
   int64_t get_embedding_placeholder_size() override;

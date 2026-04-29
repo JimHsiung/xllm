@@ -164,6 +164,60 @@ struct has_init_or_refresh_rolling_runtime<
         std::declval<int32_t>(),
         std::declval<const std::string&>()))>> : std::true_type {};
 
+template <typename T, typename = void>
+struct has_get_decoder_layer_weight : std::false_type {};
+
+template <typename T>
+struct has_get_decoder_layer_weight<
+    T,
+    std::void_t<decltype(std::declval<T>()->get_decoder_layer_weight(
+        std::declval<int32_t>()))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_get_lm_head_weight : std::false_type {};
+
+template <typename T>
+struct has_get_lm_head_weight<
+    T,
+    std::void_t<decltype(std::declval<T>()->get_lm_head_weight())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct has_get_word_embedding_weight : std::false_type {};
+
+template <typename T>
+struct has_get_word_embedding_weight<
+    T,
+    std::void_t<decltype(std::declval<T>()->get_word_embedding_weight())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct has_get_norm_weight : std::false_type {};
+
+template <typename T>
+struct has_get_norm_weight<
+    T,
+    std::void_t<decltype(std::declval<T>()->get_norm_weight())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct has_get_expert_weight_indices : std::false_type {};
+
+template <typename T>
+struct has_get_expert_weight_indices<
+    T,
+    std::void_t<decltype(std::declval<const T>()->get_expert_weight_indices())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct has_refresh_loaded_weights : std::false_type {};
+
+template <typename T>
+struct has_refresh_loaded_weights<
+    T,
+    std::void_t<decltype(std::declval<T>()->refresh_loaded_weights())>>
+    : std::true_type {};
+
 #endif
 }  // namespace detail
 }  // namespace xllm

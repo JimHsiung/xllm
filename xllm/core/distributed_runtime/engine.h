@@ -21,6 +21,7 @@ limitations under the License.
 
 #include "framework/batch/batch.h"
 #include "framework/block/block_manager_pool.h"
+#include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/model/model_args.h"
 #include "framework/tokenizer/tokenizer.h"
 #include "framework/tokenizer/tokenizer_args.h"
@@ -121,6 +122,11 @@ class Engine {
     NOT_IMPLEMENTED();
   };
 
+  virtual std::vector<std::string> get_weight_transfer_addrs() {
+    LOG(FATAL) << " get_weight_transfer_addrs is notimplemented!";
+    return {};
+  };
+
   virtual bool link_cluster(const std::vector<uint64_t>& cluster_ids,
                             const std::vector<std::string>& addrs,
                             const std::vector<std::string>& device_ips,
@@ -171,6 +177,12 @@ class Engine {
       const std::vector<int32_t>& block_ids,
       std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>&
           layer_offsets) {
+    return false;
+  };
+
+  virtual bool get_expert_distribution(std::vector<int32_t>& dims,
+                                       std::vector<int32_t>& data) {
+    LOG(FATAL) << " get_expert_distribution is notimplemented!";
     return false;
   };
 

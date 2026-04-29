@@ -176,6 +176,22 @@ NpuQwen3DecoderLayerImpl::NpuQwen3DecoderLayerImpl(const ModelContext& context)
       FLAGS_enable_manual_loader ? LoadMode::kManual : LoadMode::kEager);
 }
 
+void NpuQwen3DecoderLayerImpl::merge_loaded_weights() {
+  loader_->merge_loaded_weights();
+  refresh_loaded_weights();
+}
+
+void NpuQwen3DecoderLayerImpl::refresh_loaded_weights() {
+  auto& at_weight_tensors = loader_->get_at_weight_tensors();
+  c10_npu::NPUCachingAllocator::emptyCache();
+  for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
+    atb_weight_tensors_[i] =
+        atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[i]);
+  }
+
+  init_layer();
+}
+
 int64_t NpuQwen3DecoderLayerImpl::init_layer() {
   init_attn_mask();
   name_ = "qwen3_decoder_layer";

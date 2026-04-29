@@ -54,19 +54,16 @@ Eagle3WorkerImpl::Eagle3WorkerImpl(const ParallelArgs& parallel_args,
                     eagle3_draft_options(options),
                     FLAGS_enable_opt_validate_probs) {}
 
-bool Eagle3WorkerImpl::init_model(const std::string& model_weights_path,
-                                  int32_t random_seed,
-                                  MasterStatus master_status) {
+bool Eagle3WorkerImpl::init_model(const InitModelParams& params) {
   // Call parent's init_model first
-  bool result =
-      MTPWorkerImpl::init_model(model_weights_path, random_seed, master_status);
+  bool result = MTPWorkerImpl::init_model(params);
 
   // Load hot_token_id_ directly from state_dict (EAGLE-3 specific)
   // This should be done after draft model is loaded
   if (draft_impl_->get_status() == WorkerImpl::Status::LOADED) {
     // d2t stores diffs between draft id and target id
     // hot_token_id = d2t + arange(d2t.size(0))
-    auto model_loader = ModelLoader::create(model_weights_path);
+    auto model_loader = ModelLoader::create(params.model_weights_path);
     auto& state_dicts = model_loader->get_state_dicts();
     for (const auto& state_dict : state_dicts) {
       torch::Tensor d2t_tensor = state_dict->get_tensor("d2t");

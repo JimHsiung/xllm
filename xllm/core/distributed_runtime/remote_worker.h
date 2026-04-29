@@ -47,9 +47,7 @@ class RemoteWorker : public WorkerClient {
 
   bool wait_for_server_ready(const std::string& server_address);
 
-  virtual bool init_model(const std::string& model_weights_path,
-                          int32_t random_seed,
-                          MasterStatus master_status) override;
+  virtual bool init_model(const InitModelParams& params) override;
 
   virtual std::tuple<int64_t, int64_t> estimate_kv_cache_capacity() override;
 
@@ -90,9 +88,7 @@ class RemoteWorker : public WorkerClient {
       const ForwardInput& inputs) override;
 
   virtual folly::SemiFuture<bool> init_model_async(
-      const std::string& model_weights_path,
-      int32_t random_seed,
-      MasterStatus master_status) override;
+      const InitModelParams& params) override;
 
   virtual folly::SemiFuture<std::tuple<int64_t, int64_t>>
   estimate_kv_cache_capacity_async() override;
@@ -153,6 +149,8 @@ class RemoteWorker : public WorkerClient {
 
   virtual folly::SemiFuture<bool> wakeup_async(
       const WakeupOptions& options) override;
+
+  virtual std::string get_weight_transfer_addr() override;
 
  private:
   DISALLOW_COPY_AND_ASSIGN(RemoteWorker);

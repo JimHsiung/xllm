@@ -342,7 +342,9 @@ Master::Master(const Options& options, EngineType type)
         .is_local(options_.is_local())
         .server_idx(options_.server_idx())
         .kv_cache_dtype(options_.kv_cache_dtype())
-        .model_id(options_.model_id());
+        .model_id(options_.model_id())
+        .weight_load_mode(options_.weight_load_mode())
+        .weight_transfer_port(options_.weight_transfer_port());
 
     if (options_.device_ip().has_value()) {
       eng_options.device_ip(options_.device_ip().value());

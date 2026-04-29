@@ -243,6 +243,10 @@ struct Options {
 
   // max concurrency for rec worker
   PROPERTY(int32_t, rec_worker_max_concurrency) = 1;
+
+  PROPERTY(std::string, weight_load_mode) = "disk";
+
+  PROPERTY(uint16_t, weight_transfer_port) = 26001;
 };
 
 }  // namespace runtime

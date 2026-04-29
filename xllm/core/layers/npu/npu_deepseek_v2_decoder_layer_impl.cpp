@@ -505,6 +505,27 @@ void NpuDeepseekV2DecoderLayerImpl::initialize_quantization_parameters(
   }
 }
 
+void NpuDeepseekV2DecoderLayerImpl::merge_loaded_weights() {
+  loader_->merge_loaded_weights();
+  auto& at_weight_tensors = loader_->get_at_weight_tensors();
+  c10_npu::NPUCachingAllocator::emptyCache();
+  for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
+    atb_weight_tensors_[i] =
+        atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[i]);
+  }
+  init_layer();
+}
+
+void NpuDeepseekV2DecoderLayerImpl::refresh_loaded_weights() {
+  auto& at_weight_tensors = loader_->get_at_weight_tensors();
+  c10_npu::NPUCachingAllocator::emptyCache();
+  for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
+    atb_weight_tensors_[i] =
+        atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[i]);
+  }
+  init_layer();
+}
+
 torch::Tensor NpuDeepseekV2DecoderLayerImpl::build_expert_routing_map(
     std::vector<int32_t> expert_lists) {
   std::unordered_map<int64_t, std::vector<int64_t>> expert_routing_map;
@@ -684,6 +705,24 @@ void NpuDeepseekV2DecoderLayerImpl::update_expert_weight() {
   expert_routing_map_[layer_id_ - first_k_dense_replace_] =
       expert_routing_map_buffer_;
   expert_routing_map_ = expert_routing_map_.contiguous();
+}
+
+std::vector<int> NpuDeepseekV2DecoderLayerImpl::get_expert_weight_indices()
+    const {
+  return {
+      IN_MLP_GATEUP_WEIGHT_EXPERT,
+      IN_MLP_GATEUP_BIAS_EXPERT,
+      IN_MLP_GATEUP_DESCALE_EXPERT,
+      IN_MLP_GATEUP_OFFSET_EXPERT,
+      IN_MLP_GATEUP_SCALE_EXPERT,
+      IN_MLP_GATEUP_COMPRESS_IDX_EXPERT,
+      IN_MLP_DOWN_WEIGHT_EXPERT,
+      IN_MLP_DOWN_BIAS_EXPERT,
+      IN_MLP_DOWN_DESCALE_EXPERT,
+      IN_MLP_DOWN_OFFSET_EXPERT,
+      IN_MLP_DOWN_SCALE_EXPERT,
+      IN_MLP_DOWN_COMPRESS_IDX_EXPERT,
+  };
 }
 
 int64_t NpuDeepseekV2DecoderLayerImpl::init_layer() {

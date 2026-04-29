@@ -322,8 +322,9 @@ int run() {
       .beam_width(FLAGS_beam_width)
       .kv_cache_dtype(FLAGS_kv_cache_dtype)
       .rec_worker_max_concurrency(FLAGS_rec_worker_max_concurrency)
-      .is_local(is_local);
-
+      .is_local(is_local)
+      .weight_load_mode(FLAGS_weight_load_mode)
+      .weight_transfer_port(FLAGS_weight_transfer_port);
   InstanceName::name()->set_name(options.instance_name().value_or(""));
 
   // master node

@@ -41,9 +41,7 @@ class WorkerClient {
   virtual ~WorkerClient() = default;
 
   // initialize model, cache manager. blocking call
-  virtual bool init_model(const std::string& model_weights_path,
-                          int32_t random_seed,
-                          MasterStatus master_status);
+  virtual bool init_model(const InitModelParams& params);
 
   virtual folly::SemiFuture<bool> sleep_async(MasterStatus master_status);
 
@@ -89,9 +87,7 @@ class WorkerClient {
 
   // initialize model, cache manager. async call
   virtual folly::SemiFuture<bool> init_model_async(
-      const std::string& model_weights_path,
-      int32_t random_seed,
-      MasterStatus master_status);
+      const InitModelParams& params);
 
   virtual folly::SemiFuture<std::tuple<int64_t, int64_t>>
   estimate_kv_cache_capacity_async();
@@ -146,6 +142,8 @@ class WorkerClient {
   virtual int64_t get_active_activation_memory();
 
   virtual folly::SemiFuture<int64_t> get_active_activation_memory_async();
+
+  virtual std::string get_weight_transfer_addr();
 
  private:
   Worker* worker_ = nullptr;  // not owend

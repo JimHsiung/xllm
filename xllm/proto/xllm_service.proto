@@ -5,6 +5,7 @@ package xllm.proto;
 option cc_enable_arenas = true;
 option cc_generic_services = true;
 
+import "common.proto";
 import "completion.proto";
 import "sample.proto";
 import "chat.proto";
@@ -13,7 +14,6 @@ import "image_generation.proto";
 import "rerank.proto";
 import "models.proto";
 import "anthropic.proto";
-import "common.proto";
 
 message HttpRequest {
 };
@@ -47,6 +47,11 @@ message MasterWeightSegmentList {
 message D2DLinkRequest {
   string model_id = 1;
   repeated string device_ips = 2;
+}
+
+message GetExpertDistributionResponse {
+  repeated int32 dims = 1;
+  repeated int32 data = 2;
 }
 
 service XllmAPIService {
@@ -89,4 +94,6 @@ service XllmAPIService {
 
   rpc UnlinkD2D (D2DLinkRequest) returns (Status);
   rpc UnlinkD2DHttp (HttpRequest) returns (HttpResponse);
-}; 
+
+  rpc GetExpertDistribution (Empty) returns (GetExpertDistributionResponse);
+};

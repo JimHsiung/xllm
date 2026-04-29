@@ -102,6 +102,8 @@ class LLMEngine : public Engine {
       std::unordered_map<std::string, std::vector<WeightSegment>>&
           model_weight_segments) override;
 
+  std::vector<std::string> get_weight_transfer_addrs() override;
+
   bool link_cluster(const std::vector<uint64_t>& cluster_ids,
                     const std::vector<std::string>& addrs,
                     const std::vector<std::string>& device_ips,
@@ -132,6 +134,9 @@ class LLMEngine : public Engine {
       const std::vector<int32_t>& block_ids,
       std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>&
           layer_offsets) override;
+
+  bool get_expert_distribution(std::vector<int32_t>& dims,
+                               std::vector<int32_t>& data) override;
 
  private:
   friend class SpeculativeEngine;

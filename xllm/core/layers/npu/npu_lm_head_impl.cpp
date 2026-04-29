@@ -116,6 +116,18 @@ NpuLmHeadImpl::NpuLmHeadImpl(const ModelContext& context) : BaseLayer(context) {
       FLAGS_enable_manual_loader ? LoadMode::kManual : LoadMode::kEager);
 }
 
+void NpuLmHeadImpl::merge_loaded_weights() {
+  loader_->merge_loaded_weights();
+  refresh_loaded_weights();
+}
+
+void NpuLmHeadImpl::refresh_loaded_weights() {
+  auto& at_weight_tensors = loader_->get_at_weight_tensors();
+  atb_weight_tensors_[0] =
+      atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[0]);
+  init_layer();
+}
+
 int64_t NpuLmHeadImpl::init_layer() {
   BaseLayer::name_ = "lm_head_layer";
   model_name_ = "lm";

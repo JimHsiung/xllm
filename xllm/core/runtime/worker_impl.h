@@ -24,6 +24,11 @@ limitations under the License.
 #include "common/types.h"
 #include "executor.h"
 #include "forward_params.h"
+#include "framework/model_context.h"
+#if defined(USE_NPU)
+#include "framework/kv_cache_transfer/llm_data_dist_transfer.h"
+#include "framework/weight_transfer/hccl_weight_transfer.h"
+#endif
 #include "framework/eplb/eplb_executor.h"
 #include "framework/kv_cache/kv_cache_shape.h"
 #include "framework/kv_cache_transfer/hierarchy_kv_cache_transfer.h"
@@ -65,13 +70,15 @@ class WorkerImpl {
   // initialize model, cache manager. blocking call
   virtual bool init_model(ModelContext& context) = 0;
 
-  virtual bool init_model(const std::string& model_weights_path,
-                          int32_t random_seed,
-                          MasterStatus master_status);
+  virtual bool init_model(const InitModelParams& params);
 
   virtual void load_model(std::unique_ptr<ModelLoader> loader);
 
   virtual void lazy_load_model(std::unique_ptr<ModelLoader> loader);
+
+  virtual void load_model_from_instance(
+      const std::string& remote_addr,
+      const RankExpertTransferPlanData& rank_expert_transfer_plan);
 
   virtual std::tuple<int64_t, int64_t> estimate_kv_cache_capacity();
 
@@ -126,9 +133,7 @@ class WorkerImpl {
 
   // initialize model, cache manager. async call
   virtual folly::SemiFuture<bool> init_model_async(
-      const std::string& model_weights_path,
-      int32_t random_seed,
-      MasterStatus master_status);
+      const InitModelParams& params);
 
   virtual folly::SemiFuture<std::tuple<int64_t, int64_t>>
   estimate_kv_cache_capacity_async();
@@ -180,6 +185,8 @@ class WorkerImpl {
   }
 
   virtual ForwardOutput get_last_step_result();
+
+  virtual std::string get_weight_transfer_addr();
 
   bool is_driver() const { return driver_ || dp_driver_; }
 
@@ -283,6 +290,10 @@ class WorkerImpl {
   InstanceRole instance_role_ = InstanceRole::DEFAULT;
 
   std::shared_ptr<KVCacheTransfer> kv_cache_transfer_;
+#if defined(USE_NPU)
+  std::unique_ptr<HcclWeightTransfer> hccl_weight_transfer_;
+#endif
+
   std::unique_ptr<HierarchyKVCacheTransfer> hierarchy_kv_cache_transfer_;
 
 #if defined(USE_CUDA)

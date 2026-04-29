@@ -719,3 +719,15 @@ DEFINE_bool(enable_xattention_one_stage,
             false,
             "Whether to force xattention one-stage decode for rec "
             "multi-round mode.");
+
+// --- weight load config ---
+DEFINE_string(weight_load_mode,
+              "disk",
+              "The mode to load model weights: 'disk' or 'remote'.");
+
+DEFINE_int32(weight_transfer_port, 26001, "The WeightTranfer listen port.");
+
+DEFINE_bool(enable_parallel_weight_pull,
+            false,
+            "Whether to pull non-expert and expert weights in parallel when "
+            "expert transfer plan is available.");

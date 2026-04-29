@@ -49,6 +49,14 @@ class NpuRMSNormImpl : public BaseLayer {
 
   ~NpuRMSNormImpl() override = default;
 
+  // void load_state_dict(const StateDict& state_dict) override;
+
+  // void verify_loaded_weights(const std::string weight_str) const;
+
+  void merge_loaded_weights() override;
+
+  void refresh_loaded_weights() override;
+
   torch::Tensor forward(torch::Tensor& x, int nodeId);
 
  private:

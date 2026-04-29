@@ -337,3 +337,9 @@ DECLARE_bool(enable_intralayer_addnorm);
 #endif
 
 DECLARE_int32(health_check_interval_ms);
+
+DECLARE_string(weight_load_mode);
+
+DECLARE_int32(weight_transfer_port);
+
+DECLARE_bool(enable_parallel_weight_pull);

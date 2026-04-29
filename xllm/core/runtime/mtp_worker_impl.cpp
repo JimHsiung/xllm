@@ -68,18 +68,14 @@ MTPWorkerImpl::MTPWorkerImpl(const ParallelArgs& parallel_args,
       std::make_unique<LLMWorkerImpl>(parallel_args, device, draft_options);
 }
 
-bool MTPWorkerImpl::init_model(const std::string& model_weights_path,
-                               int32_t random_seed,
-                               MasterStatus master_status) {
+bool MTPWorkerImpl::init_model(const InitModelParams& params) {
   // Load target model via base class
   bool result = true;
   if (impl_->get_status() == WorkerImpl::Status::UNINITIALIZED) {
-    result = SpeculativeWorkerImpl::init_model(
-        model_weights_path, random_seed, master_status);
+    result = SpeculativeWorkerImpl::init_model(params);
   } else {
     CHECK_EQ(draft_impl_->get_status(), WorkerImpl::Status::UNINITIALIZED);
-    result = draft_impl_->WorkerImpl::init_model(
-        model_weights_path, random_seed, master_status);
+    result = draft_impl_->WorkerImpl::init_model(params);
   }
 
   if (draft_impl_ != nullptr &&

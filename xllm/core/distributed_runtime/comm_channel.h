@@ -28,6 +28,7 @@ limitations under the License.
 #include "framework/xtensor/xtensor.h"
 #include "runtime/forward_params.h"
 #include "runtime/params_utils.h"
+#include "runtime/worker.h"
 #include "worker.pb.h"
 
 namespace xllm {
@@ -64,14 +65,9 @@ class CommChannel {
   virtual bool link_d2d(const std::string& remote_addr);
   virtual bool unlink_d2d(const std::string& remote_addr);
 
-  virtual bool init_model(const std::string& model_weights_path,
-                          int32_t random_seed,
-                          MasterStatus master_status);
-
-  virtual bool init_model_async(const std::string& model_weights_path,
-                                int32_t random_seed,
-                                folly::Promise<bool>& promise,
-                                MasterStatus master_status);
+  virtual bool init_model(const InitModelParams& params);
+  virtual bool init_model_async(const InitModelParams& params,
+                                folly::Promise<bool>& promise);
 
   virtual bool estimate_kv_cache_capacity(int64_t& available_memory,
                                           int64_t& total_memory);
@@ -119,6 +115,8 @@ class CommChannel {
   virtual bool sleep(MasterStatus master_status);
 
   virtual bool wakeup(const WakeupOptions& options);
+
+  virtual std::string get_weight_transfer_addr();
 
  protected:
   bool execute_model_with_brpc(

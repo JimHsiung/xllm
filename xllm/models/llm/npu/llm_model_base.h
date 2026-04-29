@@ -604,6 +604,27 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
     return true;
   }
 
+  std::vector<at::Tensor>& get_decoder_layer_weight(int32_t id) {
+    static std::vector<at::Tensor> empty_vector;
+    return empty_vector;
+  }
+  std::vector<at::Tensor>& get_lm_head_weight() {
+    static std::vector<at::Tensor> empty_vector;
+    return empty_vector;
+  }
+  std::vector<at::Tensor>& get_word_embedding_weight() {
+    static std::vector<at::Tensor> empty_vector;
+    return empty_vector;
+  }
+  std::vector<at::Tensor>& get_norm_weight() {
+    static std::vector<at::Tensor> empty_vector;
+    return empty_vector;
+  }
+
+  void refresh_loaded_weights() {}
+
+  virtual std::vector<int> get_expert_weight_indices() const { return {}; }
+
  protected:
   // parameter members, must be registered
   LlmModelType model_{nullptr};

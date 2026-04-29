@@ -52,14 +52,11 @@ SpeculativeWorkerImpl::SpeculativeWorkerImpl(
   }
 }
 
-bool SpeculativeWorkerImpl::init_model(const std::string& model_weights_path,
-                                       int32_t random_seed,
-                                       MasterStatus master_status) {
-  // Base class only loads the target model.
+bool SpeculativeWorkerImpl::init_model(const InitModelParams& params) {
+  // initialize model
   bool result = true;
   if (impl_->get_status() == WorkerImpl::Status::UNINITIALIZED) {
-    result = impl_->WorkerImpl::init_model(
-        model_weights_path, random_seed, master_status);
+    result = impl_->WorkerImpl::init_model(params);
     if (result) {
       dtype_ = impl_->dtype();
       embedding_size_ = impl_->hidden_size();

@@ -41,6 +41,7 @@ limitations under the License.
 #include "framework/xtensor/xtensor_allocator.h"
 #include "runtime/llm_worker_impl.h"
 #include "runtime/worker.h"
+#include "runtime/xservice_client.h"
 #include "server/xllm_server_registry.h"
 #include "util/env_var.h"
 #include "util/pretty_print.h"
@@ -304,13 +305,45 @@ bool LLMEngine::init_model(MasterStatus master_status) {
     }
   }
 
+  // get weight transfer source and plan
+  WeightTransferPlanResult weight_transfer_plan_result;
+  bool has_valid_weight_transfer_source = false;
+  if (options_.weight_load_mode() != "disk" &&
+      options_.enable_service_routing()) {
+    CHECK(XServiceClient::get_instance()->initialize_done());
+    has_valid_weight_transfer_source =
+        XServiceClient::get_instance()->get_weight_transfer_plan(
+            options_.nnodes(),
+            options_.dp_size(),
+            options_.ep_size(),
+            &weight_transfer_plan_result);
+    if (!has_valid_weight_transfer_source) {
+      weight_transfer_plan_result.weight_transfer_addrs.clear();
+    }
+  }
+
   // init model for each worker in parallel
   // multiple workers, call async init
   std::vector<folly::SemiFuture<bool>> futures;
   futures.reserve(worker_clients_num_);
-  for (auto& worker : worker_clients_) {
-    futures.push_back(
-        worker->init_model_async(model_path, FLAGS_random_seed, master_status));
+  bool use_remote_addr =
+      has_valid_weight_transfer_source &&
+      weight_transfer_plan_result.weight_transfer_addrs.size() ==
+          worker_clients_num_;
+  for (size_t i = 0; i < worker_clients_.size(); ++i) {
+    InitModelParams params;
+    params.model_weights_path = model_path;
+    params.random_seed = FLAGS_random_seed;
+    params.master_status = master_status;
+    if (use_remote_addr) {
+      params.remote_addr = weight_transfer_plan_result.weight_transfer_addrs[i];
+      if (i <
+          weight_transfer_plan_result.expert_transfer_plan.rank_plans.size()) {
+        params.rank_expert_transfer_plan =
+            weight_transfer_plan_result.expert_transfer_plan.rank_plans[i];
+      }
+    }
+    futures.push_back(worker_clients_[i]->init_model_async(params));
   }
   // wait for all futures to complete
   auto results = folly::collectAll(futures).get();
@@ -787,6 +820,17 @@ void LLMEngine::get_xtensor_info(
   // Worker 0 is always in dp group 0, weights are duplicated across dp groups
   auto& xtensor_allocator = XTensorAllocator::get_instance();
   model_weight_segments = xtensor_allocator.get_all_model_weight_segments();
+}
+
+std::vector<std::string> LLMEngine::get_weight_transfer_addrs() {
+  std::vector<std::string> weight_transfer_addrs;
+  weight_transfer_addrs.reserve(worker_clients_num_);
+  for (size_t worker_rank = 0; worker_rank < worker_clients_num_;
+       ++worker_rank) {
+    weight_transfer_addrs.emplace_back(
+        worker_clients_[worker_rank]->get_weight_transfer_addr());
+  }
+  return weight_transfer_addrs;
 }
 
 bool LLMEngine::link_cluster(const std::vector<uint64_t>& cluster_ids,
@@ -1358,6 +1402,79 @@ bool LLMEngine::get_xtensor_offsets_for_blocks(
   VLOG(1) << "get_xtensor_offsets_for_blocks: dp_rank=" << dp_rank
           << ", num_blocks=" << block_ids.size()
           << ", num_layers=" << layer_offsets.size();
+  return true;
+}
+
+bool LLMEngine::get_expert_distribution(std::vector<int32_t>& dims,
+                                        std::vector<int32_t>& data) {
+  if (FLAGS_enable_eplb && eplb_manager_) {
+    auto dist = eplb_manager_->get_expert_distribution();
+    if (dist.numel() == 0 || dist.dim() != 3) {
+      return false;
+    }
+    dims.clear();
+    dims.reserve(dist.dim());
+    for (int i = 0; i < dist.dim(); ++i) {
+      dims.emplace_back(static_cast<int32_t>(dist.size(i)));
+    }
+    auto contiguous = dist.contiguous();
+    int32_t* ptr = contiguous.data_ptr<int32_t>();
+    data.assign(ptr, ptr + contiguous.numel());
+    return true;
+  }
+
+  bool is_deepseek_moe =
+      args_.n_routed_experts() > 0 && args_.num_experts_per_tok() > 0;
+  bool is_qwen_moe = args_.num_experts() > 0 && args_.num_experts_per_tok() > 0;
+  if (!is_deepseek_moe && !is_qwen_moe) {
+    dims.clear();
+    data.clear();
+    return false;
+  }
+
+  int32_t layer_num = 0;
+  int32_t device_num = static_cast<int32_t>(options_.ep_size());
+  int32_t experts_num = 0;
+  if (is_deepseek_moe) {
+    layer_num = args_.n_layers() - args_.first_k_dense_replace();
+    experts_num = static_cast<int32_t>(args_.n_routed_experts());
+  } else {
+    auto mlp_only_layers = args_.mlp_only_layers();
+    auto stride = std::max<int32_t>(args_.decoder_sparse_step(), 1);
+    for (int32_t layer = 0; layer < args_.n_layers(); ++layer) {
+      bool mlp_only =
+          std::find(mlp_only_layers.begin(), mlp_only_layers.end(), layer) !=
+          mlp_only_layers.end();
+      bool is_moe_layer = !mlp_only && ((layer + 1) % stride == 0);
+      if (is_moe_layer) {
+        ++layer_num;
+      }
+    }
+    experts_num = static_cast<int32_t>(args_.num_experts());
+  }
+  if (layer_num <= 0 || device_num <= 0 || experts_num <= 0) {
+    return false;
+  }
+  int32_t device_route_experts_num = experts_num / device_num;
+  int32_t device_experts_num = device_route_experts_num;
+
+  dims.clear();
+  dims.reserve(3);
+  dims.emplace_back(layer_num);
+  dims.emplace_back(device_num);
+  dims.emplace_back(device_experts_num);
+
+  data.clear();
+  data.reserve(static_cast<size_t>(layer_num) * device_num *
+               device_experts_num);
+  for (int32_t layer = 0; layer < layer_num; ++layer) {
+    for (int32_t device = 0; device < device_num; ++device) {
+      int32_t base = device * device_route_experts_num;
+      for (int32_t expert = 0; expert < device_experts_num; ++expert) {
+        data.emplace_back(base + expert);
+      }
+    }
+  }
   return true;
 }
 

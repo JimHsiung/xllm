@@ -20,6 +20,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <boost/algorithm/string.hpp>
+#include <utility>
 #include <vector>
 
 #include "common/global_flags.h"
@@ -33,6 +34,29 @@ limitations under the License.
 #include "runtime/forward_params.h"
 #include "runtime/params_utils.h"
 #include "util/timer.h"
+
+namespace {
+
+xllm::RankExpertTransferPlanData parse_rank_expert_transfer_plan(
+    const xllm::proto::RankExpertTransferPlan& pb_plan) {
+  xllm::RankExpertTransferPlanData rank_plan;
+  rank_plan.layer_plans.reserve(pb_plan.layer_plans_size());
+  for (const auto& pb_layer_plan : pb_plan.layer_plans()) {
+    xllm::LayerExpertTransferPlanData layer_plan;
+    layer_plan.source_experts.reserve(pb_layer_plan.source_experts_size());
+    for (const auto& pb_source_expert : pb_layer_plan.source_experts()) {
+      xllm::SourceExpertIdsData source_expert;
+      source_expert.source_addr = pb_source_expert.source_addr();
+      source_expert.expert_ids.assign(pb_source_expert.expert_ids().begin(),
+                                      pb_source_expert.expert_ids().end());
+      layer_plan.source_experts.emplace_back(std::move(source_expert));
+    }
+    rank_plan.layer_plans.emplace_back(std::move(layer_plan));
+  }
+  return rank_plan;
+}
+
+}  // namespace
 
 namespace xllm {
 
@@ -260,12 +284,14 @@ void WorkerService::InitModel(::google::protobuf::RpcController* controller,
                               ::google::protobuf::Closure* done) {
   threadpool_->schedule([this, controller, request, response, done]() mutable {
     brpc::ClosureGuard done_guard(done);
-    auto model_weights_path = request->model_weights_path();
-    auto random_seed = request->random_seed();
-    auto init_future =
-        worker_->init_model_async(model_weights_path,
-                                  random_seed,
-                                  MasterStatus(request->master_status()));
+    InitModelParams params;
+    params.model_weights_path = request->model_weights_path();
+    params.random_seed = request->random_seed();
+    params.master_status = MasterStatus(request->master_status());
+    params.remote_addr = request->remote_addr();
+    params.rank_expert_transfer_plan =
+        parse_rank_expert_transfer_plan(request->rank_expert_transfer_plan());
+    auto init_future = worker_->init_model_async(params);
     bool status = std::move(init_future).get();
     if (!status) {
       response->set_ok(false);
@@ -747,6 +773,21 @@ void WorkerService::GetActiveActivationMemory(
     int64_t active_activation_memory = std::move(future).get();
     resp->set_active_activation_memory(active_activation_memory);
   });
+  return;
+}
+
+void WorkerService::GetWeightTransferAddr(
+    ::google::protobuf::RpcController* controller,
+    const proto::Empty* req,
+    proto::WeightTransferAddr* resp,
+    ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!initialized_) {
+    auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+    ctrl->SetFailed("Server is not initialized");
+    return;
+  }
+  resp->set_addr(worker_->get_weight_transfer_addr());
   return;
 }
 }  // namespace xllm

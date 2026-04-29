@@ -58,20 +58,24 @@ LLMMaster::LLMMaster(const Options& options)
     : Master(
           options,
           should_use_ssm_engine(options) ? EngineType::SSM : EngineType::LLM) {
+  if (options_.enable_service_routing()) {
+    xservice_client_ = XServiceClient::get_instance();
+    if (!xservice_client_->init(options_.etcd_addr().value_or(""),
+                                options_.instance_name().value_or(""),
+                                nullptr,
+                                options_.etcd_namespace().value_or(""))) {
+      LOG(FATAL) << "XServiceClient init fail!";
+      return;
+    }
+  }
+
   CHECK(engine_->init(master_status_));
   task_type_ = options_.task_type();
 
   model_args_ = engine_->model_args();
 
   if (options_.enable_service_routing()) {
-    xservice_client_ = XServiceClient::get_instance();
-    if (!xservice_client_->init(options_.etcd_addr().value_or(""),
-                                options_.instance_name().value_or(""),
-                                engine_->block_manager_pool(),
-                                options_.etcd_namespace().value_or(""))) {
-      LOG(FATAL) << "XServiceClient init fail!";
-      return;
-    }
+    xservice_client_->start_heartbeat(engine_->block_manager_pool());
   }
 
   ContinuousScheduler::Options scheduler_options;
@@ -83,6 +87,7 @@ LLMMaster::LLMMaster(const Options& options)
       .nnodes(options_.nnodes())
       .dp_size(options_.dp_size())
       .cp_size(options_.cp_size())
+      .ep_size(options_.ep_size())
       .enable_disagg_pd(options_.enable_disagg_pd())
       .enable_pd_ooc(options_.enable_pd_ooc())
       .enable_schedule_overlap(options_.enable_schedule_overlap())
@@ -577,6 +582,11 @@ LLMAssistantMaster::~LLMAssistantMaster() {
   if (loop_thread_.joinable()) {
     loop_thread_.join();
   }
+}
+
+void LLMMaster::get_expert_distribution(std::vector<int32_t>& dims,
+                                        std::vector<int32_t>& data) {
+  engine_->get_expert_distribution(dims, data);
 }
 
 void LLMAssistantMaster::run() {

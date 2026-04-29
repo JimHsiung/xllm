@@ -206,6 +206,18 @@ class BaseLayer : public torch::nn::Module {
 
   virtual void run_task(std::string taskName, std::function<int()> task) const;
 
+  std::vector<at::Tensor>& get_at_weight_tensors() {
+    if (loader_) {
+      return loader_->get_at_weight_tensors();
+    }
+    return at_weight_tensors_;
+  }
+
+  virtual void refresh_loaded_weights() {};
+
+ protected:
+  atb::Tensor XTensor2Tensor(const std::shared_ptr<xllm::XTensor>& xtensor);
+
  protected:
   std::unique_ptr<BaseLoader> loader_ = nullptr;
   std::vector<at::Tensor> at_weight_tensors_;

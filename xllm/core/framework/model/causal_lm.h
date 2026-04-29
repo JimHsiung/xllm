@@ -108,6 +108,34 @@ class CausalLM : public torch::nn::Module {
     NOT_IMPLEMENTED();
     return false;
   }
+
+  // weight transfer interface
+  virtual std::vector<at::Tensor>& get_decoder_layer_weight(int32_t layer_id) {
+    static std::vector<at::Tensor> empty_vector;
+    return empty_vector;
+  }
+
+  virtual std::vector<at::Tensor>& get_lm_head_weight() {
+    static std::vector<at::Tensor> empty_vector;
+    return empty_vector;
+  }
+
+  virtual std::vector<at::Tensor>& get_word_embedding_weight() {
+    static std::vector<at::Tensor> empty_vector;
+    return empty_vector;
+  }
+
+  virtual std::vector<at::Tensor>& get_norm_weight() {
+    static std::vector<at::Tensor> empty_vector;
+    return empty_vector;
+  };
+
+  virtual std::vector<int> get_expert_weight_indices() const {
+    static std::vector<int> empty_vector;
+    return empty_vector;
+  }
+
+  virtual void refresh_loaded_weights() {};
 #endif
 
   virtual layer::LmHead get_lm_head() {
@@ -254,6 +282,54 @@ class CausalLMImpl : public CausalLM {
                                                      num_cached_slots,
                                                      requested_rolling_slots,
                                                      model_id);
+  }
+
+  std::vector<at::Tensor>& get_decoder_layer_weight(int32_t layer_id) override {
+    if constexpr (detail::has_get_decoder_layer_weight<Model>::value) {
+      return model_->get_decoder_layer_weight(layer_id);
+    } else {
+      return CausalLM::get_decoder_layer_weight(layer_id);
+    }
+  }
+
+  std::vector<at::Tensor>& get_lm_head_weight() override {
+    if constexpr (detail::has_get_lm_head_weight<Model>::value) {
+      return model_->get_lm_head_weight();
+    } else {
+      return CausalLM::get_lm_head_weight();
+    }
+  }
+
+  std::vector<at::Tensor>& get_word_embedding_weight() override {
+    if constexpr (detail::has_get_word_embedding_weight<Model>::value) {
+      return model_->get_word_embedding_weight();
+    } else {
+      return CausalLM::get_word_embedding_weight();
+    }
+  }
+
+  std::vector<at::Tensor>& get_norm_weight() override {
+    if constexpr (detail::has_get_norm_weight<Model>::value) {
+      return model_->get_norm_weight();
+    } else {
+      return CausalLM::get_norm_weight();
+    }
+  }
+
+  std::vector<int> get_expert_weight_indices() const override {
+    if constexpr (detail::has_get_expert_weight_indices<Model>::value) {
+      return model_->get_expert_weight_indices();
+    } else {
+      return CausalLM::get_expert_weight_indices();
+    }
+  }
+
+  void refresh_loaded_weights() override {
+    if constexpr (detail::has_refresh_loaded_weights<Model>::value) {
+      model_->refresh_loaded_weights();
+    } else {
+      CausalLM::refresh_loaded_weights();
+    }
   }
 #endif
 

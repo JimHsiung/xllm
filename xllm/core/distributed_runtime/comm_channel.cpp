@@ -20,6 +20,31 @@ limitations under the License.
 
 #include <future>
 
+namespace {
+
+void fill_rank_expert_transfer_plan_pb(
+    const xllm::RankExpertTransferPlanData& plan,
+    xllm::proto::RankExpertTransferPlan* pb_plan) {
+  if (pb_plan == nullptr) {
+    return;
+  }
+  pb_plan->clear_layer_plans();
+  for (const auto& layer_plan : plan.layer_plans) {
+    auto* pb_layer_plan = pb_plan->add_layer_plans();
+    for (const auto& source_expert : layer_plan.source_experts) {
+      auto* pb_source_expert = pb_layer_plan->add_source_experts();
+      pb_source_expert->set_source_addr(source_expert.source_addr);
+      pb_source_expert->mutable_expert_ids()->Reserve(
+          source_expert.expert_ids.size());
+      for (int32_t expert_id : source_expert.expert_ids) {
+        pb_source_expert->add_expert_ids(expert_id);
+      }
+    }
+  }
+}
+
+}  // namespace
+
 namespace xllm {
 
 bool CommChannel::init_brpc(const std::string& server_address) {
@@ -206,14 +231,16 @@ bool CommChannel::unlink_d2d(const std::string& remote_addr) {
   return true;
 }
 
-bool CommChannel::init_model(const std::string& model_weights_path,
-                             int32_t random_seed,
-                             MasterStatus master_status) {
+bool CommChannel::init_model(const InitModelParams& params) {
   proto::InitModelRequest request;
+  request.set_model_weights_path(params.model_weights_path);
+  request.set_random_seed(params.random_seed);
+  request.set_master_status(params.master_status.to_proto());
+  request.set_remote_addr(params.remote_addr);
+  fill_rank_expert_transfer_plan_pb(
+      params.rank_expert_transfer_plan,
+      request.mutable_rank_expert_transfer_plan());
 
-  request.set_model_weights_path(model_weights_path);
-  request.set_random_seed(random_seed);
-  request.set_master_status(master_status.to_proto());
   proto::Status response;
   brpc::Controller cntl;
   stub_->InitModel(&cntl, &request, &response, nullptr);
@@ -224,15 +251,17 @@ bool CommChannel::init_model(const std::string& model_weights_path,
   return true;
 }
 
-bool CommChannel::init_model_async(const std::string& model_weights_path,
-                                   int32_t random_seed,
-                                   folly::Promise<bool>& promise,
-                                   MasterStatus master_status) {
+bool CommChannel::init_model_async(const InitModelParams& params,
+                                   folly::Promise<bool>& promise) {
   proto::InitModelRequest request;
+  request.set_model_weights_path(params.model_weights_path);
+  request.set_random_seed(params.random_seed);
+  request.set_master_status(params.master_status.to_proto());
+  request.set_remote_addr(params.remote_addr);
+  fill_rank_expert_transfer_plan_pb(
+      params.rank_expert_transfer_plan,
+      request.mutable_rank_expert_transfer_plan());
 
-  request.set_model_weights_path(model_weights_path);
-  request.set_random_seed(random_seed);
-  request.set_master_status(master_status.to_proto());
   auto done = new InitModelClosure();
   done->promise = std::move(promise);
   stub_->InitModel(&done->cntl, &request, &done->response, done);
@@ -580,6 +609,18 @@ void TransferBlocksClosure::Run() {
     promise.setValue(response.success_cnt());
   }
   return;
+}
+
+std::string CommChannel::get_weight_transfer_addr() {
+  brpc::Controller cntl;
+  proto::Empty req;
+  proto::WeightTransferAddr resp;
+  stub_->GetWeightTransferAddr(&cntl, &req, &resp, nullptr);
+  if (cntl.Failed()) {
+    LOG(ERROR) << "GetWeightTransferAddr failed: " << cntl.ErrorText();
+    return "";
+  }
+  return resp.addr();
 }
 
 }  // namespace xllm

@@ -45,6 +45,16 @@ namespace xllm {
 
 VLMMaster::VLMMaster(const Options& options)
     : Master(options, EngineType::VLM) {
+  XServiceClient* xservice_client = nullptr;
+  if (options_.enable_service_routing()) {
+    xservice_client = XServiceClient::get_instance();
+    if (!xservice_client->init_client(options_.etcd_addr().value_or(""),
+                                      options_.instance_name().value_or(""))) {
+      LOG(FATAL) << "XServiceClient init fail!";
+      return;
+    }
+  }
+
   CHECK(engine_->init());
 
   model_args_ = engine_->model_args();

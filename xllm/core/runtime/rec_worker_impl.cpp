@@ -1460,10 +1460,8 @@ RecWorkerImpl::~RecWorkerImpl() {
   }
 }
 
-bool RecWorkerImpl::init_model(const std::string& model_weights_path,
-                               int32_t random_seed,
-                               MasterStatus master_status) {
-  if (!WorkerImpl::init_model(model_weights_path, random_seed, master_status)) {
+bool RecWorkerImpl::init_model(const InitModelParams& params) {
+  if (!WorkerImpl::init_model(params)) {
     return false;
   }
 

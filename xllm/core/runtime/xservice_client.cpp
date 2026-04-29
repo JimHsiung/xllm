@@ -23,6 +23,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <unordered_map>
+#include <utility>
 
 #include "util/env_var.h"
 #include "util/hash_util.h"
@@ -66,6 +67,33 @@ bool check_instance_name(const std::string& name) {
   }
 
   return true;
+}
+
+void parse_expert_transfer_plan(
+    const xllm_service::proto::ExpertTransferPlan& pb_plan,
+    ExpertTransferPlanData* result_plan) {
+  if (result_plan == nullptr) {
+    return;
+  }
+  result_plan->rank_plans.clear();
+  result_plan->rank_plans.reserve(pb_plan.rank_plans_size());
+  for (const auto& pb_rank_plan : pb_plan.rank_plans()) {
+    RankExpertTransferPlanData rank_plan;
+    rank_plan.layer_plans.reserve(pb_rank_plan.layer_plans_size());
+    for (const auto& pb_layer_plan : pb_rank_plan.layer_plans()) {
+      LayerExpertTransferPlanData layer_plan;
+      layer_plan.source_experts.reserve(pb_layer_plan.source_experts_size());
+      for (const auto& pb_source_expert : pb_layer_plan.source_experts()) {
+        SourceExpertIdsData source_expert;
+        source_expert.source_addr = pb_source_expert.source_addr();
+        source_expert.expert_ids.assign(pb_source_expert.expert_ids().begin(),
+                                        pb_source_expert.expert_ids().end());
+        layer_plan.source_experts.emplace_back(std::move(source_expert));
+      }
+      rank_plan.layer_plans.emplace_back(std::move(layer_plan));
+    }
+    result_plan->rank_plans.emplace_back(std::move(rank_plan));
+  }
 }
 
 }  // namespace
@@ -141,6 +169,20 @@ bool XServiceClient::init(const std::string& etcd_addr,
     }
   }
 
+  initialize_done_ = true;
+  if (block_manager_pool != nullptr) {
+    start_heartbeat(block_manager_pool);
+  }
+  return true;
+}
+
+bool XServiceClient::init_client(const std::string& etcd_addr,
+                                 const std::string& instance_name) {
+  return init(etcd_addr, instance_name);
+}
+
+void XServiceClient::start_heartbeat(
+    const BlockManagerPool* block_manager_pool) {
   // heartbeat thread
   heartbeat_thread_ =
       std::make_unique<std::thread>(&XServiceClient::heartbeat, this);
@@ -162,9 +204,6 @@ bool XServiceClient::init(const std::string& etcd_addr,
   etcd_client_->add_watch(ETCD_XSERVICES_KEY_PREFIX, xservices_func);
 
   block_manager_pool_ = block_manager_pool;
-
-  initialize_done_ = true;
-  return true;
 }
 
 void XServiceClient::set_scheduler(Scheduler* scheduler) {
@@ -336,8 +375,69 @@ InstanceInfo XServiceClient::get_instance_info(
   for (auto& port : resp.ports()) {
     result.ports.emplace_back(port);
   }
+  for (auto& addr : resp.weight_transfer_addrs()) {
+    result.weight_transfer_addrs.emplace_back(addr);
+  }
+  result.world_size = resp.world_size();
+  result.ep_size = resp.ep_size();
 
   return result;
+}
+
+bool XServiceClient::get_weight_transfer_plan(
+    int32_t world_size,
+    int32_t dp_size,
+    int32_t ep_size,
+    WeightTransferPlanResult* result) {
+  if (result == nullptr) {
+    LOG(ERROR) << "Weight transfer plan result should not be nullptr.";
+    return false;
+  }
+  *result = WeightTransferPlanResult{};
+
+  brpc::Controller cntl;
+  xllm_service::proto::WeightTransferPlanRequest req;
+  xllm_service::proto::WeightTransferPlanResponse resp;
+  req.set_instance_name(instance_name_);
+  req.set_world_size(world_size);
+  req.set_dp_size(dp_size);
+  req.set_ep_size(ep_size);
+
+  std::string master_addr;
+  if (!with_master_stub(
+          [&](xllm_service::proto::XllmRpcService_Stub* master_stub) {
+            master_stub->GetWeightTransferPlan(&cntl, &req, &resp, nullptr);
+          },
+          &master_addr)) {
+    return false;
+  }
+
+  if (cntl.Failed()) {
+    LOG(ERROR) << "Fail to get weight transfer plan from xservice server "
+               << master_addr << ", error text: " << cntl.ErrorText();
+    return false;
+  }
+
+  result->has_weight_transfer_source = resp.has_weight_transfer_source();
+  result->weight_transfer_addrs.assign(resp.weight_transfer_addrs().begin(),
+                                       resp.weight_transfer_addrs().end());
+  parse_expert_transfer_plan(resp.expert_transfer_plan(),
+                             &result->expert_transfer_plan);
+
+  if (!result->has_weight_transfer_source) {
+    LOG(INFO) << "Weight transfer source unavailable from xservice server "
+              << master_addr;
+    return false;
+  }
+
+  if (result->weight_transfer_addrs.empty()) {
+    LOG(WARNING) << "Weight transfer source flag is true but address list is "
+                    "empty from xservice server "
+                 << master_addr;
+    return false;
+  }
+
+  return true;
 }
 
 void XServiceClient::heartbeat() {

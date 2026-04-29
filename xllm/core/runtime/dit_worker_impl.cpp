@@ -92,15 +92,13 @@ bool DiTWorkerImpl::init_model(ModelContext& context) {
   return false;
 }
 
-bool DiTWorkerImpl::init_model(const std::string& model_weights_path,
-                               int32_t random_seed,
-                               MasterStatus master_status) {
+bool DiTWorkerImpl::init_model(const InitModelParams& params) {
   CHECK(dit_model_ == nullptr) << "Model is already initialized.";
 
   // set same random seed for all worker
-  device_.set_seed(random_seed);
+  device_.set_seed(params.random_seed);
 
-  auto loader = std::make_unique<DiTModelLoader>(model_weights_path);
+  auto loader = std::make_unique<DiTModelLoader>(params.model_weights_path);
   dtype_ = util::parse_dtype(loader->get_torch_dtype(), device_);
 
   auto tensor_options = torch::dtype(dtype_).device(device_);
@@ -131,24 +129,6 @@ bool DiTWorkerImpl::init_model(const std::string& model_weights_path,
   DiTCache::get_instance().init(cache_config);
 
   return true;
-}
-
-folly::SemiFuture<bool> DiTWorkerImpl::init_model_async(
-    const std::string& model_weights_path,
-    int32_t random_seed,
-    MasterStatus master_status) {
-  auto promise = std::make_shared<folly::Promise<bool>>();
-  auto future = promise->getSemiFuture();
-  threadpool_.schedule([this,
-                        model_weights_path,
-                        random_seed,
-                        master_status,
-                        promise]() mutable {
-    bool status =
-        this->init_model(model_weights_path, random_seed, master_status);
-    promise->setValue(status);
-  });
-  return future;
 }
 
 std::optional<ForwardOutput> DiTWorkerImpl::step(const ForwardInput& inputs) {

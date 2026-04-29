@@ -51,9 +51,7 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
                 bool enable_opt_validate_probs = false);
 
  public:
-  bool init_model(const std::string& model_weights_path,
-                  int32_t random_seed,
-                  MasterStatus master_status) override;
+  bool init_model(const InitModelParams& params) override;
 
   bool allocate_kv_cache(const KVCacheShape& kv_cache_shape) override;
 

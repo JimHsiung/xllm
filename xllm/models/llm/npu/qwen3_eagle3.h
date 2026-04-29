@@ -404,6 +404,27 @@ class QWen3Eagle3ForCausalLMImpl : public torch::nn::Module {
     model_->set_npu_word_embedding(npu_word_embedding);
   }
 
+  std::vector<at::Tensor>& get_decoder_layer_weight(int32_t id) {
+    static std::vector<at::Tensor> empty_vector;
+    return empty_vector;
+  }
+  std::vector<at::Tensor>& get_lm_head_weight() {
+    static std::vector<at::Tensor> empty_vector;
+    return empty_vector;
+  }
+  std::vector<at::Tensor>& get_word_embedding_weight() {
+    static std::vector<at::Tensor> empty_vector;
+    return empty_vector;
+  }
+  std::vector<at::Tensor>& get_norm_weight() {
+    static std::vector<at::Tensor> empty_vector;
+    return empty_vector;
+  }
+
+  void refresh_loaded_weights() {}
+
+  virtual std::vector<int> get_expert_weight_indices() const { return {}; }
+
  protected:
   QWen3Eagle3Model model_{nullptr};
   int device_id_ = 0;

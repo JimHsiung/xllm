@@ -28,6 +28,8 @@ NpuBlockCopyImpl::NpuBlockCopyImpl(const ModelContext& context)
 
 void NpuBlockCopyImpl::merge_loaded_weights() { init_layer(); }
 
+void NpuBlockCopyImpl::refresh_loaded_weights() { init_layer(); }
+
 int64_t NpuBlockCopyImpl::init_layer() {
   BaseLayer::name_ = "block_copy_layer";
   model_name_ = "llm";

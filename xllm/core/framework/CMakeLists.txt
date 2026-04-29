@@ -22,6 +22,7 @@ add_subdirectory(state_dict)
 add_subdirectory(tokenizer)
 add_subdirectory(eplb)
 add_subdirectory(dit_cache)
+add_subdirectory(weight_transfer)
 
 
 cc_library(

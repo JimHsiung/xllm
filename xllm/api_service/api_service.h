@@ -176,6 +176,11 @@ class APIService : public proto::XllmAPIService {
                      proto::HttpResponse* response,
                      ::google::protobuf::Closure* done) override;
 
+  void GetExpertDistribution(::google::protobuf::RpcController* controller,
+                             const proto::Empty* request,
+                             proto::GetExpertDistributionResponse* response,
+                             ::google::protobuf::Closure* done) override;
+
  private:
   using ChatHttpHandler = std::function<void(ClosureGuard&,
                                              brpc::Controller*,

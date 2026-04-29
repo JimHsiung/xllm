@@ -733,21 +733,12 @@ folly::SemiFuture<folly::Unit> WorkerImpl::process_group_test_async() {
 }
 
 folly::SemiFuture<bool> WorkerImpl::init_model_async(
-    const std::string& model_weights_path,
-    int32_t random_seed,
-    MasterStatus master_status) {
+    const InitModelParams& params) {
   folly::Promise<bool> promise;
   auto future = promise.getSemiFuture();
-  threadpool_.schedule([this,
-                        model_weights_path,
-                        random_seed,
-                        master_status,
-                        promise = std::move(promise)]() mutable {
-    auto status =
-        this->init_model(model_weights_path, random_seed, master_status);
-    promise.setValue(status);
+  threadpool_.schedule([this, promise = std::move(promise), params]() mutable {
+    promise.setValue(init_model(params));
   });
-
   return future;
 }
 
@@ -871,15 +862,17 @@ bool WorkerImpl::wakeup_from_remote_weights(const WakeupOptions& options) {
 #endif
 
 // initialize model, cache manager. async call
-bool WorkerImpl::init_model(const std::string& model_weights_path,
-                            int32_t random_seed,
-                            MasterStatus master_status) {
+bool WorkerImpl::init_model(const InitModelParams& params) {
+  const std::string& model_weights_path = params.model_weights_path;
+  int32_t random_seed = params.random_seed;
+  MasterStatus master_status = params.master_status;
+  const std::string& remote_addr = params.remote_addr;
   // set same random seed for all worker
   FLAGS_random_seed = random_seed;
   device_.set_seed(random_seed);
 
   auto model_loader = ModelLoader::create(model_weights_path);
-  model_weights_path_ = std::move(model_weights_path);
+  model_weights_path_ = model_weights_path;
   auto tokenizer = model_loader->tokenizer();
   CHECK(tokenizer != nullptr);
 
@@ -975,8 +968,48 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   scoped_load_threads =
       std::make_unique<ScopedAtenLoadThreads>(/*target_threads=*/1);
 
+#if defined(USE_NPU)
+  if (master_status == MasterStatus::WAKEUP && !hccl_weight_transfer_) {
+    hccl_weight_transfer_ =
+        std::make_unique<HcclWeightTransfer>(context_,
+                                             model_.get(),
+                                             device_.index(),
+                                             options_.weight_transfer_port());
+  }
+#endif
+
+  Timer load_timer;
   if (master_status == MasterStatus::WAKEUP) {
-    this->load_model(std::move(model_loader));
+#if defined(USE_NPU)
+    if (options_.weight_load_mode() != "disk" && !remote_addr.empty()) {
+      this->load_model_from_instance(remote_addr,
+                                     params.rank_expert_transfer_plan);
+      LOG(INFO) << "Model loaded from instance. Total time: "
+                << load_timer.elapsed_milliseconds() << " ms";
+    } else
+#endif
+    {
+      this->load_model(std::move(model_loader));
+      LOG(INFO) << "Model loaded from disk. Total time: "
+                << load_timer.elapsed_milliseconds() << " ms";
+    }
+#if defined(USE_NPU)
+    if (hccl_weight_transfer_) {
+      std::vector<at::Tensor> global_tensors = {
+          model_->get_word_embedding_weight()[0],
+          model_->get_norm_weight()[0],
+          model_->get_lm_head_weight()[0],
+      };
+      hccl_weight_transfer_->register_layer(-1, global_tensors);
+
+      int32_t num_layers = context_.get_model_args().n_layers();
+      for (int i = 0; i < num_layers; ++i) {
+        hccl_weight_transfer_->register_layer(
+            i, model_->get_decoder_layer_weight(i));
+      }
+      hccl_weight_transfer_->start_serving();
+    }
+#endif
   } else if (master_status == MasterStatus::LIGHT_SLEEP) {
     this->lazy_load_model(std::move(model_loader));
   }
@@ -999,6 +1032,15 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
                             .contiguous();
   }
   return true;
+}
+
+std::string WorkerImpl::get_weight_transfer_addr() {
+#if defined(USE_NPU)
+  if (hccl_weight_transfer_ != nullptr) {
+    return hccl_weight_transfer_->get_weight_transfer_addr();
+  }
+#endif
+  return "";
 }
 
 void WorkerImpl::load_model(std::unique_ptr<ModelLoader> loader) {
@@ -1044,6 +1086,22 @@ bool WorkerImpl::init_rolling_runtime_state() {
 void WorkerImpl::lazy_load_model(std::unique_ptr<ModelLoader> loader) {
   CHECK(model_ != nullptr) << "Model is not initialized.";
   model_->lazy_load_model(std::move(loader));
+}
+
+void WorkerImpl::load_model_from_instance(
+    const std::string& remote_addr,
+    const RankExpertTransferPlanData& rank_expert_transfer_plan) {
+#if defined(USE_NPU)
+  CHECK(hccl_weight_transfer_ != nullptr)
+      << "HcclWeightTransfer is not initialized.";
+  if (!hccl_weight_transfer_->pull_model_from_instance(
+          remote_addr, rank_expert_transfer_plan)) {
+    LOG(FATAL) << "Failed to load model from instance " << remote_addr;
+  }
+  model_->refresh_loaded_weights();
+#else
+  LOG(FATAL) << "Remote model weight loading only supports NPU.";
+#endif
 }
 
 folly::SemiFuture<bool> WorkerImpl::allocate_kv_cache_async(

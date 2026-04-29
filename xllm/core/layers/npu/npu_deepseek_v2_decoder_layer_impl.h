@@ -117,6 +117,12 @@ class NpuDeepseekV2DecoderLayerImpl : public BaseLayer {
 
   void update_expert_weight();
 
+  virtual void merge_loaded_weights() override;
+
+  virtual void refresh_loaded_weights() override;
+
+  std::vector<int> get_expert_weight_indices() const;
+
   virtual int64_t init_layer() override;
 
   torch::Tensor forward(torch::Tensor& x,

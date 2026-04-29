@@ -205,6 +205,29 @@ struct WeightSegment {
   uint64_t size;    // Segment size in bytes
 };
 
+struct SourceExpertIdsData {
+  std::string source_addr;
+  std::vector<int32_t> expert_ids;
+};
+
+struct LayerExpertTransferPlanData {
+  std::vector<SourceExpertIdsData> source_experts;
+};
+
+struct RankExpertTransferPlanData {
+  std::vector<LayerExpertTransferPlanData> layer_plans;
+};
+
+struct ExpertTransferPlanData {
+  std::vector<RankExpertTransferPlanData> rank_plans;
+};
+
+struct WeightTransferPlanResult {
+  bool has_weight_transfer_source = false;
+  std::vector<std::string> weight_transfer_addrs;
+  ExpertTransferPlanData expert_transfer_plan;
+};
+
 struct InstanceInfo {
   std::string name = "";
   std::string rpc_address = "";
@@ -217,7 +240,11 @@ struct InstanceInfo {
   std::vector<std::string> addrs;
   std::vector<int64_t> k_cache_ids;
   std::vector<int64_t> v_cache_ids;
-  int32_t dp_size;
+  int32_t dp_size = 1;
+  int32_t world_size = 1;
+  int32_t ep_size = 1;
+  // weight transfer info
+  std::vector<std::string> weight_transfer_addrs;
   // device network info
   std::vector<std::string> device_ips;
   std::vector<uint16_t> ports;
@@ -259,6 +286,9 @@ struct InstanceInfo {
     json_val["k_cache_ids"] = k_cache_ids;
     json_val["v_cache_ids"] = v_cache_ids;
     json_val["dp_size"] = dp_size;
+    json_val["world_size"] = world_size;
+    json_val["ep_size"] = ep_size;
+    json_val["weight_transfer_addrs"] = weight_transfer_addrs;
     json_val["device_ips"] = device_ips;
     json_val["ports"] = ports;
     json_val["ttft_profiling_data"] = ttft_profiling_data;
@@ -407,6 +437,14 @@ struct WakeupOptions {
   // Each remote_addr has a list of weight segments to pull
   // Segments are ordered and should be concatenated at destination
   std::vector<std::vector<WeightSegment>> src_weight_segments;
+};
+
+struct InitModelParams {
+  std::string model_weights_path;
+  int32_t random_seed;
+  MasterStatus master_status = MasterStatus::WAKEUP;
+  std::string remote_addr = "";
+  RankExpertTransferPlanData rank_expert_transfer_plan;
 };
 
 inline constexpr int32_t REC_TOKEN_SIZE = 3;
