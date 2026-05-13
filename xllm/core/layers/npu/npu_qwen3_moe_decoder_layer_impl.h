@@ -44,7 +44,11 @@ class NpuQwen3MoeDecoderLayerImpl : public BaseLayer {
 
   ~NpuQwen3MoeDecoderLayerImpl() override = default;
 
-  virtual void merge_loaded_weights();
+  virtual void merge_loaded_weights() override;
+
+  virtual void refresh_loaded_weights() override;
+
+  std::vector<int> get_expert_weight_indices() const;
 
   virtual int64_t init_layer() override;
 

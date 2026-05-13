@@ -113,6 +113,16 @@ class Qwen3MoeDecoderLayerImpl : public torch::nn::Module {
 
   void refresh_rolling_weights() { decoder_layer_->refresh_rolling_weights(); }
 
+  void refresh_loaded_weights() { decoder_layer_->refresh_loaded_weights(); }
+
+  std::vector<at::Tensor>& get_decoder_layer_weight() {
+    return decoder_layer_->get_at_weight_tensors();
+  }
+
+  std::vector<int> get_expert_weight_indices() const {
+    return decoder_layer_->get_expert_weight_indices();
+  }
+
  private:
   layer::NpuQwen3MoeDecoderLayer decoder_layer_{nullptr};
 };
@@ -446,6 +456,14 @@ class Qwen3MoeModelImpl : public torch::nn::Module {
     }
   }
 
+  void refresh_loaded_weights() {
+    npu_embed_tokens_->refresh_loaded_weights();
+    for (auto& layer : layers_) {
+      layer->refresh_loaded_weights();
+    }
+    norm_->refresh_loaded_weights();
+  }
+
   std::vector<layer::BaseLoader*> get_decoder_loaders() {
     std::vector<layer::BaseLoader*> loaders;
     loaders.reserve(layers_.size());
@@ -462,6 +480,23 @@ class Qwen3MoeModelImpl : public torch::nn::Module {
   void set_npu_word_embedding(layer::NpuWordEmbedding& npu_word_embedding) {
     npu_embed_tokens_ = npu_word_embedding;
   }
+
+  std::vector<at::Tensor>& get_word_embedding_weight() {
+    return npu_embed_tokens_->get_at_weight_tensors();
+  }
+
+  std::vector<at::Tensor>& get_norm_weight() {
+    return norm_->get_at_weight_tensors();
+  }
+
+  std::vector<at::Tensor>& get_decoder_layer_weight_by_id(int32_t layer_id) {
+    return layers_[layer_id]->get_decoder_layer_weight();
+  }
+
+  std::vector<int> get_expert_weight_indices() const {
+    return layers_[0]->get_expert_weight_indices();
+  }
+
   torch::Tensor get_input_embeddings(torch::Tensor input_ids) {
     return npu_embed_tokens_(input_ids, 0);
   }
@@ -499,6 +534,31 @@ class Qwen3MoeForCausalLMImpl
  public:
   Qwen3MoeForCausalLMImpl(const ModelContext& context)
       : xllm::npu::model::LlmForCausalLMImplBase<Qwen3MoeModel>(context) {}
+
+  std::vector<at::Tensor>& get_decoder_layer_weight(int32_t layer_id) {
+    return model_->get_decoder_layer_weight_by_id(layer_id);
+  }
+
+  std::vector<at::Tensor>& get_lm_head_weight() {
+    return npu_lm_head_->get_at_weight_tensors();
+  }
+
+  std::vector<at::Tensor>& get_word_embedding_weight() {
+    return model_->get_word_embedding_weight();
+  }
+
+  std::vector<at::Tensor>& get_norm_weight() {
+    return model_->get_norm_weight();
+  }
+
+  void refresh_loaded_weights() {
+    model_->refresh_loaded_weights();
+    npu_lm_head_->refresh_loaded_weights();
+  }
+
+  std::vector<int> get_expert_weight_indices() const override {
+    return model_->get_expert_weight_indices();
+  }
 };
 TORCH_MODULE(Qwen3MoeForCausalLM);
 

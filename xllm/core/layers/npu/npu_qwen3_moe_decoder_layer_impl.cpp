@@ -20,6 +20,7 @@ limitations under the License.
 #include <unordered_set>
 
 #include "common/global_flags.h"
+#include "loader/qwen_loader_constants.h"
 namespace xllm {
 namespace layer {
 
@@ -262,6 +263,10 @@ void NpuQwen3MoeDecoderLayerImpl::initialize_quantization_parameters(
 
 void NpuQwen3MoeDecoderLayerImpl::merge_loaded_weights() {
   loader_->merge_loaded_weights();
+  refresh_loaded_weights();
+}
+
+void NpuQwen3MoeDecoderLayerImpl::refresh_loaded_weights() {
   auto& at_weight_tensors = loader_->get_at_weight_tensors();
   Device::empty_cache(device_.index());
   for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
@@ -269,6 +274,24 @@ void NpuQwen3MoeDecoderLayerImpl::merge_loaded_weights() {
         atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[i]);
   }
   init_layer();
+}
+
+std::vector<int> NpuQwen3MoeDecoderLayerImpl::get_expert_weight_indices()
+    const {
+  return {
+      qwen3_moe_decoder_constants::IN_MLP_GATEUP_WEIGHT_EXPERT,
+      qwen3_moe_decoder_constants::IN_MLP_GATEUP_BIAS_EXPERT,
+      qwen3_moe_decoder_constants::IN_MLP_GATEUP_DESCALE_EXPERT,
+      qwen3_moe_decoder_constants::IN_MLP_GATEUP_OFFSET_EXPERT,
+      qwen3_moe_decoder_constants::IN_MLP_GATEUP_SCALE_EXPERT,
+      qwen3_moe_decoder_constants::IN_MLP_GATEUP_COMPRESS_IDX_EXPERT,
+      qwen3_moe_decoder_constants::IN_MLP_DOWN_WEIGHT_EXPERT,
+      qwen3_moe_decoder_constants::IN_MLP_DOWN_BIAS_EXPERT,
+      qwen3_moe_decoder_constants::IN_MLP_DOWN_DESCALE_EXPERT,
+      qwen3_moe_decoder_constants::IN_MLP_DOWN_OFFSET_EXPERT,
+      qwen3_moe_decoder_constants::IN_MLP_DOWN_SCALE_EXPERT,
+      qwen3_moe_decoder_constants::IN_MLP_DOWN_COMPRESS_IDX_EXPERT,
+  };
 }
 
 int64_t NpuQwen3MoeDecoderLayerImpl::init_layer() {
