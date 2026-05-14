@@ -26,6 +26,7 @@ namespace layer {
 class LmHead;
 class WordEmbedding;
 #if defined(USE_NPU)
+class BaseLoader;
 class NpuLmHead;
 class NpuWordEmbedding;
 #endif
@@ -172,6 +173,15 @@ struct has_get_decoder_layer_weight<
     T,
     std::void_t<decltype(std::declval<T>()->get_decoder_layer_weight(
         std::declval<int32_t>()))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_get_decoder_loaders : std::false_type {};
+
+template <typename T>
+struct has_get_decoder_loaders<
+    T,
+    std::void_t<decltype(std::declval<T>()->get_decoder_loaders())>>
+    : std::true_type {};
 
 template <typename T, typename = void>
 struct has_get_lm_head_weight : std::false_type {};

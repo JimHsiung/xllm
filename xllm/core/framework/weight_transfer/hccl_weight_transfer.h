@@ -26,6 +26,9 @@ limitations under the License.
 #include "hccl_weight_transfer.pb.h"
 
 namespace xllm {
+namespace layer {
+class BaseLoader;
+}  // namespace layer
 
 class CausalLM;
 class ModelContext;
@@ -40,6 +43,7 @@ class HcclWeightTransfer {
   ~HcclWeightTransfer();
 
   void register_layer(int32_t layer_id, const std::vector<at::Tensor>& tensors);
+  void register_layer_storage(int32_t layer_id, layer::BaseLoader* loader);
 
   void start_serving();
 

@@ -21,8 +21,12 @@ limitations under the License.
 #include <algorithm>
 #include <atomic>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
+
+#include "layers/npu/loader/base_loader.h"
 
 namespace xllm {
 namespace {
@@ -122,6 +126,57 @@ SenderSessionEndInfo end_sender_session_tracking(
 }
 
 }  // namespace
+
+LayerStorageInfo get_contiguous_layer_storage_info(
+    const std::vector<at::Tensor>& tensors,
+    layer::BaseLoader* loader) {
+  LayerStorageInfo info;
+  if (loader == nullptr || loader->mode() != layer::LoadMode::kManual ||
+      loader->uses_rolling_buffer()) {
+    return info;
+  }
+
+  void* base = loader->get_device_storage();
+  uint64_t storage_size = loader->get_storage_size();
+  if (base == nullptr || storage_size == 0 || tensors.empty()) {
+    return info;
+  }
+
+  const uintptr_t base_addr = reinterpret_cast<uintptr_t>(base);
+  const uintptr_t end_addr = base_addr + storage_size;
+  if (end_addr < base_addr) {
+    return info;
+  }
+
+  bool has_payload = false;
+  for (const auto& tensor : tensors) {
+    if (!tensor.defined()) {
+      return LayerStorageInfo{};
+    }
+    const size_t nbytes = tensor.nbytes();
+    if (nbytes == 0) {
+      return LayerStorageInfo{};
+    }
+    void* data_ptr = tensor.data_ptr();
+    if (data_ptr == nullptr) {
+      return LayerStorageInfo{};
+    }
+    const uintptr_t tensor_addr = reinterpret_cast<uintptr_t>(data_ptr);
+    if (tensor_addr < base_addr || tensor_addr + nbytes < tensor_addr ||
+        tensor_addr + nbytes > end_addr) {
+      return LayerStorageInfo{};
+    }
+    has_payload = true;
+  }
+
+  if (!has_payload) {
+    return info;
+  }
+  info.available = true;
+  info.base_ptr = base;
+  info.storage_size = storage_size;
+  return info;
+}
 
 SenderSessionLogGuard::SenderSessionLogGuard(const std::string& session_id,
                                              const std::string& mode)
@@ -501,6 +556,128 @@ bool append_layer_transfer_items(
   }
 
   return true;
+}
+
+void append_contiguous_storage_transfer_items(
+    void* base_ptr,
+    uint64_t storage_size,
+    decltype(HCCL_SEND) operation,
+    uint32_t peer_rank,
+    uint64_t chunk_bytes,
+    std::vector<HcclSendRecvItem>* items,
+    size_t* total_nbytes) {
+  CHECK(base_ptr != nullptr);
+  CHECK(items != nullptr);
+  CHECK(total_nbytes != nullptr);
+  if (storage_size == 0) {
+    return;
+  }
+  const uint64_t effective_chunk =
+      chunk_bytes == 0 ? storage_size : chunk_bytes;
+  uint64_t offset = 0;
+  while (offset < storage_size) {
+    const uint64_t bytes =
+        std::min<uint64_t>(effective_chunk, storage_size - offset);
+    void* data_ptr = static_cast<uint8_t*>(base_ptr) + offset;
+    items->push_back(
+        {operation, data_ptr, bytes, HCCL_DATA_TYPE_UINT8, peer_rank});
+    *total_nbytes += bytes;
+    offset += bytes;
+  }
+}
+
+uint64_t sum_tensor_nbytes(const std::vector<at::Tensor>& tensors) {
+  uint64_t total = 0;
+  for (const auto& tensor : tensors) {
+    if (!tensor.defined()) {
+      continue;
+    }
+    total += static_cast<uint64_t>(tensor.nbytes());
+  }
+  return total;
+}
+
+std::string summarize_hccl_transfer_items(
+    const std::vector<HcclSendRecvItem>& items) {
+  if (items.empty()) {
+    return "items=0, item_min_mb=0.00, item_max_mb=0.00, item_avg_mb=0.00";
+  }
+
+  uint64_t min_bytes = std::numeric_limits<uint64_t>::max();
+  uint64_t max_bytes = 0;
+  uint64_t total_bytes = 0;
+  for (const auto& item : items) {
+    min_bytes = std::min(min_bytes, item.count);
+    max_bytes = std::max(max_bytes, item.count);
+    total_bytes += item.count;
+  }
+
+  constexpr double kMiB = 1024.0 * 1024.0;
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(2) << "items=" << items.size()
+      << ", item_min_mb=" << (static_cast<double>(min_bytes) / kMiB)
+      << ", item_max_mb=" << (static_cast<double>(max_bytes) / kMiB)
+      << ", item_avg_mb="
+      << (static_cast<double>(total_bytes) / static_cast<double>(items.size()) /
+          kMiB);
+  return oss.str();
+}
+
+std::string summarize_hccl_transfer_item_addresses(
+    const std::vector<HcclSendRecvItem>& items) {
+  if (items.empty()) {
+    return "addr_align64=0/0, addr_align512=0/0, addr_align4k=0/0, "
+           "size_align512=0/0, adjacent_items=0, start_2mb_pages=0, "
+           "addr_span_mb=0.00";
+  }
+
+  size_t addr_align64 = 0;
+  size_t addr_align512 = 0;
+  size_t addr_align4k = 0;
+  size_t size_align512 = 0;
+  size_t adjacent_items = 0;
+  uintptr_t min_addr = std::numeric_limits<uintptr_t>::max();
+  uintptr_t max_end = 0;
+  std::unordered_set<uintptr_t> start_2mb_pages;
+  start_2mb_pages.reserve(items.size());
+  uintptr_t prev_end = 0;
+
+  for (const auto& item : items) {
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(item.buf);
+    const uintptr_t end = addr + static_cast<uintptr_t>(item.count);
+    if (addr % 64 == 0) {
+      ++addr_align64;
+    }
+    if (addr % 512 == 0) {
+      ++addr_align512;
+    }
+    if (addr % 4096 == 0) {
+      ++addr_align4k;
+    }
+    if (item.count % 512 == 0) {
+      ++size_align512;
+    }
+    if (prev_end != 0 && addr == prev_end) {
+      ++adjacent_items;
+    }
+    prev_end = end;
+    min_addr = std::min(min_addr, addr);
+    max_end = std::max(max_end, end);
+    start_2mb_pages.insert(addr >> 21);
+  }
+
+  constexpr double kMiB = 1024.0 * 1024.0;
+  const double span_mb =
+      max_end > min_addr ? static_cast<double>(max_end - min_addr) / kMiB : 0.0;
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(2) << "addr_align64=" << addr_align64
+      << "/" << items.size() << ", addr_align512=" << addr_align512 << "/"
+      << items.size() << ", addr_align4k=" << addr_align4k << "/"
+      << items.size() << ", size_align512=" << size_align512 << "/"
+      << items.size() << ", adjacent_items=" << adjacent_items
+      << ", start_2mb_pages=" << start_2mb_pages.size()
+      << ", addr_span_mb=" << span_mb;
+  return oss.str();
 }
 
 void fill_trigger_weights_send_request(

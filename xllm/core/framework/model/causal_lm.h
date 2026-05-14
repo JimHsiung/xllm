@@ -18,6 +18,7 @@ limitations under the License.
 // clang-format off
 #if defined(USE_NPU)
 #include "graph/types.h"
+#include "layers/npu/loader/base_loader.h"
 #include "layers/npu/npu_lm_head_impl.h"
 #include "layers/npu/npu_word_embedding_impl.h"
 #endif
@@ -114,6 +115,8 @@ class CausalLM : public torch::nn::Module {
     static std::vector<at::Tensor> empty_vector;
     return empty_vector;
   }
+
+  virtual std::vector<layer::BaseLoader*> get_decoder_loaders() { return {}; }
 
   virtual std::vector<at::Tensor>& get_lm_head_weight() {
     static std::vector<at::Tensor> empty_vector;
@@ -289,6 +292,14 @@ class CausalLMImpl : public CausalLM {
       return model_->get_decoder_layer_weight(layer_id);
     } else {
       return CausalLM::get_decoder_layer_weight(layer_id);
+    }
+  }
+
+  std::vector<layer::BaseLoader*> get_decoder_loaders() override {
+    if constexpr (detail::has_get_decoder_loaders<Model>::value) {
+      return model_->get_decoder_loaders();
+    } else {
+      return CausalLM::get_decoder_loaders();
     }
   }
 

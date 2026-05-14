@@ -34,6 +34,10 @@ namespace {
 static inline size_t AlignUp(size_t value, size_t alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
 }
+
+static inline uintptr_t AlignUpAddress(uintptr_t value, size_t alignment) {
+  return (value + alignment - 1) & ~(static_cast<uintptr_t>(alignment) - 1);
+}
 }  // namespace
 
 BaseLoader::BaseLoader(uint64_t weight_count,
@@ -412,6 +416,7 @@ void BaseLoader::allocate_device_storage() {
     device_storage_ = rolling_buffer_->get_slot_ptr(layer_index_);
     CHECK(device_storage_ != nullptr)
         << "RollingWeightBuffer slot is null for layer " << layer_index_;
+    device_storage_alloc_ = nullptr;
     return;
   }
   if (FLAGS_enable_xtensor) {
@@ -420,13 +425,50 @@ void BaseLoader::allocate_device_storage() {
         allocator.allocate_weight(model_id_, device_storage_, storage_size_);
     CHECK(ok) << "Failed to allocate contiguous device storage size="
               << storage_size_;
+    device_storage_alloc_ = nullptr;
     return;
   }
+  const size_t alloc_size = storage_size_ + kDeviceAlignment - 1;
   auto ret = aclrtMallocAlign32(
-      &device_storage_, storage_size_, ACL_MEM_MALLOC_HUGE_FIRST);
+      &device_storage_alloc_, alloc_size, ACL_MEM_MALLOC_HUGE_FIRST);
   CHECK_EQ(ret, ACL_SUCCESS)
-      << "aclrtMallocAlign32 failed for BaseLoader, size=" << storage_size_
+      << "aclrtMallocAlign32 failed for BaseLoader, size=" << alloc_size
       << ", ret=" << ret;
+  const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(device_storage_alloc_);
+  const uintptr_t aligned_addr = AlignUpAddress(raw_addr, kDeviceAlignment);
+  CHECK_LE(aligned_addr + storage_size_, raw_addr + alloc_size)
+      << "Aligned device storage exceeds allocation. raw=" << raw_addr
+      << ", aligned=" << aligned_addr << ", storage_size=" << storage_size_
+      << ", alloc_size=" << alloc_size;
+  device_storage_ = reinterpret_cast<void*>(aligned_addr);
+}
+
+void BaseLoader::prepare_device_storage_from_slices(
+    uint64_t storage_size,
+    const std::vector<DeviceWeightSliceSpec>& slices,
+    bool initialize_views) {
+  CHECK(mode_ == LoadMode::kManual)
+      << "prepare_device_storage_from_slices is only valid in manual mode";
+  CHECK_GT(storage_size, 0u) << "storage_size must be greater than 0";
+
+  release_device_storage();
+  storage_size_ = storage_size;
+  weight_slices_.clear();
+  weight_slices_.reserve(slices.size());
+  for (const auto& spec : slices) {
+    WeightSlice slice;
+    slice.offset = spec.offset;
+    slice.bytes = spec.bytes;
+    slice.sizes = spec.sizes;
+    slice.dtype = spec.dtype;
+    slice.acl_format = spec.acl_format;
+    weight_slices_.push_back(std::move(slice));
+  }
+  at_weight_tensors_.resize(weight_slices_.size());
+  allocate_device_storage();
+  if (initialize_views) {
+    init_device_at_weights();
+  }
 }
 
 void BaseLoader::init_weight_slices() {
@@ -438,15 +480,17 @@ void BaseLoader::init_weight_slices() {
     if (!tensor.defined() || tensor.numel() < 1) {
       continue;
     }
-    offset = AlignUp(offset, kHostAlignment);
+    offset = AlignUp(offset, kDeviceAlignment);
     weight_slices_[i].offset = offset;
     weight_slices_[i].bytes = tensor.nbytes();
     weight_slices_[i].sizes = tensor.sizes().vec();
     weight_slices_[i].dtype = tensor.scalar_type();
+    weight_slices_[i].acl_format = is_nz_format_tensor(static_cast<int>(i))
+                                       ? ACL_FORMAT_FRACTAL_NZ
+                                       : ACL_FORMAT_ND;
     offset += weight_slices_[i].bytes;
   }
-  size_t max_alignment = std::max(kHostAlignment, kDeviceAlignment);
-  storage_size_ = AlignUp(offset, max_alignment);
+  storage_size_ = AlignUp(offset, kDeviceAlignment);
 }
 
 void BaseLoader::copy_weights_to_pinned_host() {
@@ -454,8 +498,7 @@ void BaseLoader::copy_weights_to_pinned_host() {
   CHECK_EQ(weight_slices_.size(), at_host_weight_tensors_.size())
       << "weight_slices_ size and at_host_weight_tensors_ size mismatch.";
 
-  size_t max_alignment = std::max(kHostAlignment, kDeviceAlignment);
-  storage_size_ = AlignUp(storage_size_, max_alignment);
+  storage_size_ = AlignUp(storage_size_, kDeviceAlignment);
 
   auto ret = aclrtMallocHost(&host_pinned_storage_, storage_size_);
   CHECK_EQ(ret, ACL_SUCCESS)
@@ -553,16 +596,11 @@ void BaseLoader::init_device_at_weights() {
     }
     void* base = static_cast<char*>(device_storage_) +
                  static_cast<ptrdiff_t>(slice.offset);
-    if (is_nz_format_tensor(i)) {
-      at_weight_tensors_[i] =
-          convert_to_torch_tensor(slice.sizes,
-                                  slice.dtype,
-                                  reinterpret_cast<uintptr_t>(base),
-                                  ACL_FORMAT_FRACTAL_NZ);
-    } else {
-      at_weight_tensors_[i] = convert_to_torch_tensor(
-          slice.sizes, slice.dtype, reinterpret_cast<uintptr_t>(base));
-    }
+    at_weight_tensors_[i] =
+        convert_to_torch_tensor(slice.sizes,
+                                slice.dtype,
+                                reinterpret_cast<uintptr_t>(base),
+                                slice.acl_format);
   }
 }
 
@@ -571,12 +609,15 @@ void BaseLoader::release_device_storage() {
     return;
   }
   if (!FLAGS_enable_xtensor && !rolling_buffer_) {
-    auto ret = aclrtFree(device_storage_);
+    void* ptr_to_free = device_storage_alloc_ != nullptr ? device_storage_alloc_
+                                                         : device_storage_;
+    auto ret = aclrtFree(ptr_to_free);
     if (ret != ACL_SUCCESS) {
       LOG(ERROR) << "aclrtFree failed for BaseLoader, ret=" << ret;
     }
   }
   device_storage_ = nullptr;
+  device_storage_alloc_ = nullptr;
 }
 
 void BaseLoader::release_host_storage() {

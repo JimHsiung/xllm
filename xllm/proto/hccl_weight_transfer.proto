@@ -30,6 +30,14 @@ message TensorMeta {
   int64 npu_format = 3;
 }
 
+message TensorSliceMeta {
+  uint64 offset = 1;
+  uint64 bytes = 2;
+  int32 dtype = 3;       // at::ScalarType
+  repeated int64 shape = 4;
+  int64 npu_format = 5;
+}
+
 message GetWeightsMetaRequest {
   repeated int32 layer_ids = 1;
 }
@@ -37,6 +45,9 @@ message GetWeightsMetaRequest {
 message LayerWeightsMeta {
   int32 layer_id = 1;
   repeated TensorMeta metas = 2;
+  bool has_contiguous_storage = 3;
+  uint64 storage_size = 4;
+  repeated TensorSliceMeta slice_metas = 5;
 }
 
 message GetWeightsMetaResponse {
@@ -63,6 +74,8 @@ message TriggerWeightsSendRequest {
   bool use_alltoallv = 5;
   uint32 receiver_rank = 6;
   repeated AlltoAllRoundDesc alltoall_rounds = 7;
+  bool use_layer_storage_transfer = 8;
+  bool transfer_all_experts = 9;
 }
 
 message TriggerWeightsSendResponse {

@@ -727,6 +727,17 @@ DEFINE_string(weight_load_mode,
 
 DEFINE_int32(weight_transfer_port, 26001, "The WeightTranfer listen port.");
 
+DEFINE_bool(
+    enable_layer_storage_weight_transfer,
+    true,
+    "Whether to transfer each contiguous manual-loader decoder layer storage "
+    "as one HCCL item during full single-source weight pull.");
+
+DEFINE_uint64(layer_storage_weight_transfer_chunk_bytes,
+              0,
+              "Chunk size in bytes for contiguous manual-loader decoder layer "
+              "storage transfer. 0 means one HCCL item per layer storage.");
+
 DEFINE_bool(enable_parallel_weight_pull,
             false,
             "Whether to pull non-expert and expert weights in parallel when "

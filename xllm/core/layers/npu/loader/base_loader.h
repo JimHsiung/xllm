@@ -114,12 +114,26 @@ class BaseLoader {
 
   LoadMode mode() const { return mode_; }
 
+  struct DeviceWeightSliceSpec {
+    uint64_t offset = 0;
+    uint64_t bytes = 0;
+    std::vector<int64_t> sizes;
+    torch::ScalarType dtype = torch::kFloat16;
+    int acl_format = ACL_FORMAT_ND;
+  };
+
   // Manual-mode helpers exposed publicly for RollingLoadManager.
   void* get_host_pinned_storage() const { return host_pinned_storage_; }
+  void* get_device_storage() const { return device_storage_; }
   uint64_t get_storage_size() const { return storage_size_; }
+  bool uses_rolling_buffer() const { return rolling_buffer_ != nullptr; }
   void set_rolling_buffer(std::shared_ptr<RollingWeightBuffer> buf,
                           int32_t layer_index);
   void allocate_device_storage();
+  void prepare_device_storage_from_slices(
+      uint64_t storage_size,
+      const std::vector<DeviceWeightSliceSpec>& slices,
+      bool initialize_views = true);
 
   // Manual-mode pipeline. Kept public for RollingLoadManager and legacy
   // downstream call sites; internally a no-op when mode_ == kEager.
@@ -136,6 +150,7 @@ class BaseLoader {
     uint64_t bytes = 0;
     std::vector<int64_t> sizes;
     torch::ScalarType dtype = torch::kFloat16;
+    int acl_format = ACL_FORMAT_ND;
   };
 
   // -------------------- uniform weight staging helpers --------------------
@@ -267,14 +282,15 @@ class BaseLoader {
   // pointer borrowed from `rolling_buffer_`.
   std::string model_id_;
   void* host_pinned_storage_ = nullptr;
+  void* device_storage_alloc_ = nullptr;
   void* device_storage_ = nullptr;
   uint64_t storage_size_ = 0;
   std::vector<WeightSlice> weight_slices_;
   std::unordered_set<int> nz_indices_;
   std::shared_ptr<RollingWeightBuffer> rolling_buffer_ = nullptr;
   int32_t layer_index_ = -1;
-  static constexpr size_t kDeviceAlignment = 64;
-  static constexpr size_t kHostAlignment = 64;
+  static constexpr size_t kDeviceAlignment = 4096;
+  static constexpr size_t kHostAlignment = 512;
 };
 
 }  // namespace layer

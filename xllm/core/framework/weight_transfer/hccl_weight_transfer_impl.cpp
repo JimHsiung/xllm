@@ -61,6 +61,11 @@ void HcclWeightTransferImpl::register_layer(
   sender_engine_.register_layer(layer_id, tensors);
 }
 
+void HcclWeightTransferImpl::register_layer_storage(int32_t layer_id,
+                                                    layer::BaseLoader* loader) {
+  sender_engine_.register_layer_storage(layer_id, loader);
+}
+
 void HcclWeightTransferImpl::start_serving() {
   service_ = std::make_unique<WeightTransferServiceImpl>(this);
   if (server_.AddService(service_.get(), brpc::SERVER_DOESNT_OWN_SERVICE) !=
@@ -84,9 +89,15 @@ void HcclWeightTransferImpl::process_weights_send_request(
     const std::string& session_id,
     const std::vector<int32_t>& layer_ids,
     const std::unordered_map<int32_t, std::vector<int32_t>>& layer_expert_ids,
-    bool include_non_expert) {
-  sender_engine_.process_weights_send_request(
-      session_id, layer_ids, layer_expert_ids, include_non_expert);
+    bool include_non_expert,
+    bool use_layer_storage_transfer,
+    bool transfer_all_experts) {
+  sender_engine_.process_weights_send_request(session_id,
+                                              layer_ids,
+                                              layer_expert_ids,
+                                              include_non_expert,
+                                              use_layer_storage_transfer,
+                                              transfer_all_experts);
 }
 
 bool HcclWeightTransferImpl::process_weights_alltoallv_send_request(
@@ -119,6 +130,11 @@ bool HcclWeightTransferImpl::handle_init_comm(const std::string& remote_addr,
 const std::vector<at::Tensor>& HcclWeightTransferImpl::get_registered_tensors(
     int32_t layer_id) const {
   return sender_engine_.get_registered_tensors(layer_id);
+}
+
+layer::BaseLoader* HcclWeightTransferImpl::get_registered_layer_storage(
+    int32_t layer_id) const {
+  return sender_engine_.get_registered_layer_storage(layer_id);
 }
 
 std::string HcclWeightTransferImpl::get_weight_transfer_addr() const {

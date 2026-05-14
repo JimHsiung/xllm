@@ -18,6 +18,7 @@ limitations under the License.
 #include <functional>
 #include <future>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "framework/model/causal_lm.h"
@@ -36,6 +37,7 @@ class WeightTransferReceiverEngine {
                                const std::string& local_addr,
                                WeightTransferSessionManager* session_manager,
                                const WeightTransferAlltoallPlanner* planner);
+  ~WeightTransferReceiverEngine();
 
   bool pull_model_from_instance(
       const std::string& remote_addr,
@@ -61,11 +63,15 @@ class WeightTransferReceiverEngine {
       const std::string& session_id,
       const std::vector<int32_t>& layer_ids,
       const std::vector<std::vector<at::Tensor>*>& local_tensors_ptrs,
-      double* prepare_ms = nullptr);
+      bool enable_layer_storage_allocation,
+      std::unordered_map<int32_t, ReceiverLayerStorage>* layer_storages,
+      MetaAllocateStats* prepare_stats = nullptr);
   bool fetch_weights_meta_and_allocate_tensors(
       xllm::proto::WeightTransferService_Stub* target_stub,
       const std::vector<int32_t>& layer_ids,
       const std::vector<std::vector<at::Tensor>*>& local_tensors_ptrs,
+      bool enable_layer_storage_allocation,
+      std::unordered_map<int32_t, ReceiverLayerStorage>* layer_storages,
       const std::string& stage_name,
       MetaAllocateStats* stats);
   std::vector<int32_t> build_pull_layer_ids() const;
@@ -74,6 +80,7 @@ class WeightTransferReceiverEngine {
       std::vector<std::vector<at::Tensor>*>* local_tensors_ptrs);
   bool assign_global_tensors_after_pull(
       const std::vector<at::Tensor>& global_tensors);
+  void release_layer_storage_views();
   LayerExpertIdsMap build_non_expert_only_plan(
       const std::vector<int32_t>& layer_ids) const;
 
@@ -82,6 +89,8 @@ class WeightTransferReceiverEngine {
       const std::string& base_session_id,
       const std::vector<int32_t>& layer_ids,
       const std::vector<std::vector<at::Tensor>*>& local_tensors_ptrs,
+      bool enable_layer_storage_allocation,
+      std::unordered_map<int32_t, ReceiverLayerStorage>* layer_storages,
       bool has_expert_prepare,
       const std::function<ModelPullAsyncStageStatus()>& expert_prepare_fn);
   void log_model_pull_prepare_timing(
@@ -108,18 +117,22 @@ class WeightTransferReceiverEngine {
       const LayerExpertIdsMap& normalized_layer_expert_ids,
       bool include_non_expert,
       bool transfer_all_experts,
+      bool use_layer_storage_transfer,
       const std::string& session_id);
   std::future<ReceiverTransferResult> launch_receiver_exec_stage(
       const std::shared_ptr<CommSessionContext>& session_ctx,
       const std::vector<int32_t>& layer_ids,
       const std::vector<std::vector<at::Tensor>*>& local_tensors_ptrs,
+      const std::unordered_map<int32_t, ReceiverLayerStorage>& layer_storages,
       const LayerExpertIdsMap& normalized_layer_expert_ids,
       bool include_non_expert,
-      bool transfer_all_experts);
+      bool transfer_all_experts,
+      bool use_layer_storage_transfer);
   bool pull_weight_internal(
       const std::string& session_id,
       const std::vector<int32_t>& layer_ids,
       const std::vector<std::vector<at::Tensor>*>& local_tensors_ptrs,
+      const std::unordered_map<int32_t, ReceiverLayerStorage>& layer_storages,
       const LayerExpertIdsMap& layer_expert_ids,
       bool include_non_expert,
       bool transfer_all_experts,
@@ -131,6 +144,8 @@ class WeightTransferReceiverEngine {
   const std::string& local_addr_;
   WeightTransferSessionManager* session_manager_;
   const WeightTransferAlltoallPlanner* planner_;
+  bool use_layer_storage_transfer_ = false;
+  std::unordered_map<int32_t, ReceiverLayerStorage> receiver_layer_storages_;
 };
 
 }  // namespace xllm

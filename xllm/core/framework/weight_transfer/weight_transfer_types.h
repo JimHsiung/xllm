@@ -35,8 +35,17 @@ limitations under the License.
 #include "hccl_weight_transfer.pb.h"
 
 namespace xllm {
+namespace layer {
+class BaseLoader;
+}  // namespace layer
 
 using LayerExpertIdsMap = std::unordered_map<int32_t, std::vector<int32_t>>;
+
+struct LayerStorageInfo {
+  bool available = false;
+  void* base_ptr = nullptr;
+  uint64_t storage_size = 0;
+};
 
 struct CommSessionContext {
   std::string session_id;
@@ -60,6 +69,18 @@ struct MetaAllocateStats {
   double total_ms = 0.0;
   double rpc_ms = 0.0;
   double tensor_alloc_ms = 0.0;
+  double storage_alloc_ms = 0.0;
+  double storage_view_init_ms = 0.0;
+  bool all_layer_storage_available = false;
+};
+
+struct ReceiverLayerStorage {
+  bool available = false;
+  void* base_ptr = nullptr;
+  uint64_t storage_size = 0;
+  uint64_t payload_nbytes = 0;
+  bool views_initialized = false;
+  layer::BaseLoader* loader = nullptr;
 };
 
 struct TriggerRpcResult {
@@ -72,9 +93,14 @@ struct ReceiverTransferResult {
   bool ok = false;
   double queue_wait_ms = 0.0;
   double build_items_ms = 0.0;
+  double storage_view_init_ms = 0.0;
   double hccl_exec_ms = 0.0;
   double thread_total_ms = 0.0;
   size_t total_nbytes = 0;
+  size_t item_count = 0;
+  size_t layer_storage_items = 0;
+  size_t tensor_items = 0;
+  uint64_t storage_padding_nbytes = 0;
 };
 
 struct ModelPullStageStatus {
@@ -95,6 +121,10 @@ struct ModelPullPrepareStageStatus {
   double base_comm_ms = 0.0;
   double expert_comm_ms = 0.0;
   double meta_alloc_ms = 0.0;
+  double meta_rpc_ms = 0.0;
+  double tensor_alloc_ms = 0.0;
+  double storage_alloc_ms = 0.0;
+  double storage_view_init_ms = 0.0;
   double prepare_wall_ms = 0.0;
 };
 

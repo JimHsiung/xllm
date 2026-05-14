@@ -15,10 +15,12 @@ limitations under the License.
 
 #include "framework/weight_transfer/weight_transfer_sender_engine.h"
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include <iomanip>
 
+#include "common/global_flags.h"
 #include "framework/weight_transfer/weight_transfer_common.h"
 
 namespace xllm {
@@ -54,12 +56,31 @@ void WeightTransferSenderEngine::register_layer(
   (*layer_registry_)[layer_id] = tensors;
 }
 
+void WeightTransferSenderEngine::register_layer_storage(
+    int32_t layer_id,
+    layer::BaseLoader* loader) {
+  if (loader == nullptr) {
+    layer_storage_registry_.erase(layer_id);
+    return;
+  }
+  layer_storage_registry_[layer_id] = loader;
+}
+
 const std::vector<at::Tensor>&
 WeightTransferSenderEngine::get_registered_tensors(int32_t layer_id) const {
   static const std::vector<at::Tensor> k_empty_tensors;
   auto it = layer_registry_->find(layer_id);
   if (it == layer_registry_->end()) {
     return k_empty_tensors;
+  }
+  return it->second;
+}
+
+layer::BaseLoader* WeightTransferSenderEngine::get_registered_layer_storage(
+    int32_t layer_id) const {
+  auto it = layer_storage_registry_.find(layer_id);
+  if (it == layer_storage_registry_.end()) {
+    return nullptr;
   }
   return it->second;
 }
@@ -112,7 +133,7 @@ void WeightTransferSenderEngine::process_weights_send_request(
     const std::string& session_id,
     const std::vector<int32_t>& layer_ids) {
   process_weights_send_request_internal(
-      session_id, layer_ids, LayerExpertIdsMap{}, true, true);
+      session_id, layer_ids, LayerExpertIdsMap{}, true, true, false);
 }
 
 void WeightTransferSenderEngine::process_weights_send_request(
@@ -120,8 +141,23 @@ void WeightTransferSenderEngine::process_weights_send_request(
     const std::vector<int32_t>& layer_ids,
     const LayerExpertIdsMap& layer_expert_ids,
     bool include_non_expert) {
-  process_weights_send_request_internal(
+  process_weights_send_request(
       session_id, layer_ids, layer_expert_ids, include_non_expert, false);
+}
+
+void WeightTransferSenderEngine::process_weights_send_request(
+    const std::string& session_id,
+    const std::vector<int32_t>& layer_ids,
+    const LayerExpertIdsMap& layer_expert_ids,
+    bool include_non_expert,
+    bool use_layer_storage_transfer,
+    bool transfer_all_experts) {
+  process_weights_send_request_internal(session_id,
+                                        layer_ids,
+                                        layer_expert_ids,
+                                        include_non_expert,
+                                        transfer_all_experts,
+                                        use_layer_storage_transfer);
 }
 
 void WeightTransferSenderEngine::process_weights_send_request_internal(
@@ -129,7 +165,8 @@ void WeightTransferSenderEngine::process_weights_send_request_internal(
     const std::vector<int32_t>& layer_ids,
     const LayerExpertIdsMap& layer_expert_ids,
     bool include_non_expert,
-    bool transfer_all_experts) {
+    bool transfer_all_experts,
+    bool use_layer_storage_transfer) {
   if (session_id.empty()) {
     LOG(ERROR) << "Sender batch transfer requires non-empty session_id.";
     return;
@@ -184,7 +221,8 @@ void WeightTransferSenderEngine::process_weights_send_request_internal(
                                         session_ctx_for_thread,
                                         expert_indices_set_ptr,
                                         ep_size,
-                                        ep_rank]() mutable {
+                                        ep_rank,
+                                        use_layer_storage_transfer]() mutable {
     std::unique_lock<std::mutex> session_lock;
     if (session_ctx_for_thread != nullptr) {
       session_lock =
@@ -196,6 +234,9 @@ void WeightTransferSenderEngine::process_weights_send_request_internal(
 
     absl::Time start_time = absl::Now();
     size_t total_nbytes = 0;
+    size_t layer_storage_items = 0;
+    size_t tensor_items = 0;
+    uint64_t storage_padding_nbytes = 0;
 
     std::vector<HcclSendRecvItem> items;
     for (int32_t layer_id : layer_ids) {
@@ -204,20 +245,52 @@ void WeightTransferSenderEngine::process_weights_send_request_internal(
       const std::vector<int32_t> layer_ids_for_experts =
           it == normalized_layer_expert_ids.end() ? std::vector<int32_t>{}
                                                   : it->second;
-      if (!append_layer_transfer_items(tensors,
-                                       layer_id,
-                                       layer_ids_for_experts,
-                                       expert_indices_set,
-                                       include_non_expert,
-                                       transfer_all_experts,
-                                       ep_rank,
-                                       ep_size,
-                                       HCCL_SEND,
-                                       0,
-                                       &items,
-                                       &total_nbytes)) {
-        promise->set_value(false);
-        return;
+      bool appended_layer_storage = false;
+      if (use_layer_storage_transfer && FLAGS_enable_manual_loader &&
+          transfer_all_experts && include_non_expert &&
+          layer_ids_for_experts.empty() && layer_id >= 0) {
+        auto storage_info = get_contiguous_layer_storage_info(
+            tensors, get_registered_layer_storage(layer_id));
+        if (storage_info.available) {
+          append_contiguous_storage_transfer_items(
+              storage_info.base_ptr,
+              storage_info.storage_size,
+              HCCL_SEND,
+              0,
+              FLAGS_layer_storage_weight_transfer_chunk_bytes,
+              &items,
+              &total_nbytes);
+          ++layer_storage_items;
+          const uint64_t payload_nbytes = sum_tensor_nbytes(tensors);
+          if (storage_info.storage_size > payload_nbytes) {
+            storage_padding_nbytes +=
+                storage_info.storage_size - payload_nbytes;
+          }
+          appended_layer_storage = true;
+        } else {
+          LOG(WARNING) << "Layer storage transfer requested but sender layer "
+                          "storage is unavailable. Fallback to tensor items. "
+                       << "layer_id=" << layer_id;
+        }
+      }
+      if (!appended_layer_storage) {
+        const size_t before_items = items.size();
+        if (!append_layer_transfer_items(tensors,
+                                         layer_id,
+                                         layer_ids_for_experts,
+                                         expert_indices_set,
+                                         include_non_expert,
+                                         transfer_all_experts,
+                                         ep_rank,
+                                         ep_size,
+                                         HCCL_SEND,
+                                         0,
+                                         &items,
+                                         &total_nbytes)) {
+          promise->set_value(false);
+          return;
+        }
+        tensor_items += items.size() - before_items;
       }
     }
 
@@ -242,8 +315,15 @@ void WeightTransferSenderEngine::process_weights_send_request_internal(
     LOG(INFO) << "[Sender Thread] Batch transfer (layers: " << layer_ids.size()
               << ", include_non_expert=" << include_non_expert
               << ", transfer_all_experts=" << transfer_all_experts
+              << ", use_layer_storage_transfer=" << use_layer_storage_transfer
               << ", requested_expert_ids="
-              << count_expert_ids(normalized_layer_expert_ids)
+              << count_expert_ids(normalized_layer_expert_ids) << ", "
+              << summarize_hccl_transfer_items(items) << ", "
+              << summarize_hccl_transfer_item_addresses(items)
+              << ", layer_storage_items=" << layer_storage_items
+              << ", tensor_items=" << tensor_items << ", storage_padding_mb="
+              << (static_cast<double>(storage_padding_nbytes) /
+                  (1024.0 * 1024.0))
               << "): " << std::fixed << std::setprecision(2) << total_gb
               << " GB, "
               << "Time: " << duration_ms << " ms, "

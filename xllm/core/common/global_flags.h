@@ -342,4 +342,7 @@ DECLARE_string(weight_load_mode);
 
 DECLARE_int32(weight_transfer_port);
 
+DECLARE_bool(enable_layer_storage_weight_transfer);
+DECLARE_uint64(layer_storage_weight_transfer_chunk_bytes);
+
 DECLARE_bool(enable_parallel_weight_pull);

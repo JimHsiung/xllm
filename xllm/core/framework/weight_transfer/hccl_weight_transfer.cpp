@@ -36,6 +36,11 @@ void HcclWeightTransfer::register_layer(
   impl_->register_layer(layer_id, tensors);
 }
 
+void HcclWeightTransfer::register_layer_storage(int32_t layer_id,
+                                                layer::BaseLoader* loader) {
+  impl_->register_layer_storage(layer_id, loader);
+}
+
 void HcclWeightTransfer::start_serving() { impl_->start_serving(); }
 
 void HcclWeightTransfer::process_weights_send_request(

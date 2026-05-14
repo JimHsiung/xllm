@@ -23,6 +23,7 @@ limitations under the License.
 #include "framework/model_context.h"
 #include "framework/weight_transfer/weight_transfer_alltoall_planner.h"
 #include "framework/weight_transfer/weight_transfer_session_manager.h"
+#include "framework/weight_transfer/weight_transfer_types.h"
 
 namespace xllm {
 
@@ -44,7 +45,9 @@ class WeightTransferSenderEngine {
                         xllm::proto::CommMode comm_mode);
 
   void register_layer(int32_t layer_id, const std::vector<at::Tensor>& tensors);
+  void register_layer_storage(int32_t layer_id, layer::BaseLoader* loader);
   const std::vector<at::Tensor>& get_registered_tensors(int32_t layer_id) const;
+  layer::BaseLoader* get_registered_layer_storage(int32_t layer_id) const;
 
   void process_weights_send_request(const std::string& session_id,
                                     const std::vector<int32_t>& layer_ids);
@@ -52,6 +55,12 @@ class WeightTransferSenderEngine {
                                     const std::vector<int32_t>& layer_ids,
                                     const LayerExpertIdsMap& layer_expert_ids,
                                     bool include_non_expert);
+  void process_weights_send_request(const std::string& session_id,
+                                    const std::vector<int32_t>& layer_ids,
+                                    const LayerExpertIdsMap& layer_expert_ids,
+                                    bool include_non_expert,
+                                    bool use_layer_storage_transfer,
+                                    bool transfer_all_experts = false);
 
   bool process_weights_alltoallv_send_request(
       const std::string& session_id,
@@ -73,7 +82,8 @@ class WeightTransferSenderEngine {
       const std::vector<int32_t>& layer_ids,
       const LayerExpertIdsMap& layer_expert_ids,
       bool include_non_expert,
-      bool transfer_all_experts);
+      bool transfer_all_experts,
+      bool use_layer_storage_transfer);
 
   const ModelContext& context_;
   CausalLM* model_;
@@ -81,6 +91,7 @@ class WeightTransferSenderEngine {
   const std::string& local_addr_;
   WeightTransferSessionManager* session_manager_;
   std::unordered_map<int32_t, std::vector<at::Tensor>>* layer_registry_;
+  std::unordered_map<int32_t, layer::BaseLoader*> layer_storage_registry_;
 };
 
 }  // namespace xllm

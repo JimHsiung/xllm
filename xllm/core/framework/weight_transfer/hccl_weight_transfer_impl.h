@@ -41,6 +41,7 @@ class HcclWeightTransferImpl {
   ~HcclWeightTransferImpl();
 
   void register_layer(int32_t layer_id, const std::vector<at::Tensor>& tensors);
+  void register_layer_storage(int32_t layer_id, layer::BaseLoader* loader);
 
   void start_serving();
 
@@ -50,7 +51,9 @@ class HcclWeightTransferImpl {
       const std::string& session_id,
       const std::vector<int32_t>& layer_ids,
       const std::unordered_map<int32_t, std::vector<int32_t>>& layer_expert_ids,
-      bool include_non_expert);
+      bool include_non_expert,
+      bool use_layer_storage_transfer = false,
+      bool transfer_all_experts = false);
   bool process_weights_alltoallv_send_request(
       const std::string& session_id,
       uint32_t receiver_rank,
@@ -70,6 +73,7 @@ class HcclWeightTransferImpl {
                         xllm::proto::CommMode comm_mode);
 
   const std::vector<at::Tensor>& get_registered_tensors(int32_t layer_id) const;
+  layer::BaseLoader* get_registered_layer_storage(int32_t layer_id) const;
 
   std::string get_weight_transfer_addr() const;
 

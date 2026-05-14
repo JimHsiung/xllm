@@ -20,15 +20,97 @@ limitations under the License.
 
 #include <algorithm>
 #include <iomanip>
+#include <unordered_set>
 #include <utility>
 
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "acl/acl_rt.h"
 #include "common/global_flags.h"
+#include "core/layers/npu/loader/base_loader.h"
 #include "framework/model/model_args.h"
 #include "framework/weight_transfer/weight_transfer_common.h"
 
 namespace xllm {
+namespace {
+
+bool is_valid_layer_storage_meta(
+    const xllm::proto::LayerWeightsMeta& layer_meta) {
+  if (!layer_meta.has_contiguous_storage() || layer_meta.storage_size() == 0 ||
+      layer_meta.metas_size() == 0 ||
+      layer_meta.slice_metas_size() != layer_meta.metas_size()) {
+    return false;
+  }
+
+  for (int j = 0; j < layer_meta.slice_metas_size(); ++j) {
+    const auto& tensor_meta = layer_meta.metas(j);
+    const auto& slice_meta = layer_meta.slice_metas(j);
+    if (slice_meta.bytes() == 0 ||
+        slice_meta.offset() + slice_meta.bytes() < slice_meta.offset() ||
+        slice_meta.offset() + slice_meta.bytes() > layer_meta.storage_size() ||
+        slice_meta.dtype() != tensor_meta.dtype() ||
+        slice_meta.npu_format() != tensor_meta.npu_format() ||
+        slice_meta.shape_size() != tensor_meta.shape_size()) {
+      return false;
+    }
+    for (int k = 0; k < slice_meta.shape_size(); ++k) {
+      if (slice_meta.shape(k) != tensor_meta.shape(k)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+void release_receiver_layer_storage_map(
+    std::unordered_map<int32_t, ReceiverLayerStorage>* layer_storages) {
+  if (layer_storages == nullptr) {
+    return;
+  }
+  for (auto& entry : *layer_storages) {
+    auto& storage = entry.second;
+    storage.base_ptr = nullptr;
+    storage.available = false;
+    storage.storage_size = 0;
+  }
+  layer_storages->clear();
+}
+
+uint64_t sum_layer_storage_payload_nbytes(
+    const xllm::proto::LayerWeightsMeta& layer_meta) {
+  uint64_t payload_nbytes = 0;
+  for (int j = 0; j < layer_meta.slice_metas_size(); ++j) {
+    const auto& slice_meta = layer_meta.slice_metas(j);
+    payload_nbytes += slice_meta.bytes();
+  }
+  return payload_nbytes;
+}
+
+void allocate_tensors_from_tensor_meta(
+    const xllm::proto::LayerWeightsMeta& layer_meta,
+    int32_t device_id,
+    std::vector<at::Tensor>* tensors) {
+  CHECK(tensors != nullptr);
+  tensors->resize(layer_meta.metas_size());
+
+  for (int j = 0; j < layer_meta.metas_size(); ++j) {
+    const auto& meta = layer_meta.metas(j);
+    std::vector<int64_t> shape;
+    shape.reserve(meta.shape_size());
+    for (int64_t dim : meta.shape()) {
+      shape.push_back(dim);
+    }
+
+    auto options = torch::TensorOptions()
+                       .dtype(static_cast<at::ScalarType>(meta.dtype()))
+                       .device("npu:" + std::to_string(device_id));
+
+    (*tensors)[j] =
+        at_npu::native::empty_with_format(shape, options, meta.npu_format());
+  }
+}
+
+}  // namespace
 
 WeightTransferReceiverEngine::WeightTransferReceiverEngine(
     const ModelContext& context,
@@ -43,6 +125,10 @@ WeightTransferReceiverEngine::WeightTransferReceiverEngine(
       local_addr_(local_addr),
       session_manager_(session_manager),
       planner_(planner) {}
+
+WeightTransferReceiverEngine::~WeightTransferReceiverEngine() {
+  release_layer_storage_views();
+}
 
 bool WeightTransferReceiverEngine::init_collective_comm_as_receiver(
     const std::vector<std::string>& source_addrs,
@@ -413,7 +499,9 @@ bool WeightTransferReceiverEngine::prepare_local_tensors_from_meta(
     const std::string& session_id,
     const std::vector<int32_t>& layer_ids,
     const std::vector<std::vector<at::Tensor>*>& local_tensors_ptrs,
-    double* prepare_ms) {
+    bool enable_layer_storage_allocation,
+    std::unordered_map<int32_t, ReceiverLayerStorage>* layer_storages,
+    MetaAllocateStats* prepare_stats) {
   if (session_id.empty()) {
     LOG(ERROR)
         << "Session id should not be empty when preparing local tensors.";
@@ -442,12 +530,14 @@ bool WeightTransferReceiverEngine::prepare_local_tensors_from_meta(
           target_stub,
           layer_ids,
           local_tensors_ptrs,
+          enable_layer_storage_allocation,
+          layer_storages,
           "prepare_local_tensors_from_meta",
           &stats)) {
     return false;
   }
-  if (prepare_ms != nullptr) {
-    *prepare_ms = stats.total_ms;
+  if (prepare_stats != nullptr) {
+    *prepare_stats = stats;
   }
   return true;
 }
@@ -456,6 +546,8 @@ bool WeightTransferReceiverEngine::fetch_weights_meta_and_allocate_tensors(
     xllm::proto::WeightTransferService_Stub* target_stub,
     const std::vector<int32_t>& layer_ids,
     const std::vector<std::vector<at::Tensor>*>& local_tensors_ptrs,
+    bool enable_layer_storage_allocation,
+    std::unordered_map<int32_t, ReceiverLayerStorage>* layer_storages,
     const std::string& stage_name,
     MetaAllocateStats* stats) {
   if (target_stub == nullptr) {
@@ -500,30 +592,149 @@ bool WeightTransferReceiverEngine::fetch_weights_meta_and_allocate_tensors(
     return false;
   }
 
+  const int32_t num_layers = context_.get_model_args().n_layers();
+  std::unordered_set<int32_t> available_storage_layers;
+  available_storage_layers.reserve(static_cast<size_t>(num_layers));
+  bool can_allocate_layer_storage = FLAGS_enable_manual_loader &&
+                                    enable_layer_storage_allocation &&
+                                    layer_storages != nullptr;
+  if (can_allocate_layer_storage) {
+    for (int i = 0; i < resp_meta.layer_metas_size(); ++i) {
+      const auto& layer_meta = resp_meta.layer_metas(i);
+      const int32_t layer_id = layer_meta.layer_id();
+      if (layer_id < 0) {
+        continue;
+      }
+      if (layer_id >= num_layers || !is_valid_layer_storage_meta(layer_meta)) {
+        can_allocate_layer_storage = false;
+        LOG(INFO) << "Disable contiguous layer storage allocation. layer_id="
+                  << layer_id << ", num_layers=" << num_layers
+                  << ", has_storage=" << layer_meta.has_contiguous_storage()
+                  << ", storage_size=" << layer_meta.storage_size()
+                  << ", tensor_metas=" << layer_meta.metas_size()
+                  << ", slice_metas=" << layer_meta.slice_metas_size();
+        break;
+      }
+      available_storage_layers.insert(layer_id);
+    }
+    if (can_allocate_layer_storage &&
+        available_storage_layers.size() != static_cast<size_t>(num_layers)) {
+      can_allocate_layer_storage = false;
+      LOG(INFO) << "Disable contiguous layer storage allocation because not "
+                   "all decoder layers have storage metadata. expected="
+                << num_layers << ", actual=" << available_storage_layers.size();
+    }
+  }
+  if (!can_allocate_layer_storage && layer_storages != nullptr) {
+    release_receiver_layer_storage_map(layer_storages);
+  }
+
   aclrtSetDevice(device_id_);
   const absl::Time tensor_alloc_start = absl::Now();
-  for (int i = 0; i < resp_meta.layer_metas_size(); ++i) {
-    const auto& layer_meta = resp_meta.layer_metas(i);
-    auto& tensors = *local_tensors_ptrs[i];
-    tensors.resize(layer_meta.metas_size());
-
-    for (int j = 0; j < layer_meta.metas_size(); ++j) {
-      const auto& meta = layer_meta.metas(j);
-      std::vector<int64_t> shape;
-      shape.reserve(meta.shape_size());
-      for (int64_t dim : meta.shape()) {
-        shape.push_back(dim);
+  bool all_layer_storage_available = false;
+  if (can_allocate_layer_storage) {
+    auto decoder_loaders = model_->get_decoder_loaders();
+    bool storage_alloc_ok =
+        decoder_loaders.size() >= static_cast<size_t>(num_layers);
+    if (!storage_alloc_ok) {
+      LOG(INFO) << "Disable loader-native receiver storage because decoder "
+                   "loaders are incomplete. expected="
+                << num_layers << ", actual=" << decoder_loaders.size();
+    }
+    for (int i = 0; i < resp_meta.layer_metas_size(); ++i) {
+      const auto& layer_meta = resp_meta.layer_metas(i);
+      if (layer_meta.layer_id() < 0) {
+        continue;
       }
+      if (!storage_alloc_ok) {
+        break;
+      }
+      layer::BaseLoader* loader = decoder_loaders[layer_meta.layer_id()];
+      if (loader == nullptr || loader->mode() != layer::LoadMode::kManual ||
+          loader->uses_rolling_buffer()) {
+        storage_alloc_ok = false;
+        LOG(INFO) << "Disable loader-native receiver storage. layer_id="
+                  << layer_meta.layer_id()
+                  << ", has_loader=" << (loader != nullptr)
+                  << ", uses_rolling_buffer="
+                  << (loader != nullptr && loader->uses_rolling_buffer());
+        break;
+      }
+    }
 
-      auto options = torch::TensorOptions()
-                         .dtype(static_cast<at::ScalarType>(meta.dtype()))
-                         .device("npu:" + std::to_string(device_id_));
+    if (storage_alloc_ok) {
+      for (int i = 0; i < resp_meta.layer_metas_size(); ++i) {
+        const auto& layer_meta = resp_meta.layer_metas(i);
+        const int32_t layer_id = layer_meta.layer_id();
+        if (layer_id < 0) {
+          continue;
+        }
+        layer::BaseLoader* loader = decoder_loaders[layer_id];
+        std::vector<layer::BaseLoader::DeviceWeightSliceSpec> slice_specs;
+        slice_specs.reserve(layer_meta.slice_metas_size());
+        for (const auto& slice_meta : layer_meta.slice_metas()) {
+          layer::BaseLoader::DeviceWeightSliceSpec spec;
+          spec.offset = slice_meta.offset();
+          spec.bytes = slice_meta.bytes();
+          spec.dtype = static_cast<at::ScalarType>(slice_meta.dtype());
+          spec.acl_format = static_cast<int>(slice_meta.npu_format());
+          spec.sizes.reserve(slice_meta.shape_size());
+          for (int64_t dim : slice_meta.shape()) {
+            spec.sizes.push_back(dim);
+          }
+          slice_specs.push_back(std::move(spec));
+        }
+        const absl::Time storage_alloc_start = absl::Now();
+        loader->prepare_device_storage_from_slices(layer_meta.storage_size(),
+                                                   slice_specs,
+                                                   /*initialize_views=*/false);
+        local_stats.storage_alloc_ms += elapsed_ms_since(storage_alloc_start);
 
-      tensors[j] =
-          at_npu::native::empty_with_format(shape, options, meta.npu_format());
+        ReceiverLayerStorage storage;
+        storage.available = loader->get_device_storage() != nullptr;
+        storage.base_ptr = loader->get_device_storage();
+        storage.storage_size = layer_meta.storage_size();
+        storage.payload_nbytes = sum_layer_storage_payload_nbytes(layer_meta);
+        storage.views_initialized = false;
+        storage.loader = loader;
+        if (!storage.available || storage.base_ptr == nullptr ||
+            storage.storage_size == 0 || storage.payload_nbytes == 0) {
+          LOG(WARNING) << "Failed to setup loader-native receiver storage. "
+                       << "layer_id=" << layer_id;
+          storage_alloc_ok = false;
+          break;
+        }
+        (*layer_storages)[layer_id] = std::move(storage);
+      }
+    }
+
+    if (storage_alloc_ok) {
+      for (int i = 0; i < resp_meta.layer_metas_size(); ++i) {
+        const auto& layer_meta = resp_meta.layer_metas(i);
+        if (layer_meta.layer_id() >= 0) {
+          continue;
+        }
+        allocate_tensors_from_tensor_meta(
+            layer_meta, device_id_, local_tensors_ptrs[i]);
+      }
+    }
+
+    if (storage_alloc_ok &&
+        layer_storages->size() == static_cast<size_t>(num_layers)) {
+      all_layer_storage_available = true;
+    } else {
+      release_receiver_layer_storage_map(layer_storages);
+    }
+  }
+
+  if (!all_layer_storage_available) {
+    for (int i = 0; i < resp_meta.layer_metas_size(); ++i) {
+      allocate_tensors_from_tensor_meta(
+          resp_meta.layer_metas(i), device_id_, local_tensors_ptrs[i]);
     }
   }
   local_stats.tensor_alloc_ms = elapsed_ms_since(tensor_alloc_start);
+  local_stats.all_layer_storage_available = all_layer_storage_available;
   local_stats.total_ms = elapsed_ms_since(meta_alloc_start);
   if (stats != nullptr) {
     *stats = local_stats;
@@ -569,6 +780,10 @@ bool WeightTransferReceiverEngine::assign_global_tensors_after_pull(
   return true;
 }
 
+void WeightTransferReceiverEngine::release_layer_storage_views() {
+  release_receiver_layer_storage_map(&receiver_layer_storages_);
+}
+
 std::unordered_map<int32_t, std::vector<int32_t>>
 WeightTransferReceiverEngine::build_non_expert_only_plan(
     const std::vector<int32_t>& layer_ids) const {
@@ -584,6 +799,8 @@ WeightTransferReceiverEngine::run_model_pull_prepare_stage(
     const std::string& base_session_id,
     const std::vector<int32_t>& layer_ids,
     const std::vector<std::vector<at::Tensor>*>& local_tensors_ptrs,
+    bool enable_layer_storage_allocation,
+    std::unordered_map<int32_t, ReceiverLayerStorage>* layer_storages,
     bool has_expert_prepare,
     const std::function<ModelPullAsyncStageStatus()>& expert_prepare_fn) {
   ModelPullPrepareStageStatus prepare_status;
@@ -617,10 +834,14 @@ WeightTransferReceiverEngine::run_model_pull_prepare_stage(
     });
   }
 
-  bool meta_ok = prepare_local_tensors_from_meta(base_session_id,
-                                                 layer_ids,
-                                                 local_tensors_ptrs,
-                                                 &prepare_status.meta_alloc_ms);
+  MetaAllocateStats prepare_stats;
+  bool meta_ok =
+      prepare_local_tensors_from_meta(base_session_id,
+                                      layer_ids,
+                                      local_tensors_ptrs,
+                                      enable_layer_storage_allocation,
+                                      layer_storages,
+                                      &prepare_stats);
   ModelPullAsyncStageStatus base_comm_status = base_comm_future.get();
   ModelPullAsyncStageStatus expert_comm_status;
   if (has_expert_prepare) {
@@ -628,6 +849,11 @@ WeightTransferReceiverEngine::run_model_pull_prepare_stage(
   }
   prepare_status.base_comm_ms = base_comm_status.elapsed_ms;
   prepare_status.expert_comm_ms = expert_comm_status.elapsed_ms;
+  prepare_status.meta_alloc_ms = prepare_stats.total_ms;
+  prepare_status.meta_rpc_ms = prepare_stats.rpc_ms;
+  prepare_status.tensor_alloc_ms = prepare_stats.tensor_alloc_ms;
+  prepare_status.storage_alloc_ms = prepare_stats.storage_alloc_ms;
+  prepare_status.storage_view_init_ms = prepare_stats.storage_view_init_ms;
   prepare_status.prepare_wall_ms = elapsed_ms_since(prepare_start);
 
   if (!meta_ok) {
@@ -663,6 +889,10 @@ void WeightTransferReceiverEngine::log_model_pull_prepare_timing(
             << prepare_status.base_comm_ms
             << ", expert_comm_ms=" << prepare_status.expert_comm_ms
             << ", meta_alloc_ms=" << prepare_status.meta_alloc_ms
+            << ", meta_rpc_ms=" << prepare_status.meta_rpc_ms
+            << ", tensor_alloc_ms=" << prepare_status.tensor_alloc_ms
+            << ", storage_alloc_ms=" << prepare_status.storage_alloc_ms
+            << ", storage_view_init_ms=" << prepare_status.storage_view_init_ms
             << ", prepare_wall_ms=" << prepare_status.prepare_wall_ms
             << ", overlap_saved_ms=" << overlap_saved_ms;
 }
@@ -707,6 +937,7 @@ WeightTransferReceiverEngine::run_prepared_expert_transfer_serial_stage(
   if (!pull_weight_internal(expert_session_id,
                             single_source_layer_ids,
                             single_source_tensors_ptrs,
+                            receiver_layer_storages_,
                             single_source_layer_expert_ids,
                             false,
                             false,
@@ -727,6 +958,8 @@ bool WeightTransferReceiverEngine::pull_model_from_instance(
     const RankExpertTransferPlanData& rank_expert_transfer_plan) {
   const absl::Time overall_start_time = absl::Now();
   WeightPullTimingStats timing_stats;
+  release_layer_storage_views();
+  use_layer_storage_transfer_ = false;
 
   auto finalize_with_timing = [&](bool success,
                                   const std::string& failed_stage) -> bool {
@@ -757,6 +990,7 @@ bool WeightTransferReceiverEngine::pull_model_from_instance(
 
   std::vector<at::Tensor> global_tensors;
   std::vector<std::vector<at::Tensor>*> local_tensors_ptrs;
+  std::unordered_map<int32_t, ReceiverLayerStorage> layer_storages;
   build_pull_tensor_ptrs(&global_tensors, &local_tensors_ptrs);
 
   const bool use_single_phase_pull =
@@ -764,6 +998,9 @@ bool WeightTransferReceiverEngine::pull_model_from_instance(
       source_tasks.front().source_addr == remote_addr;
   const bool has_two_stage_expert =
       !source_tasks.empty() && !use_single_phase_pull;
+  const bool allow_layer_storage_transfer =
+      FLAGS_enable_manual_loader &&
+      (source_tasks.empty() || use_single_phase_pull) && !has_two_stage_expert;
   const bool enable_parallel_pull =
       FLAGS_enable_parallel_weight_pull && has_two_stage_expert;
   timing_stats.parallel_mode = enable_parallel_pull;
@@ -893,6 +1130,9 @@ bool WeightTransferReceiverEngine::pull_model_from_instance(
       base_session_id,
       layer_ids,
       local_tensors_ptrs,
+      allow_layer_storage_transfer &&
+          FLAGS_enable_layer_storage_weight_transfer,
+      &layer_storages,
       has_two_stage_expert,
       [&]() -> ModelPullAsyncStageStatus {
         ModelPullAsyncStageStatus stage_status;
@@ -909,6 +1149,7 @@ bool WeightTransferReceiverEngine::pull_model_from_instance(
                                  prepare_status.base_comm_ms +
                                  prepare_status.expert_comm_ms;
   if (!prepare_status.ok) {
+    receiver_layer_storages_ = std::move(layer_storages);
     session_manager_->destroy_session_context_async(base_session_id, true);
     if (!expert_session_id.empty()) {
       session_manager_->destroy_session_context_async(expert_session_id, true);
@@ -922,6 +1163,7 @@ bool WeightTransferReceiverEngine::pull_model_from_instance(
   ModelPullStageStatus finalize_expert_status =
       finalize_expert_transfer_after_tensor_ready();
   if (!finalize_expert_status.ok) {
+    receiver_layer_storages_ = std::move(layer_storages);
     session_manager_->destroy_session_context_async(base_session_id, true);
     if (!expert_session_id.empty()) {
       session_manager_->destroy_session_context_async(expert_session_id, true);
@@ -929,11 +1171,27 @@ bool WeightTransferReceiverEngine::pull_model_from_instance(
     return finalize_with_timing(false, finalize_expert_status.failed_stage);
   }
 
+  const bool can_use_layer_storage_transfer =
+      allow_layer_storage_transfer &&
+      FLAGS_enable_layer_storage_weight_transfer &&
+      layer_storages.size() == static_cast<size_t>(num_layers);
+  if (can_use_layer_storage_transfer) {
+    receiver_layer_storages_ = std::move(layer_storages);
+    use_layer_storage_transfer_ = true;
+    LOG(INFO) << "Use contiguous layer storage transfer for full single-source "
+                 "pull. decoder_layers="
+              << receiver_layer_storages_.size();
+  } else {
+    receiver_layer_storages_ = std::move(layer_storages);
+    use_layer_storage_transfer_ = false;
+  }
+
   if (source_tasks.empty() || use_single_phase_pull) {
     const absl::Time transfer_start = absl::Now();
     if (!pull_weight_internal(base_session_id,
                               layer_ids,
                               local_tensors_ptrs,
+                              receiver_layer_storages_,
                               LayerExpertIdsMap{},
                               true,
                               true,
@@ -961,6 +1219,7 @@ bool WeightTransferReceiverEngine::pull_model_from_instance(
     if (!pull_weight_internal(base_session_id,
                               layer_ids,
                               local_tensors_ptrs,
+                              receiver_layer_storages_,
                               non_expert_only_plan,
                               true,
                               false,
@@ -1013,6 +1272,7 @@ bool WeightTransferReceiverEngine::pull_model_from_instance(
         bool ok = pull_weight_internal(base_session_id,
                                        layer_ids,
                                        local_tensors_ptrs,
+                                       receiver_layer_storages_,
                                        non_expert_only_plan,
                                        true,
                                        false,
@@ -1049,6 +1309,7 @@ bool WeightTransferReceiverEngine::pull_model_from_instance(
         bool ok = pull_weight_internal(expert_session_id,
                                        single_source_layer_ids,
                                        single_source_tensors_ptrs,
+                                       receiver_layer_storages_,
                                        single_source_layer_expert_ids,
                                        false,
                                        false,
@@ -1100,6 +1361,7 @@ WeightTransferReceiverEngine::launch_trigger_rpc_stage(
         normalized_layer_expert_ids,
     bool include_non_expert,
     bool transfer_all_experts,
+    bool use_layer_storage_transfer,
     const std::string& session_id) {
   auto trigger_promise = std::make_shared<std::promise<TriggerRpcResult>>();
   std::future<TriggerRpcResult> trigger_future = trigger_promise->get_future();
@@ -1111,6 +1373,7 @@ WeightTransferReceiverEngine::launch_trigger_rpc_stage(
                                        normalized_layer_expert_ids,
                                        include_non_expert,
                                        transfer_all_experts,
+                                       use_layer_storage_transfer,
                                        session_id,
                                        session_ctx_for_rpc,
                                        trigger_task_enqueued_time,
@@ -1136,6 +1399,8 @@ WeightTransferReceiverEngine::launch_trigger_rpc_stage(
       for (int32_t id : layer_ids) {
         req_trig.add_layer_ids(id);
       }
+      req_trig.set_include_non_expert(include_non_expert);
+      req_trig.set_transfer_all_experts(true);
     } else {
       fill_trigger_weights_send_request(layer_ids,
                                         normalized_layer_expert_ids,
@@ -1143,6 +1408,7 @@ WeightTransferReceiverEngine::launch_trigger_rpc_stage(
                                         &req_trig);
     }
     req_trig.set_session_id(session_id);
+    req_trig.set_use_layer_storage_transfer(use_layer_storage_transfer);
 
     const absl::Time rpc_start = absl::Now();
     stub_for_rpc->TriggerWeightsSend(
@@ -1165,10 +1431,12 @@ WeightTransferReceiverEngine::launch_receiver_exec_stage(
     const std::shared_ptr<CommSessionContext>& session_ctx,
     const std::vector<int32_t>& layer_ids,
     const std::vector<std::vector<at::Tensor>*>& local_tensors_ptrs,
+    const std::unordered_map<int32_t, ReceiverLayerStorage>& layer_storages,
     const std::unordered_map<int32_t, std::vector<int32_t>>&
         normalized_layer_expert_ids,
     bool include_non_expert,
-    bool transfer_all_experts) {
+    bool transfer_all_experts,
+    bool use_layer_storage_transfer) {
   auto promise = std::make_shared<std::promise<ReceiverTransferResult>>();
   std::future<ReceiverTransferResult> future = promise->get_future();
   if (session_ctx == nullptr) {
@@ -1197,6 +1465,8 @@ WeightTransferReceiverEngine::launch_receiver_exec_stage(
                                         expert_indices_set_ptr,
                                         ep_size,
                                         ep_rank,
+                                        layer_storages,
+                                        use_layer_storage_transfer,
                                         receiver_task_enqueued_time,
                                         promise]() mutable {
     ReceiverTransferResult receiver_result;
@@ -1216,6 +1486,9 @@ WeightTransferReceiverEngine::launch_receiver_exec_stage(
 
     const absl::Time start_time = absl::Now();
     size_t total_nbytes = 0;
+    size_t layer_storage_items = 0;
+    size_t tensor_items = 0;
+    uint64_t storage_padding_nbytes = 0;
     std::vector<HcclSendRecvItem> items;
     const absl::Time build_items_start = absl::Now();
 
@@ -1226,23 +1499,64 @@ WeightTransferReceiverEngine::launch_receiver_exec_stage(
       const std::vector<int32_t> layer_ids_for_experts =
           it == normalized_layer_expert_ids.end() ? std::vector<int32_t>{}
                                                   : it->second;
-      if (!append_layer_transfer_items(*tensors_ptr,
-                                       layer_id,
-                                       layer_ids_for_experts,
-                                       expert_indices_set,
-                                       include_non_expert,
-                                       transfer_all_experts,
-                                       ep_rank,
-                                       ep_size,
-                                       HCCL_RECV,
-                                       1,
-                                       &items,
-                                       &total_nbytes)) {
-        promise->set_value(receiver_result);
-        return;
+      bool appended_layer_storage = false;
+      if (use_layer_storage_transfer && FLAGS_enable_manual_loader &&
+          transfer_all_experts && include_non_expert &&
+          layer_ids_for_experts.empty() && layer_id >= 0) {
+        auto storage_it = layer_storages.find(layer_id);
+        if (storage_it != layer_storages.end() &&
+            storage_it->second.available &&
+            storage_it->second.base_ptr != nullptr &&
+            storage_it->second.storage_size > 0) {
+          append_contiguous_storage_transfer_items(
+              storage_it->second.base_ptr,
+              storage_it->second.storage_size,
+              HCCL_RECV,
+              1,
+              FLAGS_layer_storage_weight_transfer_chunk_bytes,
+              &items,
+              &total_nbytes);
+          ++layer_storage_items;
+          const uint64_t payload_nbytes =
+              storage_it->second.payload_nbytes > 0
+                  ? storage_it->second.payload_nbytes
+                  : sum_tensor_nbytes(*tensors_ptr);
+          if (storage_it->second.storage_size > payload_nbytes) {
+            storage_padding_nbytes +=
+                storage_it->second.storage_size - payload_nbytes;
+          }
+          appended_layer_storage = true;
+        } else {
+          LOG(WARNING) << "Layer storage transfer requested but receiver layer "
+                          "storage is unavailable. Fallback to tensor items. "
+                       << "layer_id=" << layer_id;
+        }
+      }
+      if (!appended_layer_storage) {
+        const size_t before_items = items.size();
+        if (!append_layer_transfer_items(*tensors_ptr,
+                                         layer_id,
+                                         layer_ids_for_experts,
+                                         expert_indices_set,
+                                         include_non_expert,
+                                         transfer_all_experts,
+                                         ep_rank,
+                                         ep_size,
+                                         HCCL_RECV,
+                                         1,
+                                         &items,
+                                         &total_nbytes)) {
+          promise->set_value(receiver_result);
+          return;
+        }
+        tensor_items += items.size() - before_items;
       }
     }
     receiver_result.build_items_ms = elapsed_ms_since(build_items_start);
+    receiver_result.item_count = items.size();
+    receiver_result.layer_storage_items = layer_storage_items;
+    receiver_result.tensor_items = tensor_items;
+    receiver_result.storage_padding_nbytes = storage_padding_nbytes;
 
     const absl::Time hccl_exec_start = absl::Now();
     if (!items.empty()) {
@@ -1256,8 +1570,34 @@ WeightTransferReceiverEngine::launch_receiver_exec_stage(
       }
     }
 
+    bool storage_view_init_ok = true;
+    if (use_layer_storage_transfer && layer_storage_items > 0) {
+      const absl::Time view_init_start = absl::Now();
+      for (size_t i = 0; i < local_tensors_ptrs.size(); ++i) {
+        const int32_t layer_id = layer_ids[i];
+        auto storage_it = layer_storages.find(layer_id);
+        if (storage_it == layer_storages.end() ||
+            !storage_it->second.available ||
+            storage_it->second.views_initialized) {
+          continue;
+        }
+        if (storage_it->second.loader == nullptr) {
+          storage_view_init_ok = false;
+          break;
+        }
+        storage_it->second.loader->init_device_at_weights();
+      }
+      receiver_result.storage_view_init_ms = elapsed_ms_since(view_init_start);
+    }
+
     auto sync_ret = aclrtSynchronizeStream(target_stream);
     receiver_result.hccl_exec_ms = elapsed_ms_since(hccl_exec_start);
+    if (!storage_view_init_ok) {
+      LOG(ERROR) << "[Receiver Thread] Failed to initialize tensor views from "
+                    "layer storage after HCCL enqueue.";
+      promise->set_value(receiver_result);
+      return;
+    }
 
     absl::Time end_time = absl::Now();
     double duration_s = absl::ToDoubleSeconds(end_time - start_time);
@@ -1269,8 +1609,15 @@ WeightTransferReceiverEngine::launch_receiver_exec_stage(
               << layer_ids.size()
               << ", include_non_expert=" << include_non_expert
               << ", transfer_all_experts=" << transfer_all_experts
+              << ", use_layer_storage_transfer=" << use_layer_storage_transfer
               << ", requested_expert_ids="
-              << count_expert_ids(normalized_layer_expert_ids)
+              << count_expert_ids(normalized_layer_expert_ids) << ", "
+              << summarize_hccl_transfer_items(items) << ", "
+              << summarize_hccl_transfer_item_addresses(items)
+              << ", layer_storage_items=" << layer_storage_items
+              << ", tensor_items=" << tensor_items << ", storage_padding_mb="
+              << (static_cast<double>(storage_padding_nbytes) /
+                  (1024.0 * 1024.0))
               << "): " << std::fixed << std::setprecision(2) << total_gb
               << " GB, "
               << "Time: " << duration_ms << " ms, "
@@ -1289,6 +1636,7 @@ bool WeightTransferReceiverEngine::pull_weight_internal(
     const std::string& session_id,
     const std::vector<int32_t>& layer_ids,
     const std::vector<std::vector<at::Tensor>*>& local_tensors_ptrs,
+    const std::unordered_map<int32_t, ReceiverLayerStorage>& layer_storages,
     const std::unordered_map<int32_t, std::vector<int32_t>>& layer_expert_ids,
     bool include_non_expert,
     bool transfer_all_experts,
@@ -1344,6 +1692,8 @@ bool WeightTransferReceiverEngine::pull_weight_internal(
     if (!fetch_weights_meta_and_allocate_tensors(target_stub,
                                                  layer_ids,
                                                  local_tensors_ptrs,
+                                                 false,
+                                                 nullptr,
                                                  "pull_weight_internal",
                                                  &meta_stats)) {
       return false;
@@ -1359,14 +1709,17 @@ bool WeightTransferReceiverEngine::pull_weight_internal(
                                normalized_layer_expert_ids,
                                include_non_expert,
                                transfer_all_experts,
+                               use_layer_storage_transfer_,
                                effective_session_id);
   std::future<ReceiverTransferResult> receiver_future =
       launch_receiver_exec_stage(session_ctx,
                                  layer_ids,
                                  local_tensors_ptrs,
+                                 layer_storages,
                                  normalized_layer_expert_ids,
                                  include_non_expert,
-                                 transfer_all_experts);
+                                 transfer_all_experts,
+                                 use_layer_storage_transfer_);
 
   const absl::Time receiver_wait_start = absl::Now();
   ReceiverTransferResult receiver_result = receiver_future.get();
@@ -1398,10 +1751,20 @@ bool WeightTransferReceiverEngine::pull_weight_internal(
             << ", trigger_wait_ms=" << trigger_wait_ms
             << ", receiver_queue_wait_ms=" << receiver_result.queue_wait_ms
             << ", receiver_build_items_ms=" << receiver_result.build_items_ms
+            << ", receiver_storage_view_init_ms="
+            << receiver_result.storage_view_init_ms
             << ", receiver_hccl_exec_ms=" << receiver_result.hccl_exec_ms
             << ", receiver_thread_total_ms=" << receiver_result.thread_total_ms
             << ", receiver_wait_ms=" << receiver_wait_ms
-            << ", receiver_gb=" << receiver_total_gb << ", success=" << result;
+            << ", receiver_gb=" << receiver_total_gb
+            << ", receiver_items=" << receiver_result.item_count
+            << ", receiver_layer_storage_items="
+            << receiver_result.layer_storage_items
+            << ", receiver_tensor_items=" << receiver_result.tensor_items
+            << ", receiver_storage_padding_mb="
+            << (static_cast<double>(receiver_result.storage_padding_nbytes) /
+                (1024.0 * 1024.0))
+            << ", success=" << result;
 
   if (!result) {
     LOG(ERROR) << "Batch pull weight failed!";

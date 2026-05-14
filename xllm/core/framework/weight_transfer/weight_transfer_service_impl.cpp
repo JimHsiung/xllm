@@ -19,6 +19,7 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch_npu/csrc/core/npu/NPUFormat.h>
 
+#include <cstdint>
 #include <utility>
 
 #include "framework/weight_transfer/hccl_weight_transfer_impl.h"
@@ -89,6 +90,26 @@ void WeightTransferServiceImpl::GetWeightsMeta(
       }
       meta->set_npu_format(at_npu::native::get_npu_format(t));
     }
+    auto storage_info = get_contiguous_layer_storage_info(
+        tensors, impl_->get_registered_layer_storage(layer_id));
+    if (!storage_info.available) {
+      continue;
+    }
+    layer_meta->set_has_contiguous_storage(true);
+    layer_meta->set_storage_size(storage_info.storage_size);
+    const uintptr_t base_addr =
+        reinterpret_cast<uintptr_t>(storage_info.base_ptr);
+    for (const auto& t : tensors) {
+      auto* slice_meta = layer_meta->add_slice_metas();
+      const uintptr_t tensor_addr = reinterpret_cast<uintptr_t>(t.data_ptr());
+      slice_meta->set_offset(tensor_addr - base_addr);
+      slice_meta->set_bytes(static_cast<uint64_t>(t.nbytes()));
+      slice_meta->set_dtype(static_cast<int32_t>(t.scalar_type()));
+      for (int i = 0; i < t.dim(); ++i) {
+        slice_meta->add_shape(t.size(i));
+      }
+      slice_meta->set_npu_format(at_npu::native::get_npu_format(t));
+    }
   }
 }
 
@@ -136,7 +157,8 @@ void WeightTransferServiceImpl::TriggerWeightsSend(
     layer_ids.push_back(id);
   }
   const bool has_extended_fields =
-      request->include_non_expert() || request->layer_expert_ids_size() > 0;
+      request->include_non_expert() || request->layer_expert_ids_size() > 0 ||
+      request->use_layer_storage_transfer() || request->transfer_all_experts();
   if (!has_extended_fields) {
     impl_->process_weights_send_request(session_id, layer_ids);
     response->set_success(true);
@@ -144,8 +166,12 @@ void WeightTransferServiceImpl::TriggerWeightsSend(
   }
 
   auto layer_expert_ids = parse_layer_expert_ids(*request);
-  impl_->process_weights_send_request(
-      session_id, layer_ids, layer_expert_ids, request->include_non_expert());
+  impl_->process_weights_send_request(session_id,
+                                      layer_ids,
+                                      layer_expert_ids,
+                                      request->include_non_expert(),
+                                      request->use_layer_storage_transfer(),
+                                      request->transfer_all_experts());
   response->set_success(true);
   response->set_transferred_bytes(0);
 }

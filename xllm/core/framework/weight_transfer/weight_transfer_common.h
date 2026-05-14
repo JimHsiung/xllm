@@ -29,6 +29,10 @@ limitations under the License.
 
 namespace xllm {
 
+LayerStorageInfo get_contiguous_layer_storage_info(
+    const std::vector<at::Tensor>& tensors,
+    layer::BaseLoader* loader);
+
 class SenderSessionLogGuard {
  public:
   SenderSessionLogGuard(const std::string& session_id, const std::string& mode);
@@ -93,6 +97,23 @@ bool append_layer_transfer_items(
     uint32_t peer_rank,
     std::vector<HcclSendRecvItem>* items,
     size_t* total_nbytes);
+
+void append_contiguous_storage_transfer_items(
+    void* base_ptr,
+    uint64_t storage_size,
+    decltype(HCCL_SEND) operation,
+    uint32_t peer_rank,
+    uint64_t chunk_bytes,
+    std::vector<HcclSendRecvItem>* items,
+    size_t* total_nbytes);
+
+uint64_t sum_tensor_nbytes(const std::vector<at::Tensor>& tensors);
+
+std::string summarize_hccl_transfer_items(
+    const std::vector<HcclSendRecvItem>& items);
+
+std::string summarize_hccl_transfer_item_addresses(
+    const std::vector<HcclSendRecvItem>& items);
 
 void fill_trigger_weights_send_request(
     const std::vector<int32_t>& layer_ids,

@@ -1003,9 +1003,13 @@ bool WorkerImpl::init_model(const InitModelParams& params) {
       hccl_weight_transfer_->register_layer(-1, global_tensors);
 
       int32_t num_layers = context_.get_model_args().n_layers();
+      auto decoder_loaders = model_->get_decoder_loaders();
       for (int i = 0; i < num_layers; ++i) {
         hccl_weight_transfer_->register_layer(
             i, model_->get_decoder_layer_weight(i));
+        if (i < static_cast<int32_t>(decoder_loaders.size())) {
+          hccl_weight_transfer_->register_layer_storage(i, decoder_loaders[i]);
+        }
       }
       hccl_weight_transfer_->start_serving();
     }
