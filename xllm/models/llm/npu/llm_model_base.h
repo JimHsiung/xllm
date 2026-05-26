@@ -121,6 +121,15 @@ class LlmDecoderLayerImplBase : public torch::nn::Module {
     decoder_layer_->refresh_rolling_weights();
   }
 
+  virtual void refresh_loaded_weights() {
+    decoder_layer_->refresh_loaded_weights();
+    block_copy_->refresh_loaded_weights();
+  }
+
+  std::vector<at::Tensor>& get_decoder_layer_weight() {
+    return decoder_layer_->get_at_weight_tensors();
+  }
+
  private:
   DecoderType decoder_layer_{nullptr};
   layer::NpuBlockCopy block_copy_{nullptr};

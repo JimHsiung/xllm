@@ -270,6 +270,26 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
     return ModelOutput(hidden_states);
   }
 
+  void refresh_loaded_weights() {
+    npu_embed_tokens_->refresh_loaded_weights();
+    for (auto& layer : layers_) {
+      layer->refresh_loaded_weights();
+    }
+    norm_->refresh_loaded_weights();
+  }
+
+  std::vector<at::Tensor>& get_word_embedding_weight() {
+    return npu_embed_tokens_->get_at_weight_tensors();
+  }
+
+  std::vector<at::Tensor>& get_norm_weight() {
+    return norm_->get_at_weight_tensors();
+  }
+
+  std::vector<at::Tensor>& get_decoder_layer_weight_by_id(int32_t layer_id) {
+    return layers_[layer_id]->get_decoder_layer_weight();
+  }
+
  private:
   torch::Tensor viusal_pos_mask_;
   std::unordered_set<int32_t> layers_to_capture_set_;
@@ -291,6 +311,27 @@ class QWen3ForCausalLMImpl : public LlmForCausalLMImplBase<QWen3Model> {
     }
     return torch::nn::functional::normalize(
         h, torch::nn::functional::NormalizeFuncOptions().p(2).dim(1));
+  }
+
+  std::vector<at::Tensor>& get_decoder_layer_weight(int32_t layer_id) {
+    return model_->get_decoder_layer_weight_by_id(layer_id);
+  }
+
+  std::vector<at::Tensor>& get_lm_head_weight() {
+    return npu_lm_head_->get_at_weight_tensors();
+  }
+
+  std::vector<at::Tensor>& get_word_embedding_weight() {
+    return model_->get_word_embedding_weight();
+  }
+
+  std::vector<at::Tensor>& get_norm_weight() {
+    return model_->get_norm_weight();
+  }
+
+  void refresh_loaded_weights() {
+    model_->refresh_loaded_weights();
+    npu_lm_head_->refresh_loaded_weights();
   }
 };
 TORCH_MODULE(QWen3ForCausalLM);
