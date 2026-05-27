@@ -20,6 +20,8 @@ limitations under the License.
 #include <hccl/hccl.h>
 #endif
 
+#include <condition_variable>
+#include <mutex>
 #include <unordered_map>
 
 #include "common/macros.h"
@@ -56,6 +58,7 @@ class CollectiveService : public proto::Collective {
   std::vector<HcclRootInfo> root_infos_;
 #endif
   std::mutex mutex_;
+  std::condition_variable cond_;
   std::unordered_map<int32_t, std::string> addrs_map_;
 };
 

@@ -52,21 +52,17 @@ void CollectiveService::Sync(::google::protobuf::RpcController* controller,
     std::lock_guard<std::mutex> lock(mutex_);
     addrs_map_[global_rank] = address;
   }
+  cond_.notify_all();
 #if defined(USE_NPU)
   to_proto_list(root_infos_, response);
 #endif
 }
 
 std::unordered_map<int32_t, std::string> CollectiveService::wait() {
-  int connected = 0;
-  while (connected < total_num_) {
-    absl::SleepFor(absl::Milliseconds(1000));
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      connected = addrs_map_.size();
-    }
-  }
-
+  std::unique_lock<std::mutex> lock(mutex_);
+  cond_.wait(lock, [this] {
+    return static_cast<int>(addrs_map_.size()) >= total_num_;
+  });
   return addrs_map_;
 }
 

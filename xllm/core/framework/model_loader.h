@@ -64,7 +64,8 @@ class ModelLoader {
  public:
   // create a model loader from the given path
   static std::unique_ptr<ModelLoader> create(
-      const std::string& model_weights_path);
+      const std::string& model_weights_path,
+      bool load_tokenizer_args = true);
 };
 
 }  // namespace xllm

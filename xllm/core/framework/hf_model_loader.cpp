@@ -30,6 +30,7 @@ limitations under the License.
 #include <cctype>
 #include <filesystem>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -55,6 +56,21 @@ limitations under the License.
 namespace xllm {
 
 namespace {
+
+struct BaseArgsCacheEntry {
+  ModelArgs args;
+  QuantArgs quant_args;
+};
+
+std::mutex& base_args_cache_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<std::string, BaseArgsCacheEntry>& base_args_cache() {
+  static std::unordered_map<std::string, BaseArgsCacheEntry> cache;
+  return cache;
+}
 
 JsonReader normalize_config_torch_dtype(const JsonReader& reader) {
   auto config = reader.data();
@@ -409,9 +425,10 @@ bool load_quant_cfg(const JsonReader& reader, QuantArgs& quant_args) {
       reader, quant_args, only_expert_per_group);
 }
 
-HFModelLoader::HFModelLoader(const std::string& model_weights_path)
+HFModelLoader::HFModelLoader(const std::string& model_weights_path,
+                             bool include_tokenizer_args)
     : model_weights_path_(model_weights_path) {
-  CHECK(load_args(model_weights_path))
+  CHECK(load_args(model_weights_path, include_tokenizer_args))
       << "Failed to load model args from " << model_weights_path;
   // try to load safetensors first
   for (const auto& entry :
@@ -693,29 +710,43 @@ bool HFModelLoader::load_rec_vocab(const std::string& model_weights_path) {
   return true;
 }
 
-bool HFModelLoader::load_args(const std::string& model_weights_path) {
-  if (!load_model_args(model_weights_path)) {
-    LOG(ERROR) << "Failed to load model args from " << model_weights_path;
-    return false;
+bool HFModelLoader::load_args(const std::string& model_weights_path,
+                              bool include_tokenizer_args) {
+  {
+    std::lock_guard<std::mutex> lock(base_args_cache_mutex());
+    auto& cache = base_args_cache();
+    auto it = cache.find(model_weights_path);
+    if (it != cache.end()) {
+      args_ = it->second.args;
+      quant_args_ = it->second.quant_args;
+    } else {
+      if (!load_model_args(model_weights_path)) {
+        LOG(ERROR) << "Failed to load model args from " << model_weights_path;
+        return false;
+      }
+
+      if (!load_quant_args(model_weights_path)) {
+        LOG(ERROR) << "Failed to load quant args from " << model_weights_path;
+        return false;
+      }
+      cache.emplace(model_weights_path, BaseArgsCacheEntry{args_, quant_args_});
+    }
   }
 
-  if (!load_quant_args(model_weights_path)) {
-    LOG(ERROR) << "Failed to load quant args from " << model_weights_path;
-    return false;
-  }
-
-  if (!load_tokenizer_args(model_weights_path)) {
+  if (include_tokenizer_args && !load_tokenizer_args(model_weights_path)) {
     LOG(ERROR) << "Failed to load tokenizer args from " << model_weights_path;
     return false;
   }
 
-  if (!load_image_preprocessor_args(model_weights_path)) {
+  if (include_tokenizer_args &&
+      !load_image_preprocessor_args(model_weights_path)) {
     LOG(ERROR) << "Failed to load image preprocess args from "
                << model_weights_path;
     return false;
   }
 
-  if (!load_video_preprocessor_args(model_weights_path)) {
+  if (include_tokenizer_args &&
+      !load_video_preprocessor_args(model_weights_path)) {
     LOG(ERROR) << "Failed to load video preprocess args from "
                << model_weights_path;
     return false;

@@ -21,9 +21,11 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <thread>
 #include <utility>
 
 #include "common/global_flags.h"
@@ -47,28 +49,38 @@ RemoteWorker::RemoteWorker(int32_t global_rank,
 }
 
 bool RemoteWorker::wait_for_server_ready(const std::string& server_address) {
-  // Retry until server initialize ready
+  // Preserve the old total wait budget while avoiding a fixed 3-second gap
+  // when the worker service is almost ready.
+  const int max_reconnect_count = std::max(1, FLAGS_max_reconnect_count);
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(3 * max_reconnect_count);
+  const auto max_sleep = std::chrono::milliseconds(500);
+  auto sleep_time = std::chrono::milliseconds(100);
   int try_count = 0;
-  const int sleep_time_second = 3;
-  while (try_count < FLAGS_max_reconnect_count) {
+
+  while (std::chrono::steady_clock::now() < deadline) {
     if (channel_->hello()) {
       LOG(INFO) << "RemoteWorker Hello connected, server_address: "
                 << server_address << ", global_rank_: " << global_rank_;
-      break;
-    } else {
-      std::this_thread::sleep_for(std::chrono::seconds(sleep_time_second));
+      return true;
     }
 
     try_count++;
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      break;
+    }
+
+    auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+    std::this_thread::sleep_for(std::min(sleep_time, remaining));
+    sleep_time = std::min(sleep_time * 2, max_sleep);
   }
 
-  if (try_count >= FLAGS_max_reconnect_count) {
-    LOG(ERROR) << "RemoteWorker Hello method failed, global_rank_ is "
-               << global_rank_;
-    return false;
-  }
-
-  return true;
+  LOG(ERROR) << "RemoteWorker Hello method failed, global_rank_ is "
+             << global_rank_ << ", attempts=" << try_count
+             << ", max_wait_seconds=" << 3 * max_reconnect_count;
+  return false;
 }
 
 bool RemoteWorker::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {

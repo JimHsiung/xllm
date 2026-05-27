@@ -181,9 +181,58 @@ bool LLMEngine::init(MasterStatus master_status) {
 
 bool LLMEngine::init_model(MasterStatus master_status) {
   const std::string& model_path = options_.model_path();
-  auto model_loader = ModelLoader::create(model_path);
   LOG(INFO) << "Initializing model from: " << model_path;
 
+  // get weight transfer source and plan
+  WeightTransferPlanResult weight_transfer_plan_result;
+  bool has_valid_weight_transfer_source = false;
+  auto prepare_weight_transfer_plan = [&]() {
+    if (options_.weight_load_mode() != "disk" &&
+        options_.enable_service_routing()) {
+      CHECK(XServiceClient::get_instance()->initialize_done());
+      has_valid_weight_transfer_source =
+          XServiceClient::get_instance()->get_weight_transfer_plan(
+              options_.nnodes(),
+              options_.dp_size(),
+              options_.ep_size(),
+              &weight_transfer_plan_result);
+      if (!has_valid_weight_transfer_source) {
+        weight_transfer_plan_result.weight_transfer_addrs.clear();
+      }
+    }
+  };
+
+  std::vector<folly::SemiFuture<bool>> futures;
+  futures.reserve(worker_clients_num_);
+  auto launch_worker_init = [&]() {
+    bool use_remote_addr =
+        has_valid_weight_transfer_source &&
+        weight_transfer_plan_result.weight_transfer_addrs.size() ==
+            worker_clients_num_;
+    for (size_t i = 0; i < worker_clients_.size(); ++i) {
+      InitModelParams params;
+      params.model_weights_path = model_path;
+      params.random_seed = FLAGS_random_seed;
+      params.master_status = master_status;
+      if (use_remote_addr) {
+        params.remote_addr =
+            weight_transfer_plan_result.weight_transfer_addrs[i];
+        if (i < weight_transfer_plan_result.expert_transfer_plan.rank_plans
+                    .size()) {
+          params.rank_expert_transfer_plan =
+              weight_transfer_plan_result.expert_transfer_plan.rank_plans[i];
+        }
+      }
+      futures.push_back(worker_clients_[i]->init_model_async(params));
+    }
+  };
+
+  if (!FLAGS_enable_xtensor) {
+    prepare_weight_transfer_plan();
+    launch_worker_init();
+  }
+
+  auto model_loader = ModelLoader::create(model_path);
   tokenizer_ = model_loader->tokenizer();
   CHECK(tokenizer_ != nullptr);
 
@@ -305,46 +354,11 @@ bool LLMEngine::init_model(MasterStatus master_status) {
     }
   }
 
-  // get weight transfer source and plan
-  WeightTransferPlanResult weight_transfer_plan_result;
-  bool has_valid_weight_transfer_source = false;
-  if (options_.weight_load_mode() != "disk" &&
-      options_.enable_service_routing()) {
-    CHECK(XServiceClient::get_instance()->initialize_done());
-    has_valid_weight_transfer_source =
-        XServiceClient::get_instance()->get_weight_transfer_plan(
-            options_.nnodes(),
-            options_.dp_size(),
-            options_.ep_size(),
-            &weight_transfer_plan_result);
-    if (!has_valid_weight_transfer_source) {
-      weight_transfer_plan_result.weight_transfer_addrs.clear();
-    }
+  if (FLAGS_enable_xtensor) {
+    prepare_weight_transfer_plan();
+    launch_worker_init();
   }
 
-  // init model for each worker in parallel
-  // multiple workers, call async init
-  std::vector<folly::SemiFuture<bool>> futures;
-  futures.reserve(worker_clients_num_);
-  bool use_remote_addr =
-      has_valid_weight_transfer_source &&
-      weight_transfer_plan_result.weight_transfer_addrs.size() ==
-          worker_clients_num_;
-  for (size_t i = 0; i < worker_clients_.size(); ++i) {
-    InitModelParams params;
-    params.model_weights_path = model_path;
-    params.random_seed = FLAGS_random_seed;
-    params.master_status = master_status;
-    if (use_remote_addr) {
-      params.remote_addr = weight_transfer_plan_result.weight_transfer_addrs[i];
-      if (i <
-          weight_transfer_plan_result.expert_transfer_plan.rank_plans.size()) {
-        params.rank_expert_transfer_plan =
-            weight_transfer_plan_result.expert_transfer_plan.rank_plans[i];
-      }
-    }
-    futures.push_back(worker_clients_[i]->init_model_async(params));
-  }
   // wait for all futures to complete
   auto results = folly::collectAll(futures).get();
   for (const auto& result : results) {

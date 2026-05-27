@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <future>
+
 #include "comm_channel.h"
 #include "common/health_check_manager.h"
 #include "distributed_runtime/collective_service.h"
@@ -292,8 +294,8 @@ void DistManager::setup_multi_node_workers(
 
     auto worker_addrs_map = collective_service->wait();
 
-    // check if all workers connected
-    // and then create worker clients
+    // check if all workers connected and create channels.
+    std::vector<std::unique_ptr<CommChannel>> channels(world_size);
     for (size_t r = 0; r < world_size; ++r) {
       if (worker_addrs_map.find(r) == worker_addrs_map.end()) {
         LOG(FATAL) << "Not all worker connect to engine server. Miss rank is "
@@ -301,13 +303,32 @@ void DistManager::setup_multi_node_workers(
         return;
       }
       /* TODO(CP): support smem  + CP */
-      auto channel =
+      channels[r] =
           create_channel(worker_addrs_map[r], r, dp_local_tp_size, options);
-      worker_clients_.emplace_back(
-          std::make_unique<RemoteWorker>(r,
-                                         worker_addrs_map[r],
-                                         devices[r % each_node_ranks],
-                                         std::move(channel)));
+    }
+
+    // Hello readiness can block while worker services finish initialization.
+    // Start all waits concurrently, then preserve rank order in
+    // worker_clients_.
+    std::vector<std::future<std::shared_ptr<WorkerClient>>>
+        remote_worker_futures;
+    remote_worker_futures.reserve(world_size);
+    for (size_t r = 0; r < world_size; ++r) {
+      remote_worker_futures.emplace_back(std::async(
+          std::launch::async,
+          [r,
+           worker_addr = worker_addrs_map[r],
+           device = devices[r % each_node_ranks],
+           channel = std::move(
+               channels[r])]() mutable -> std::shared_ptr<WorkerClient> {
+            return std::make_shared<RemoteWorker>(
+                r, worker_addr, device, std::move(channel));
+          }));
+    }
+
+    worker_clients_.reserve(world_size);
+    for (auto& future : remote_worker_futures) {
+      worker_clients_.emplace_back(future.get());
     }
 
     // Register health check for each worker and start background health check

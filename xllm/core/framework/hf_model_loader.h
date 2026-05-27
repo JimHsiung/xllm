@@ -31,7 +31,8 @@ bool load_quant_cfg(const JsonReader& reader, QuantArgs& quant_args);
 
 class HFModelLoader : public ModelLoader {
  public:
-  HFModelLoader(const std::string& model_weights_path);
+  explicit HFModelLoader(const std::string& model_weights_path,
+                         bool include_tokenizer_args = true);
 
   std::unique_ptr<Tokenizer> tokenizer() const override;
 
@@ -44,7 +45,8 @@ class HFModelLoader : public ModelLoader {
   int64_t get_max_decoder_layer_weight_size() const override;
 
  private:
-  bool load_args(const std::string& model_weights_path);
+  bool load_args(const std::string& model_weights_path,
+                 bool include_tokenizer_args);
   bool load_rec_vocab(const std::string& model_weights_path);
   bool load_model_args(const std::string& model_weights_path);
   bool load_quant_args(const std::string& model_weights_path);

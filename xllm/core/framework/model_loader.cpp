@@ -30,7 +30,8 @@ limitations under the License.
 namespace xllm {
 
 std::unique_ptr<ModelLoader> ModelLoader::create(
-    const std::string& model_weights_path) {
+    const std::string& model_weights_path,
+    bool load_tokenizer_args) {
   ModelType model_type;
   for (const auto& entry :
        std::filesystem::directory_iterator(model_weights_path)) {
@@ -42,7 +43,8 @@ std::unique_ptr<ModelLoader> ModelLoader::create(
   }
 
   if (model_type == ModelType::HF_MODEL_TYPE) {
-    return std::make_unique<HFModelLoader>(model_weights_path);
+    return std::make_unique<HFModelLoader>(model_weights_path,
+                                           load_tokenizer_args);
   } else {
     LOG(FATAL) << "Only support HF model type currently.";
   }
