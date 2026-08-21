@@ -1,0 +1,1685 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="xLLM PreparedTaskPipeline 生产者—消费者执行链路重构方案">
+  <title>xLLM PreparedTaskPipeline 执行链路重构方案</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f3f6fb;
+      --surface: #ffffff;
+      --surface-soft: #f8fafc;
+      --ink: #172033;
+      --muted: #5f6c80;
+      --line: #dbe3ee;
+      --primary: #1958c7;
+      --primary-dark: #103b89;
+      --primary-soft: #eaf1ff;
+      --teal: #087f73;
+      --teal-soft: #e7f7f4;
+      --success: #137a54;
+      --success-soft: #e8f7f0;
+      --warn: #a35b00;
+      --warn-soft: #fff3df;
+      --danger: #a3333d;
+      --danger-soft: #fff0f1;
+      --purple: #6842b8;
+      --purple-soft: #f1edff;
+      --code: #101827;
+      --code-ink: #dce7f8;
+      --shadow: 0 12px 32px rgba(24, 45, 78, 0.08);
+      --radius: 14px;
+      --content: 1120px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html {
+      scroll-behavior: smooth;
+      scroll-padding-top: 20px;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top right, rgba(25, 88, 199, 0.13), transparent 34rem),
+        radial-gradient(circle at 0 38rem, rgba(8, 127, 115, 0.08), transparent 28rem),
+        var(--bg);
+      font-family:
+        Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+        sans-serif;
+      line-height: 1.72;
+    }
+
+    a {
+      color: var(--primary);
+      text-decoration: none;
+    }
+
+    a:hover { text-decoration: underline; }
+
+    code,
+    pre {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    }
+
+    code {
+      padding: 0.12rem 0.34rem;
+      border-radius: 5px;
+      background: #edf2f8;
+      color: #18345f;
+      font-size: 0.92em;
+    }
+
+    pre {
+      overflow-x: auto;
+      margin: 1rem 0;
+      padding: 1rem 1.15rem;
+      border-radius: 10px;
+      background: var(--code);
+      color: var(--code-ink);
+      font-size: 0.89rem;
+      line-height: 1.58;
+      tab-size: 2;
+    }
+
+    pre code {
+      padding: 0;
+      color: inherit;
+      background: transparent;
+      font-size: inherit;
+    }
+
+    .hero {
+      border-bottom: 1px solid rgba(219, 227, 238, 0.9);
+      background: linear-gradient(135deg, #0b214b 0%, #173f84 52%, #1958c7 100%);
+      color: #fff;
+    }
+
+    .hero-inner {
+      width: min(calc(100% - 40px), var(--content));
+      margin: 0 auto;
+      padding: 58px 0 50px;
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      color: #bcd2ff;
+      font-size: 0.82rem;
+      font-weight: 750;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      max-width: 970px;
+      margin: 0;
+      font-size: clamp(2rem, 4.6vw, 3.35rem);
+      line-height: 1.17;
+      letter-spacing: -0.035em;
+    }
+
+    .subtitle {
+      max-width: 930px;
+      margin: 18px 0 0;
+      color: #dce7ff;
+      font-size: 1.08rem;
+    }
+
+    .meta-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 26px;
+    }
+
+    .meta-pill {
+      padding: 6px 11px;
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.09);
+      color: #f4f7ff;
+      font-size: 0.85rem;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 255px minmax(0, 1fr);
+      gap: 28px;
+      width: min(calc(100% - 40px), 1390px);
+      margin: 32px auto 70px;
+      align-items: start;
+    }
+
+    .toc {
+      position: sticky;
+      top: 18px;
+      max-height: calc(100vh - 36px);
+      overflow-y: auto;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, 0.94);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+
+    .toc-title {
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: 0.77rem;
+      font-weight: 800;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .toc ol {
+      margin: 0;
+      padding-left: 1.25rem;
+    }
+
+    .toc li {
+      margin: 0.28rem 0;
+      color: #8a95a6;
+      font-size: 0.86rem;
+      line-height: 1.36;
+    }
+
+    .toc a { color: #34445e; }
+    .toc a.active { color: var(--primary); font-weight: 750; }
+
+    main { min-width: 0; }
+
+    section {
+      margin-bottom: 24px;
+      padding: 30px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    h2 {
+      margin: 0 0 18px;
+      font-size: 1.65rem;
+      line-height: 1.3;
+      letter-spacing: -0.02em;
+    }
+
+    h3 {
+      margin: 1.8rem 0 0.7rem;
+      font-size: 1.18rem;
+      line-height: 1.35;
+    }
+
+    h4 {
+      margin: 1.35rem 0 0.5rem;
+      font-size: 1rem;
+    }
+
+    p { margin: 0.72rem 0; }
+    ul, ol { padding-left: 1.35rem; }
+    li { margin: 0.38rem 0; }
+    .lead { color: #34445e; font-size: 1.05rem; }
+
+    .callout {
+      margin: 1rem 0;
+      padding: 13px 16px;
+      border-left: 4px solid var(--primary);
+      border-radius: 8px;
+      background: var(--primary-soft);
+    }
+
+    .callout.success { border-left-color: var(--success); background: var(--success-soft); }
+    .callout.warn { border-left-color: var(--warn); background: var(--warn-soft); }
+    .callout.danger { border-left-color: var(--danger); background: var(--danger-soft); }
+    .callout.teal { border-left-color: var(--teal); background: var(--teal-soft); }
+
+    .callout strong { display: inline-block; margin-right: 0.2rem; }
+
+    .grid-2,
+    .grid-3,
+    .grid-4 {
+      display: grid;
+      gap: 14px;
+      margin: 1rem 0;
+    }
+
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+    .card {
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: var(--surface-soft);
+    }
+
+    .card h3,
+    .card h4 { margin-top: 0; }
+    .card p:last-child,
+    .card ul:last-child { margin-bottom: 0; }
+
+    .tag {
+      display: inline-block;
+      margin: 0 5px 5px 0;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: var(--primary-soft);
+      color: var(--primary-dark);
+      font-size: 0.78rem;
+      font-weight: 700;
+    }
+
+    .tag.green { color: #0d6847; background: var(--success-soft); }
+    .tag.orange { color: #8c4d00; background: var(--warn-soft); }
+    .tag.red { color: #8b2732; background: var(--danger-soft); }
+    .tag.purple { color: #56369a; background: var(--purple-soft); }
+
+    .table-wrap {
+      overflow-x: auto;
+      margin: 1rem 0;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+      font-size: 0.92rem;
+    }
+
+    th,
+    td {
+      padding: 11px 13px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #f1f5fa;
+      color: #34445e;
+      font-weight: 750;
+      white-space: nowrap;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+
+    .diagram {
+      overflow-x: auto;
+      margin: 1rem 0;
+      padding: 20px;
+      border: 1px solid #cfdbeb;
+      border-radius: 12px;
+      background: linear-gradient(180deg, #f9fbff 0%, #f5f8fc 100%);
+    }
+
+    .flow-row {
+      display: flex;
+      align-items: stretch;
+      gap: 8px;
+      min-width: 760px;
+    }
+
+    .flow-node {
+      flex: 1 1 0;
+      min-width: 120px;
+      padding: 12px 11px;
+      border: 1px solid #b8c8df;
+      border-radius: 10px;
+      background: #fff;
+      text-align: center;
+      box-shadow: 0 5px 14px rgba(33, 65, 110, 0.06);
+    }
+
+    .flow-node strong { display: block; color: #173e78; }
+    .flow-node small { display: block; margin-top: 4px; color: var(--muted); line-height: 1.35; }
+    .flow-node.worker { border-color: #8ccfc7; background: #f1fbf9; }
+    .flow-node.launch { border-color: #b3a0dc; background: #f8f5ff; }
+    .flow-node.device { border-color: #8fb0e6; background: #f3f7ff; }
+
+    .arrow {
+      display: grid;
+      flex: 0 0 24px;
+      place-items: center;
+      color: #7c8da8;
+      font-size: 1.25rem;
+      font-weight: 800;
+    }
+
+    .state-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      margin: 1rem 0;
+      padding: 16px;
+      border-radius: 11px;
+      background: #f6f9fd;
+      border: 1px solid var(--line);
+    }
+
+    .state {
+      padding: 7px 11px;
+      border-radius: 8px;
+      border: 1px solid #b9c9df;
+      background: #fff;
+      color: #21406d;
+      font-size: 0.86rem;
+      font-weight: 760;
+    }
+
+    .state-arrow { color: #8291a8; font-weight: 800; }
+
+    .timeline {
+      display: grid;
+      grid-template-columns: 145px minmax(0, 1fr);
+      gap: 0;
+      margin: 1rem 0;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+    }
+
+    .timeline-label,
+    .timeline-track {
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .timeline-label {
+      background: #f1f5fa;
+      color: #34445e;
+      font-weight: 750;
+    }
+
+    .timeline-track { background: #fff; }
+    .timeline > :nth-last-child(-n + 2) { border-bottom: 0; }
+
+    .bar {
+      display: inline-block;
+      margin: 2px 5px 2px 0;
+      padding: 4px 9px;
+      border-radius: 6px;
+      background: var(--primary-soft);
+      color: var(--primary-dark);
+      font-size: 0.83rem;
+      font-weight: 700;
+    }
+
+    .bar.cpu { background: var(--teal-soft); color: #08695f; }
+    .bar.device { background: var(--purple-soft); color: #553594; }
+    .bar.result { background: var(--warn-soft); color: #865000; }
+
+    .decision {
+      display: grid;
+      grid-template-columns: 145px minmax(0, 1fr);
+      gap: 12px;
+      padding: 13px 0;
+      border-bottom: 1px dashed var(--line);
+    }
+
+    .decision:last-child { border-bottom: 0; }
+    .decision-key { color: var(--muted); font-size: 0.88rem; font-weight: 750; }
+    .decision-value { min-width: 0; }
+
+    .checklist {
+      list-style: none;
+      padding-left: 0;
+    }
+
+    .checklist li {
+      position: relative;
+      padding-left: 1.65rem;
+    }
+
+    .checklist li::before {
+      position: absolute;
+      left: 0;
+      top: 0.07rem;
+      content: "✓";
+      color: var(--success);
+      font-weight: 850;
+    }
+
+    .no-list {
+      list-style: none;
+      padding-left: 0;
+    }
+
+    .no-list li {
+      position: relative;
+      padding-left: 1.65rem;
+    }
+
+    .no-list li::before {
+      position: absolute;
+      left: 0;
+      top: 0.07rem;
+      content: "×";
+      color: var(--danger);
+      font-weight: 850;
+    }
+
+    .phase {
+      display: grid;
+      grid-template-columns: 72px minmax(0, 1fr);
+      gap: 14px;
+      margin: 0.8rem 0;
+      padding: 15px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: var(--surface-soft);
+    }
+
+    .phase-id {
+      display: grid;
+      place-items: center;
+      align-self: start;
+      width: 58px;
+      height: 58px;
+      border-radius: 50%;
+      background: var(--primary);
+      color: #fff;
+      font-weight: 800;
+    }
+
+    .phase h3 { margin: 0 0 5px; }
+    .phase p { margin: 0.35rem 0; }
+
+    details {
+      margin: 0.85rem 0;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: #fff;
+    }
+
+    summary {
+      cursor: pointer;
+      padding: 11px 14px;
+      color: #24446f;
+      font-weight: 760;
+    }
+
+    details > div { padding: 0 14px 13px; }
+
+    .footnote {
+      color: var(--muted);
+      font-size: 0.86rem;
+    }
+
+    footer {
+      width: min(calc(100% - 40px), var(--content));
+      margin: -38px auto 45px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 0.86rem;
+    }
+
+    @media (max-width: 1080px) {
+      .layout { grid-template-columns: 1fr; }
+      .toc { position: static; max-height: none; }
+      .toc ol { columns: 2; }
+      .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 720px) {
+      .hero-inner { padding: 40px 0 36px; }
+      .layout { width: min(calc(100% - 24px), 1390px); margin-top: 18px; }
+      section { padding: 21px 18px; }
+      .toc ol { columns: 1; }
+      .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
+      .decision { grid-template-columns: 1fr; gap: 2px; }
+      .timeline { grid-template-columns: 105px minmax(0, 1fr); }
+      .phase { grid-template-columns: 54px minmax(0, 1fr); }
+      .phase-id { width: 46px; height: 46px; }
+    }
+
+    @media print {
+      body { background: #fff; }
+      .hero { background: #173f84 !important; print-color-adjust: exact; }
+      .layout { display: block; width: 100%; margin: 0; }
+      .toc { display: none; }
+      section { break-inside: avoid; box-shadow: none; }
+      footer { margin-top: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <div class="hero-inner">
+      <p class="eyebrow">xLLM Execution Architecture</p>
+      <h1>PreparedTaskPipeline：面向异步调度的生产者—消费者执行链路重构方案</h1>
+      <p class="subtitle">
+        将一次完整 Prefill/Decode 视为 Task，由 Worker 侧提前完成 CPU 输入准备与 H2D，
+        Launch 侧只提交 Device 算子，从结构上移除 Task 间必须串行执行的 CPU 工作。
+      </p>
+      <div class="meta-row">
+        <span class="meta-pill">状态：共识设计基线</span>
+        <span class="meta-pill">代码基线：main @ 3906f5a914fb</span>
+        <span class="meta-pill">首版后端：NPU</span>
+        <span class="meta-pill">文档日期：2026-08-21</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="toc" aria-label="目录">
+      <p class="toc-title">目录</p>
+      <ol>
+        <li><a href="#summary">执行摘要</a></li>
+        <li><a href="#background">背景与问题</a></li>
+        <li><a href="#goals">目标与非目标</a></li>
+        <li><a href="#decisions">关键设计决策</a></li>
+        <li><a href="#architecture">总体架构</a></li>
+        <li><a href="#slot">ExecutionSlot</a></li>
+        <li><a href="#timeline">单次异步时序</a></li>
+        <li><a href="#input">输入准备与所有权</a></li>
+        <li><a href="#adapter">Adapter 与 Executor</a></li>
+        <li><a href="#graph">Graph 适配</a></li>
+        <li><a href="#paths">LLM / MTP 路径</a></li>
+        <li><a href="#algorithms">其他投机算法</a></li>
+        <li><a href="#state">跨 Task Device 状态</a></li>
+        <li><a href="#memory">显存与 Buffer</a></li>
+        <li><a href="#output">输出与 Consume</a></li>
+        <li><a href="#lifecycle">生命周期与错误</a></li>
+        <li><a href="#compatibility">支持范围</a></li>
+        <li><a href="#files">代码组织</a></li>
+        <li><a href="#phases">分阶段实施</a></li>
+        <li><a href="#validation">验证与验收</a></li>
+        <li><a href="#risks">风险与缓解</a></li>
+        <li><a href="#future">后续大 Graph</a></li>
+      </ol>
+    </nav>
+
+    <main>
+      <section id="summary">
+        <h2>1. 执行摘要</h2>
+        <p class="lead">
+          本方案不改变 Scheduler 的一次异步前推语义，也不重写 xLLM 的模型、KV Cache、Sampler
+          和分布式分层；它只重构 Worker 到 Executor 之间的数据链路。
+        </p>
+
+        <div class="diagram" aria-label="总体数据流">
+          <div class="flow-row">
+            <div class="flow-node">
+              <strong>Scheduler / RPC</strong>
+              <small>产生 ForwardInput，异步模式仍延迟一拍处理请求增删</small>
+            </div>
+            <div class="arrow">→</div>
+            <div class="flow-node worker">
+              <strong>Worker 单线程</strong>
+              <small>Prepare、CPU metadata、H2D、Consume</small>
+            </div>
+            <div class="arrow">→</div>
+            <div class="flow-node launch">
+              <strong>Launch 线程</strong>
+              <small>只做 Event、Graph/Eager/Collective launch</small>
+            </div>
+            <div class="arrow">→</div>
+            <div class="flow-node device">
+              <strong>Device</strong>
+              <small>完整 Prefill/Decode Task 串行执行</small>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid-4">
+          <div class="card">
+            <span class="tag green">核心目标</span>
+            <h3>移除 CPU 临界依赖</h3>
+            <p>Task N 执行期间准备 Task N+1，避免在两个 Device Task 之间构造输入。</p>
+          </div>
+          <div class="card">
+            <span class="tag">异步模式</span>
+            <h3>双 Slot</h3>
+            <p>同步模式 1 Slot，异步模式 2 Slot，严格保持当前只提前一个 Task。</p>
+          </div>
+          <div class="card">
+            <span class="tag purple">执行约束</span>
+            <h3>Launch-only</h3>
+            <p>Executor 热路径不读取 CPU 数据、不动态构造 metadata、不分配输入输出 Buffer。</p>
+          </div>
+          <div class="card">
+            <span class="tag orange">兼容策略</span>
+            <h3>启动时二选一</h3>
+            <p>Legacy 与 Prepared 新链路不热切换；Graph miss 仅回退 Prepared Eager。</p>
+          </div>
+        </div>
+
+        <div class="callout success">
+          <strong>结论：</strong>
+          方案在架构上可行。它能消除 Task 间强制串行的 CPU 输入准备；最终是否出现空泡，取决于
+          Prepare + H2D 是否能在前一 Task 的 Device 执行窗口内完成。
+        </div>
+      </section>
+
+      <section id="background">
+        <h2>2. 背景与当前问题</h2>
+
+        <h3>2.1 当前异步调度已经具备“一步前推”</h3>
+        <p>
+          当前调度在开启 schedule overlap 后，会先提交当前 Batch，再获取上一 Batch 的真实结果。
+          Scheduler 使用 fake token 暂时推进状态，请求结束或取消最多额外执行一次 Task。这与目标中的
+          双 Slot 生产者—消费者模型在底层原理上是一致的。
+        </p>
+
+        <pre><code>Scheduler iteration N:
+  1. schedule_request()            → 构造 Task N
+  2. engine.step(Task N)           → 提交 Task N，立即得到 fake output
+  3. update_last_step_result(N-1)  → 获取并处理 Task N-1 的真实输出</code></pre>
+
+        <h3>2.2 Worker 仍承担 Task 内与 Task 间的动态输入构造</h3>
+        <p>当前路径中，输入转 Device、投机验证输入构造、前一输出修正、部分 Graph 输入更新等工作分散在 Worker 和 Executor 调用前后。</p>
+        <ul>
+          <li><code>WorkerImpl::step_async()</code> 在工作线程执行模型调用和 overlap 修正。</li>
+          <li><code>ForwardInput::to(device)</code> 可能动态创建和转换多组 Tensor。</li>
+          <li>MTP/DFlash 等路径会在 Draft 与 Target 之间继续构造验证输入。</li>
+          <li>部分投机路径存在 Stream synchronize、D2H 读取和基于 Host 结果的后续输入构造。</li>
+        </ul>
+
+        <h3>2.3 空泡来源需要拆分</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>空泡类型</th><th>表现</th><th>本方案能否解决</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Task 间 CPU 输入准备</td>
+                <td>前一 Task 结束后才开始 H2D、metadata 或 Graph 输入绑定</td>
+                <td><span class="tag green">核心解决目标</span></td>
+              </tr>
+              <tr>
+                <td>生产者跟不上</td>
+                <td>Prepare + H2D 时间长于前一 Task 的 Device 时间</td>
+                <td><span class="tag orange">只能观测和继续优化</span></td>
+              </tr>
+              <tr>
+                <td>Eager 逐算子 dispatcher</td>
+                <td>模型内部每个算子仍需要 Host launch</td>
+                <td><span class="tag orange">不由第一阶段消除</span></td>
+              </tr>
+              <tr>
+                <td>Backend / Collective 等待</td>
+                <td>通信或 Stream 依赖造成 Device 等待</td>
+                <td><span class="tag">保留正确依赖，单独定位</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="goals">
+        <h2>3. 目标与非目标</h2>
+
+        <div class="grid-2">
+          <div class="card">
+            <h3>首版必须实现</h3>
+            <ul class="checklist">
+              <li>一次完整 Prefill/Decode 作为一个 Task。</li>
+              <li>Worker 提前准备最终 Device 输入并提交 H2D。</li>
+              <li>Launch 线程只做 Device 命令提交。</li>
+              <li>同步 1 Slot、异步 2 Slot。</li>
+              <li>Graph 与 Prepared Eager 使用同一组固定输入地址。</li>
+              <li>新旧链路启动阶段二选一。</li>
+              <li>固定随机种子下与旧链路确定性对齐。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>首版明确不做</h3>
+            <ul class="no-list">
+              <li>不改变 Scheduler 的 ahead depth。</li>
+              <li>不做服务期新旧链路热切换。</li>
+              <li>不做通用 Patch DAG。</li>
+              <li>不把完整 MTP 捕获成单个大 Graph。</li>
+              <li>不同时改造所有 Device backend。</li>
+              <li>不引入 Task 重试或 Pipeline 失败恢复协议。</li>
+              <li>不承诺所有负载绝对零空泡。</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section id="decisions">
+        <h2>4. 关键设计决策</h2>
+
+        <div class="decision">
+          <div class="decision-key">Task 粒度</div>
+          <div class="decision-value">一次完整 Prefill/Decode；MTP Decode 包含 Draft × N、Target Validate、Rejection 和状态发布。</div>
+        </div>
+        <div class="decision">
+          <div class="decision-key">并发深度</div>
+          <div class="decision-value">同步 1 Slot，异步 2 Slot；与当前只提前一步的 Scheduler 语义一致。</div>
+        </div>
+        <div class="decision">
+          <div class="decision-key">线程模型</div>
+          <div class="decision-value">复用现有 WorkerImpl 单线程作为 Prepare/Consume 状态所有者；新增唯一 Launch 线程。</div>
+        </div>
+        <div class="decision">
+          <div class="decision-key">输入传递</div>
+          <div class="decision-value">保留 <code>const ForwardInput&amp;</code>，Prepare Ack 前短期借用，不复制完整 ForwardInput。</div>
+        </div>
+        <div class="decision">
+          <div class="decision-key">输出语义</div>
+          <div class="decision-value">同步 Future 返回真实输出；异步 Future 只表示提交成功，真实输出由 <code>get_last_step_result()</code> 唯一消费。</div>
+        </div>
+        <div class="decision">
+          <div class="decision-key">Graph 策略</div>
+          <div class="decision-value">Graph replay miss 可回退 Prepared Eager；不允许运行时回退 Legacy Worker 链路。</div>
+        </div>
+        <div class="decision">
+          <div class="decision-key">错误语义</div>
+          <div class="decision-value">首版保持当前 fail-fast，不同时引入 Task 级恢复、重试和跨 Rank 错误协议。</div>
+        </div>
+        <div class="decision">
+          <div class="decision-key">首版范围</div>
+          <div class="decision-value">NPU；普通 LLM、MTP、Eagle3。DFlash/DSpark 作为同架构后续阶段，Suffix 保持 Legacy。</div>
+        </div>
+      </section>
+
+      <section id="architecture">
+        <h2>5. 总体架构与分层</h2>
+
+        <pre><code>Worker                              （外部接口与启动期分流）
+├── WorkerImpl* impl_               （现有模型/KV/Sampler/Legacy step_async）
+└── PreparedTaskPipeline            （新增组合组件）
+    ├── PreparedTaskAdapter         （LLM/MTP/Eagle3 固定 Task 函数）
+    ├── ExecutionSlot[1 or 2]
+    ├── ready_queue                 （Worker → Launch，SPSC）
+    ├── completed_queue             （Launch → Worker，SPSC）
+    ├── output_fifo                 （Consume 后的有序 Host 输出）
+    └── Launch thread
+
+PreparedTaskAdapter
+└── PreparedExecutor               （NPU 首版能力接口）
+    ├── PreparedInputArena[slot_count]
+    ├── Graph binding
+    └── Prepared Eager binding</code></pre>
+
+        <h3>5.1 Worker 作为组合拥有者</h3>
+        <p>
+          <code>PreparedTaskPipeline</code> 放在外层 Worker，而不是塞进 <code>WorkerImpl</code> 基类，
+          也不分别复制到 LLM/MTP 子类。这样 Legacy 的 <code>WorkerImpl::step_async()</code> 可以保持原样。
+        </p>
+
+        <pre><code>Worker::step_async(input) {
+  if (prepared_pipeline_ != nullptr) {
+    return prepared_pipeline_->submit(input);
+  }
+  return impl_->step_async(input);  // Legacy 原路径
+}</code></pre>
+
+        <h3>5.2 单状态所有者</h3>
+        <p>
+          Slot 状态、Prepare 和 Consume 只由 WorkerImpl 单线程修改。RPC、SHM polling、Launch 线程都不能直接重排或回收 Slot。
+          Launch 线程只进行 <code>READY → RUNNING → COMPLETED</code> 所需的 Device 提交，并通过 CompletionTicket 返回结果。
+        </p>
+      </section>
+
+      <section id="slot">
+        <h2>6. ExecutionSlot 与队列</h2>
+
+        <div class="state-row" aria-label="ExecutionSlot 状态机">
+          <span class="state">FREE</span><span class="state-arrow">→</span>
+          <span class="state">PREPARING</span><span class="state-arrow">→</span>
+          <span class="state">READY</span><span class="state-arrow">→</span>
+          <span class="state">RUNNING</span><span class="state-arrow">→</span>
+          <span class="state">COMPLETED</span><span class="state-arrow">→</span>
+          <span class="state">CONSUMING</span><span class="state-arrow">→</span>
+          <span class="state">FREE</span>
+        </div>
+
+        <div class="callout">
+          <strong>READY 的准确含义：</strong>
+          Host 已完成所有运行所需的描述符构造，H2D 已提交，输入不可再由 Host 修改；但 H2D 可以仍在进行，
+          Launch 通过 Event 在 Device Stream 上建立依赖。
+        </div>
+
+        <h3>6.1 Slot 主要内容</h3>
+        <div class="grid-2">
+          <div class="card">
+            <h4>Pipeline 通用字段</h4>
+            <ul>
+              <li><code>slot_id</code> 与 Debug-only <code>task_seq_no</code></li>
+              <li><code>TaskKind</code></li>
+              <li><code>h2d_ready_event</code></li>
+              <li><code>task_output_event</code></li>
+              <li><code>host_output_ready_event</code></li>
+              <li><code>reuse_fence</code></li>
+              <li>最小 Host source lease</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Adapter / Executor 字段</h4>
+            <ul>
+              <li>PreparedInputArena lease</li>
+              <li>固定 Invocation binding</li>
+              <li>算法专属 DeviceStepState</li>
+              <li><code>predecessor_row</code> Device 映射</li>
+              <li>最小 D2H 输出 Buffer</li>
+            </ul>
+          </div>
+        </div>
+
+        <h3>6.2 有界 SPSC</h3>
+        <ul>
+          <li><code>ready_queue</code>：唯一生产者为 Worker 状态线程，唯一消费者为 Launch 线程。</li>
+          <li><code>completed_queue</code>：唯一生产者为 Launch 线程，唯一消费者为 Worker 状态线程。</li>
+          <li>容量与 Slot 数一致；首版不设计超过一步的可配置 ahead depth。</li>
+          <li><code>task_seq_no</code> 仅用于 Debug FIFO 断言，不进入 RPC、ForwardInput 或 Release 热路径。</li>
+        </ul>
+      </section>
+
+      <section id="timeline">
+        <h2>7. 单次异步 Decode 时序</h2>
+
+        <div class="timeline" aria-label="异步时序">
+          <div class="timeline-label">Scheduler</div>
+          <div class="timeline-track">
+            <span class="bar">构造 Task N</span>
+            <span class="bar">等待 Prepare Ack</span>
+            <span class="bar result">GetLast(N-1)</span>
+            <span class="bar">处理真实输出</span>
+          </div>
+
+          <div class="timeline-label">Worker 线程</div>
+          <div class="timeline-track">
+            <span class="bar cpu">Prepare N</span>
+            <span class="bar cpu">H2D enqueue N</span>
+            <span class="bar cpu">READY + Ack</span>
+            <span class="bar result">Consume N-1</span>
+          </div>
+
+          <div class="timeline-label">Launch 线程</div>
+          <div class="timeline-track">
+            <span class="bar device">取 READY N</span>
+            <span class="bar device">提交完整 Task N</span>
+            <span class="bar result">提交 D2H</span>
+          </div>
+
+          <div class="timeline-label">Device</div>
+          <div class="timeline-track">
+            <span class="bar device">Execute N-1</span>
+            <span class="bar device">Execute N</span>
+          </div>
+        </div>
+
+        <h3>7.1 Prepare Ack</h3>
+        <p>Prepare Ack 在以下条件全部满足后返回：</p>
+        <ol>
+          <li>所有 CPU metadata 已构造或复制到 Slot 所有的存储；</li>
+          <li>所有输入 H2D 已提交到 <code>prepare_stream</code>；</li>
+          <li>已记录 <code>h2d_ready_event</code>；</li>
+          <li>异步 DMA 源由 Slot 持有，原始 ForwardInput 不再被访问；</li>
+          <li>Task 已发布为 READY。</li>
+        </ol>
+        <p><strong>Ack 不等待 H2D 完成，也不做 Host synchronize。</strong></p>
+
+        <h3>7.2 Future 语义</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>模式</th><th><code>step_async()</code> Future</th><th>真实输出入口</th></tr></thead>
+            <tbody>
+              <tr><td>同步 / 1 Slot</td><td>Task Consume 后返回真实 ForwardOutput</td><td>Future</td></tr>
+              <tr><td>异步 / 2 Slot</td><td>Prepare Ack 后成功结束，不承载真实输出</td><td><code>get_last_step_result()</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="input">
+        <h2>8. 输入准备、H2D 与所有权</h2>
+
+        <h3>8.1 保持 const 引用接口</h3>
+        <pre><code>step_async(const ForwardInput&amp; input)
+  → enqueue PrepareCommand{&amp;input}
+  → calling thread waits Prepare Ack
+  → Worker never accesses input after Ack</code></pre>
+
+        <p>
+          该设计不深拷贝整个 ForwardInput，也不要求把所有上层接口改成按值或右值传递。
+          Ack 等待替代了原实现中调用方同步执行 <code>prepare_work_before_execute()</code> 的生命周期保证。
+        </p>
+
+        <h3>8.2 Host source lease</h3>
+        <p>Slot 只保留异步 DMA 真正需要的 Host 资源：</p>
+        <ul>
+          <li>Pinned packed input buffer；</li>
+          <li>可能跨 Ack 继续被 DMA 读取的 Tensor storage；</li>
+          <li>来自 SHM、可能被下一 step 覆盖的必要稳定副本。</li>
+        </ul>
+
+        <p>
+          首版允许复用当前稳定化逻辑，但目标是将逐 step <code>clone()</code> 收敛为 Slot 级可复用 Pinned Staging Arena，
+          并用 <code>prepare_cpu_latency</code> 和 Host allocation 指标判断是否需要进一步重构 Scheduler 输出格式。
+        </p>
+
+        <h3>8.3 Stream 与 Event</h3>
+        <div class="grid-3">
+          <div class="card">
+            <h4>prepare_stream</h4>
+            <p>Worker 提交 H2D 和不依赖前驱 Device 输出的输入更新。</p>
+          </div>
+          <div class="card">
+            <h4>task_stream</h4>
+            <p>完整 Task 串行执行。Task 内 Draft、Target、Patch 和通信均按顺序提交。</p>
+          </div>
+          <div class="card">
+            <h4>result_stream</h4>
+            <p>等待 Task 输出 Event 后提交最小 D2H，不阻塞下一 Task 的 task_stream。</p>
+          </div>
+        </div>
+
+        <p>
+          同一 <code>task_stream</code> 内依赖使用 FIFO；只有跨 Stream 才使用 Event。
+          Device Event wait 是 Stream 依赖命令，不是计算 Kernel，也不能退化为 Host synchronize。
+        </p>
+      </section>
+
+      <section id="adapter">
+        <h2>9. Adapter 与 PreparedExecutor</h2>
+
+        <h3>9.1 三阶段 Adapter</h3>
+        <pre><code>class PreparedTaskAdapter {
+ public:
+  virtual TaskKind classify(const ForwardInput&amp;) = 0;
+
+  virtual void prepare(const ForwardInput&amp;,
+                       ExecutionSlot&amp;,
+                       PrepareContext&amp;) = 0;
+
+  virtual void launch(ExecutionSlot&amp;,
+                      LaunchContext&amp;) = 0;
+
+  virtual ForwardOutput consume(ExecutionSlot&amp;) = 0;
+};</code></pre>
+
+        <ul>
+          <li>Pipeline 只管理 Slot、队列、生命周期和 Promise。</li>
+          <li>Adapter 只描述一次完整 Task 的固定逻辑调用。</li>
+          <li>Graph/Eager、ACL 类型、Graph cache 和 Arena 绑定都封装在 Executor 侧。</li>
+        </ul>
+
+        <h3>9.2 独立 PreparedExecutor 能力</h3>
+        <p>不直接扩展所有现有 ExecutorImpl，避免其他 backend 被迫提供空实现。</p>
+
+        <pre><code>class PreparedExecutor {
+ public:
+  virtual PreparedSlotBinding bind_prepared(
+      int32_t slot_id,
+      int32_t invocation_index,
+      const PreparedInvocationDescriptor&amp; descriptor) = 0;
+
+  virtual void launch_prepared(
+      const PreparedSlotBinding&amp; binding,
+      Stream&amp; task_stream) = 0;
+};</code></pre>
+
+        <div class="callout teal">
+          <strong>边界说明：</strong>
+          <code>bind_prepared()</code> 在 Worker Prepare 阶段调用，可以进行 CPU key 计算和绑定；
+          <code>launch_prepared()</code> 才属于 Executor 消费热路径，必须是 launch-only。
+        </div>
+
+        <h3>9.3 Launch 阶段允许与禁止</h3>
+        <div class="grid-2">
+          <div class="card">
+            <h4>允许</h4>
+            <ul class="checklist">
+              <li>固定 <code>switch</code> / <code>for</code></li>
+              <li>Stream Event wait / record</li>
+              <li>Graph replay</li>
+              <li>Prepared Eager 算子提交</li>
+              <li>Collective / broadcast launch</li>
+              <li>框架 dispatcher 必需的 Host 控制</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>禁止</h4>
+            <ul class="no-list">
+              <li><code>.item()</code>、D2H 读取或 Host synchronize</li>
+              <li>依据 Device 数据做 CPU 分支</li>
+              <li>动态构造 metadata 或替换 Tensor 字段</li>
+              <li>运行期分配输入输出 Device Buffer</li>
+              <li>修改 Scheduler、Request 或 BlockManager</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section id="graph">
+        <h2>10. Graph 适配</h2>
+
+        <h3>10.1 统一最终输入 Arena</h3>
+        <pre><code>PreparedExecutor
+└── PreparedInputArena[slot_count]
+    ├── Slot 0: tokens / positions / block tables / sampling / state
+    └── Slot 1: tokens / positions / block tables / sampling / state</code></pre>
+
+        <p>
+          Worker 直接 H2D 到最终 Arena。Graph 和 Prepared Eager 都消费这些地址，不采用
+          “ExecutionSlot Buffer → Graph persistent Buffer”的整份 D2D 路径。
+        </p>
+
+        <p>启动期为字段选择固定布局策略：</p>
+        <ul>
+          <li><code>DIRECT_BIND</code>：Graph/Eager 直接绑定 Arena 字段；</li>
+          <li><code>DEVICE_PATCH</code>：由前驱状态生成或修正少量字段；</li>
+          <li><code>DEVICE_PACK</code>：确有布局变换需求时，由固定 Kernel 写最终地址。</li>
+        </ul>
+
+        <h3>10.2 显式 Slot，而不是隐式轮转</h3>
+        <p>
+          Legacy ACL Graph 继续保持当前 <code>next_replay_slot_</code> 隐式轮转。
+          Prepared 新路径显式传入 <code>slot_id</code>，一次 MTP Task 中 Draft 与 Target 必须使用同一个逻辑 Slot：
+        </p>
+
+        <pre><code>Task(slot=0):
+  draft_graph.bind(slot=0)
+  target_graph.bind(slot=0)
+
+Task(slot=1):
+  draft_graph.bind(slot=1)
+  target_graph.bind(slot=1)</code></pre>
+
+        <h3>10.3 Graph fallback</h3>
+        <ul>
+          <li>Prepare 阶段计算 Graph key、查询启动期已捕获的 Graph 并绑定。</li>
+          <li>Graph miss 只影响单次模型 Invocation，可回退 Prepared Eager。</li>
+          <li>一次 MTP Task 可以出现 <code>Draft Graph × N → Target Eager</code>。</li>
+          <li>服务期间不做 lazy/background capture。</li>
+          <li>不允许运行时从 Prepared Pipeline 回退 Legacy Worker 执行。</li>
+        </ul>
+      </section>
+
+      <section id="paths">
+        <h2>11. LLM 与 MTP 固定执行路径</h2>
+
+        <h3>11.1 顶层 TaskKind</h3>
+        <pre><code>enum class TaskKind {
+  PREFILL_LIKE,  // PREFILL / CHUNKED_PREFILL / MIXED
+  DECODE,
+  EMPTY,
+};</code></pre>
+
+        <p>算法类型由启动时选择的 Adapter 决定，不在 Task 热路径增加 MTP/Eagle3/DFlash 类型判断。</p>
+
+        <h3>11.2 普通 LLM</h3>
+        <pre><code>LLM PREFILL_LIKE / DECODE:
+  wait(h2d_ready_event)
+  → model forward
+  → lm_head / sampling
+  → publish LLMPreparedState
+  → result D2H</code></pre>
+
+        <h3>11.3 MTP Prefill</h3>
+        <pre><code>Target Prefill
+→ Target lm_head / Sampling
+→ Device Patch：token + embedding
+→ Draft Prefill
+→ Draft 状态更新
+→ 发布 MTPPreparedState</code></pre>
+
+        <p>
+          Target 输出不能先 D2H 再由 CPU 构造 Draft Prefill 输入。Target token 和 embedding 必须在 Device 上直接写入 Draft 的最终 InputArena。
+        </p>
+
+        <h3>11.4 MTP Decode</h3>
+        <pre><code>Task continuation patch
+→ Draft step 0
+→ MTP_NEXT_DRAFT patch
+→ Draft step 1
+→ ...
+→ Draft step N-1
+→ MTP_TARGET_VERIFY patch
+→ Target Validate
+→ Rejection Sampling
+→ MTP_PUBLISH_STEP_STATE
+→ 最小结果 D2H</code></pre>
+
+        <p>固定语义入口：</p>
+        <pre><code>TASK_CONTINUATION
+MTP_PREFILL_TO_DRAFT
+MTP_NEXT_DRAFT
+MTP_TARGET_VERIFY
+MTP_PUBLISH_STEP_STATE</code></pre>
+
+        <p>
+          常用路径争取融合为单 Kernel；特殊路径可以是固定小型 Kernel 序列。首版不设计通用 Patch DAG。
+          当前 <code>mtp_async_input_builder.cpp</code> 中运行期的 <code>arange/stack/to/zeros_like</code> 等动态 Device Tensor 操作需要改造成预分配输出与固定 Patch。
+        </p>
+
+        <h3>11.5 EMPTY</h3>
+        <p>
+          EMPTY 仍需参加必要的分布式 collective。输入使用启动期固定 fake input，不在 Launch 阶段临时创建 Tensor。
+        </p>
+      </section>
+
+      <section id="algorithms">
+        <h2>12. 其他投机算法适配</h2>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>算法</th><th>Task 拓扑</th><th>适配判断</th><th>计划</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><strong>Eagle3</strong></td>
+                <td>MTP 拓扑；Target aux hidden 为 3H，并做 draft→target token 映射</td>
+                <td>无架构性障碍，可复用 MTP Adapter 主体</td>
+                <td><span class="tag green">阶段 5</span></td>
+              </tr>
+              <tr>
+                <td><strong>DFlash</strong></td>
+                <td>一次 Block Draft → Target Validate → Context-KV 写入</td>
+                <td>需移除当前 Validate 后 D2H/synchronize，并在 Device 生成 Context-KV 写入索引</td>
+                <td><span class="tag orange">阶段 6</span></td>
+              </tr>
+              <tr>
+                <td><strong>DSpark</strong></td>
+                <td>DFlash + 固定 N 轮 Markov sampling / broadcast</td>
+                <td>固定循环可 launch-only，但需预分配循环 Tensor 和 Sampling descriptor</td>
+                <td><span class="tag orange">阶段 6</span></td>
+              </tr>
+              <tr>
+                <td><strong>Suffix</strong></td>
+                <td>CPU suffix tree 根据上一 Task 的真实接受 token 生成下一组 Draft</td>
+                <td>与完整提前 Prepare 存在根本依赖；除非将 suffix cache/search 迁移 Device</td>
+                <td><span class="tag red">保持 Legacy</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <strong>Suffix 为什么不能直接接入：</strong>
+          Task N+1 的 CPU suffix 查询必须等待 Task N 的真实接受 token，而异步 Pipeline 要在消费 N 之前完成 N+1 Prepare。
+          使用旧历史会改变提案语义，等待 D2H 则重新引入 Device 空泡。
+        </div>
+      </section>
+
+      <section id="state">
+        <h2>13. 跨 Task Device 状态与 KV Block</h2>
+
+        <h3>13.1 predecessor_row</h3>
+        <p>请求在相邻 Task 间可能新增、删除和重排，不能假设 row index 保持不变。</p>
+
+        <pre><code>Task C row 0 ← Task B row 0
+Task C row 1 ← Task B row 2
+Task C row 2 ← -1              // NEW_REQUEST</code></pre>
+
+        <p>
+          映射由 Scheduler/Batch 构造 ForwardInput 时顺手生成，避免 Worker 再做 request_id 字符串哈希扫描。
+          Device Patch gather 继续请求的状态；新请求保留 Worker 已写入的初始值。
+        </p>
+
+        <h3>13.2 Adapter 专属 DeviceStepState</h3>
+        <div class="grid-2">
+          <div class="card">
+            <h4>LLMPreparedState</h4>
+            <ul>
+              <li>next token</li>
+              <li>sampled row</li>
+              <li>valid mask</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>MTPPreparedState</h4>
+            <ul>
+              <li>accepted tokens / accepted length</li>
+              <li>tail token / previous token</li>
+              <li>tail embedding / previous embedding</li>
+              <li>position offset</li>
+            </ul>
+          </div>
+        </div>
+
+        <p>
+          Eagle3 使用 3H embedding 布局；DFlash/DSpark 后续定义 Context-KV 专属状态。Pipeline 不解释这些字段，只持有 Slot 与 Event。
+        </p>
+
+        <h3>13.3 KV Block 生命周期</h3>
+        <ul>
+          <li>Scheduler/BlockManager 仍是唯一分配者。</li>
+          <li>Device Patch 只消费已准备好的 block table，不申请 Block。</li>
+          <li>已提交 Task 引用的 Block 必须延迟释放，直到对应 Slot 安全退休。</li>
+          <li>Executor 不参与 Block 分配、抢占或回收决策。</li>
+          <li>复用现有 schedule-overlap lookahead 最坏情况预留，覆盖最多额外执行一个 Task。</li>
+        </ul>
+
+        <h3>13.4 reuse_fence</h3>
+        <p>
+          后继 Task 读取完前驱 DeviceStepState 后，在 <code>task_stream</code> 记录 <code>reuse_fence</code>。
+          Slot 再次进入 PREPARING 前，<code>prepare_stream</code> 等待该 Fence；Host 不同步等待。
+        </p>
+      </section>
+
+      <section id="memory">
+        <h2>14. 显存与 Buffer 规划</h2>
+
+        <h3>14.1 双 Slot 只复制跨 Task 并存数据</h3>
+        <ul>
+          <li>Draft / Target 最终输入 Arena；</li>
+          <li>block table、predecessor mapping；</li>
+          <li>算法专属 DeviceStepState；</li>
+          <li>最小 Device/Host 输出；</li>
+          <li>Event 与 backend 必需的 slot-local Graph pool。</li>
+        </ul>
+
+        <h3>14.2 Task 内共享一份串行 Workspace</h3>
+        <ul>
+          <li>N 轮 Draft 历史与临时 logits；</li>
+          <li>Target logits；</li>
+          <li>Rejection scratch；</li>
+          <li>activation、sampling、communication workspace。</li>
+        </ul>
+
+        <pre><code>Prepared memory ≈
+  slot_count × (input arena + step state + minimal result)
+  + one shared task workspace
+  + backend-required graph-local pool</code></pre>
+
+        <p>
+          不保存 N 份完整 ForwardOutput，不在运行期扩容 Device Buffer。所有上限由启动配置的最大 batch、最大 token、
+          block-table width 和 speculative width 推导。
+        </p>
+      </section>
+
+      <section id="output">
+        <h2>15. 输出、D2H 与 Consume</h2>
+
+        <pre><code>task_stream records task_output_event
+→ result_stream waits task_output_event
+→ async D2H into slot-local pinned output
+→ host_output_ready_event
+→ CompletionTicket
+→ Worker Consume
+→ output_fifo
+→ get_last_step_result()</code></pre>
+
+        <ul>
+          <li>只 D2H Host 真正需要的数据；DeviceStepState 不为下一 Task 做 D2H。</li>
+          <li>Worker 等待 Host output Event、转换输出并回收 Slot。</li>
+          <li>首版不增加 completion thread、Host Callback 或忙轮询。</li>
+          <li>异步正常 Consume 由 <code>get_last_step_result()</code> 驱动。</li>
+          <li>WorkerService 的 fake-token 行为和外部 RPC 接口保持不变。</li>
+        </ul>
+
+        <div class="callout success">
+          <strong>关键顺序：</strong>
+          Worker 必须先把 Task N 发布为 READY，再等待和消费 Task N-1。这样 Host Consume 与 Device Execute(N) 重叠，
+          不会阻塞两个 Device Task 之间的提交。
+        </div>
+      </section>
+
+      <section id="lifecycle">
+        <h2>16. 生命周期与错误语义</h2>
+
+        <h3>16.1 固定配置下复用同一 Pipeline</h3>
+        <div class="state-row">
+          <span class="state">CREATED</span><span class="state-arrow">→</span>
+          <span class="state">RUNNING</span><span class="state-arrow">↔</span>
+          <span class="state">QUIESCENT</span><span class="state-arrow">→</span>
+          <span class="state">STOPPED</span>
+        </div>
+
+        <ul>
+          <li><code>quiesce()</code>：pause/preempt 前通过正常 GetLast 收回在途 Task，使所有 Slot 回到 FREE。</li>
+          <li><code>resume()</code>：重新开放同一个 Pipeline，不重新分配 Arena、不重绑 Graph。</li>
+          <li><code>shutdown()</code>：停止新 Task，安全退休已提交 Device 操作并销毁资源。</li>
+          <li>不设计通用 DrainPolicy，也不向 TaskKind 添加 STOP/DRAIN 控制 Task。</li>
+        </ul>
+
+        <h3>16.2 首版保持 fail-fast</h3>
+        <p>
+          当前 xLLM 大量使用 <code>CHECK</code>，ThreadPool runnable 也没有统一异常捕获与 Promise 错误传播。
+          本次性能数据链路重构不同时扩展为 Task 重试或 Pipeline 恢复项目。
+        </p>
+        <ul>
+          <li>Prepare、Launch、Device、Collective、Consume 的非预期错误记录 Task 阶段与 Slot 后 Fatal。</li>
+          <li>不在某一 Rank 重试已可能进入 Collective 的 Task。</li>
+          <li>正常请求取消、结束、Graph miss 不属于执行失败。</li>
+          <li>不允许运行时切换回 Legacy 继续服务。</li>
+        </ul>
+      </section>
+
+      <section id="compatibility">
+        <h2>17. 支持范围与启动限制</h2>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>能力</th><th>Prepared 首版</th><th>处理方式</th></tr></thead>
+            <tbody>
+              <tr><td>NPU 普通 LLM</td><td>支持</td><td>阶段 1–3</td></tr>
+              <tr><td>NPU MTP</td><td>支持</td><td>阶段 4</td></tr>
+              <tr><td>NPU Eagle3</td><td>支持</td><td>阶段 5</td></tr>
+              <tr><td>NPU DFlash / DSpark</td><td>静态宽度后续支持</td><td>阶段 6</td></tr>
+              <tr><td>Graph miss</td><td>支持</td><td>单 Invocation 回退 Prepared Eager</td></tr>
+              <tr><td>JSON grammar</td><td>不支持</td><td>启动阶段使用 Legacy</td></tr>
+              <tr><td>Adaptive pruning</td><td>不支持</td><td>启动阶段使用 Legacy</td></tr>
+              <tr><td>Suffix</td><td>不支持</td><td>使用 Legacy</td></tr>
+              <tr><td>运行期 update_weights</td><td>不支持</td><td>Prepared 模式明确拒绝</td></tr>
+              <tr><td>CUDA / MUSA / MLU / DCU</td><td>首版不支持</td><td>启动阶段使用 Legacy</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>
+          配置全部在启动阶段决定，不做功能热开关。一个实例一旦启用 Prepared Pipeline，就不会在服务期切换到 Legacy；
+          后续删除 Legacy 时，只需移除 Worker 分流与旧 <code>WorkerImpl::step_async()</code>。
+        </p>
+      </section>
+
+      <section id="files">
+        <h2>18. 代码组织与改动边界</h2>
+
+        <h3>18.1 建议新增文件</h3>
+        <pre><code>xllm/core/runtime/prepared_task/
+├── prepared_task_types.h
+├── prepared_task_pipeline.h
+├── prepared_task_pipeline.cpp
+├── prepared_task_adapter.h
+├── llm_prepared_task_adapter.h
+├── llm_prepared_task_adapter.cpp
+├── mtp_prepared_task_adapter.h
+├── mtp_prepared_task_adapter.cpp
+├── eagle3_prepared_task_adapter.h
+└── eagle3_prepared_task_adapter.cpp
+
+xllm/core/runtime/
+├── prepared_executor.h
+├── acl_prepared_executor.h
+└── acl_prepared_executor.cpp</code></pre>
+
+        <h3>18.2 重点修改文件</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>位置</th><th>改动</th><th>边界</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><code>worker.h/.cpp</code></td>
+                <td>持有 Pipeline；启动期选择；step/get-last 分流</td>
+                <td>Legacy WorkerImpl 路径保持原样</td>
+              </tr>
+              <tr>
+                <td><code>worker_impl.h/.cpp</code></td>
+                <td>提供窄化的 Worker 单线程命令提交能力</td>
+                <td>不把 Prepared 状态机塞进基类</td>
+              </tr>
+              <tr>
+                <td><code>executor.h/.cpp</code></td>
+                <td>暴露可选 PreparedExecutor capability</td>
+                <td>现有 ExecutorImpl::run() 不变</td>
+              </tr>
+              <tr>
+                <td><code>acl_graph_executor_impl.*</code></td>
+                <td>显式 Slot 绑定、Arena 直绑、Prepared Graph/Eager binding</td>
+                <td>Legacy 隐式 Graph Slot 轮转继续保留</td>
+              </tr>
+              <tr>
+                <td><code>mtp_async_input_builder.*</code></td>
+                <td>动态 Tensor 操作改为预分配输出与固定 Device Patch</td>
+                <td>不构建通用 Patch DAG</td>
+              </tr>
+              <tr>
+                <td>Batch / Scheduler 构造</td>
+                <td>顺手生成 predecessor_row</td>
+                <td>不感知 Slot、Graph、Adapter</td>
+              </tr>
+              <tr>
+                <td><code>ExecutionConfig</code></td>
+                <td>增加 Prepared Pipeline 启动参数与兼容性校验</td>
+                <td>默认 Legacy，首版 NPU</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <details>
+          <summary>当前代码锚点</summary>
+          <div>
+            <ul>
+              <li><code>xllm/core/runtime/worker.cpp</code>：WorkerImpl 类型选择与外层转发。</li>
+              <li><code>xllm/core/runtime/worker_impl.cpp::step_async</code>：Legacy async/overlap 主路径。</li>
+              <li><code>xllm/core/scheduler/continuous_scheduler.cpp::step_with_schedule_overlap</code>：先 Step、后 GetLast 的一步前推顺序。</li>
+              <li><code>xllm/core/runtime/acl_graph_executor_impl.cpp</code>：当前 GraphSlot 与隐式 replay slot 轮转。</li>
+              <li><code>xllm/core/framework/speculative/mtp_async_input_builder.cpp</code>：现有 MTP 动态输入构造。</li>
+              <li><code>xllm/core/runtime/dflash_worker_impl.cpp</code>：当前 Validate 后同步、D2H 与 Context-KV Host 构造。</li>
+              <li><code>xllm/core/runtime/suffix_worker_impl.cpp</code>：CPU suffix tree 与真实输出依赖。</li>
+            </ul>
+          </div>
+        </details>
+      </section>
+
+      <section id="phases">
+        <h2>19. 分阶段实施计划</h2>
+
+        <div class="phase">
+          <div class="phase-id">1</div>
+          <div>
+            <h3>普通 LLM · Prepared Eager · 1 Slot</h3>
+            <p>打通 Prepare/Launch/Consume，验证同步语义、输入 Arena 和 launch-only 边界。</p>
+            <span class="tag">正确性基座</span><span class="tag">无 Graph</span>
+          </div>
+        </div>
+
+        <div class="phase">
+          <div class="phase-id">2</div>
+          <div>
+            <h3>普通 LLM · Prepared Eager · 2 Slot</h3>
+            <p>接入现有异步 Scheduler，验证 fake token、输出 FIFO、Prepare(N+1)/Execute(N) 重叠。</p>
+            <span class="tag green">首次验证 Task 间空泡</span>
+          </div>
+        </div>
+
+        <div class="phase">
+          <div class="phase-id">3</div>
+          <div>
+            <h3>NPU Graph</h3>
+            <p>显式 Slot、固定 Arena 直绑、Graph replay/Prepared Eager fallback，验证无整份 D2D。</p>
+            <span class="tag purple">Graph</span><span class="tag">固定地址</span>
+          </div>
+        </div>
+
+        <div class="phase">
+          <div class="phase-id">4</div>
+          <div>
+            <h3>纯 MTP</h3>
+            <p>实现 MTP Prefill 与 Decode 固定函数、DeviceStepState、predecessor_row 和 Device Patch；先 Eager 后 Graph。</p>
+            <span class="tag green">核心投机路径</span>
+          </div>
+        </div>
+
+        <div class="phase">
+          <div class="phase-id">5</div>
+          <div>
+            <h3>Eagle3</h3>
+            <p>复用 MTP Adapter，增加 3H aux-hidden 布局与 Device token-id mapping。</p>
+            <span class="tag">MTP 变体</span>
+          </div>
+        </div>
+
+        <div class="phase">
+          <div class="phase-id">6</div>
+          <div>
+            <h3>DFlash / DSpark 静态宽度</h3>
+            <p>独立 Block-Spec Adapter，移除当前 Task 内 D2H/synchronize，Device 更新 Context KV。</p>
+            <span class="tag orange">独立 Adapter</span><span class="tag red">不含 Adaptive</span>
+          </div>
+        </div>
+
+        <div class="callout">
+          每个阶段都在启动参数后独立启用和验收。未完成的算法继续走 Legacy，避免一次大改动混合 Pipeline、Graph 和算法问题。
+        </div>
+      </section>
+
+      <section id="validation">
+        <h2>20. 验证、指标与验收标准</h2>
+
+        <h3>20.1 正确性</h3>
+        <ul class="checklist">
+          <li>相同模型、请求序列、配置和随机种子下，Task 顺序与 RNG 调用顺序一致。</li>
+          <li>Greedy token、MTP/Eagle3 Draft token、接受长度和结束位置逐 step 一致。</li>
+          <li>position、kv_seq_len、block table 和 KV 写入位置一致。</li>
+          <li>浮点 logits/logprobs 按 dtype 使用既有容差。</li>
+          <li>请求新增、删除、重排、取消和结束覆盖 predecessor_row 边界。</li>
+          <li>同步/异步、Graph/Prepared Eager、Graph mixed fallback 交叉覆盖。</li>
+          <li>TP/DP/EP 下 EMPTY rank collective 顺序一致，无死锁。</li>
+        </ul>
+
+        <h3>20.2 内存与生命周期</h3>
+        <ul class="checklist">
+          <li>服务期 Task 热路径无输入输出 Device allocation。</li>
+          <li>Slot 复用前 reuse_fence 已建立；ASAN/调试模式无 Host source 生命周期问题。</li>
+          <li>已提交 Task 引用的 KV Block 不会提前释放。</li>
+          <li>同步 1 Slot、异步 2 Slot 的 HBM 增量与启动日志一致。</li>
+          <li>pause/resume 后复用同一 Arena 与 Graph 绑定。</li>
+        </ul>
+
+        <h3>20.3 性能指标</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>指标</th><th>用途</th><th>问题定位</th></tr></thead>
+            <tbody>
+              <tr><td><code>device_inter_task_gap</code></td><td>直接衡量两个完整 Task 的 Device 间隔</td><td>总体验收</td></tr>
+              <tr><td><code>prepare_cpu_latency</code></td><td>Worker CPU Prepare 时间</td><td>生产者是否跟得上</td></tr>
+              <tr><td><code>h2d_ready_latency</code></td><td>H2D 提交到 Event 完成</td><td>Copy/带宽竞争</td></tr>
+              <tr><td><code>ready_queue_empty_at_task_end</code></td><td>前一 Task 结束时下一 Slot 是否 READY</td><td>Slot starvation</td></tr>
+              <tr><td><code>patch_latency</code></td><td>跨 Task 与 MTP Patch Device 时间</td><td>Patch Kernel 优化</td></tr>
+              <tr><td>Graph hit / Prepared Eager ratio</td><td>判断实际执行模式</td><td>Graph key 与 warmup 覆盖</td></tr>
+              <tr><td>D2H / Consume latency</td><td>输出阶段 CPU 与 Copy 开销</td><td>是否影响下一轮生产</td></tr>
+              <tr><td>Slot starvation count</td><td>生产者慢于消费者的频次</td><td>CPU 输入构造后续重构依据</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>20.4 性能验收定义</h3>
+        <div class="callout success">
+          Task N 与 Task N+1 之间不再存在必须由 CPU 串行完成的输入构造、输出读取或调度判断。
+          当 Prepare + H2D 能在 Execute(N) 窗口内完成时，NPU trace 中不应出现由 Host 数据准备造成的 Task 间空泡。
+        </div>
+
+        <p>
+          若仍有空泡，必须能通过上述指标区分：ready queue 为空、H2D Event 未完成、Launch/Graph replay 延迟，或 backend/collective 等待。
+        </p>
+      </section>
+
+      <section id="risks">
+        <h2>21. 主要风险与缓解</h2>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>风险</th><th>后果</th><th>缓解方式</th></tr></thead>
+            <tbody>
+              <tr>
+                <td>CPU Prepare 仍过重</td>
+                <td>双 Slot 经常 starvation，Device 仍有空泡</td>
+                <td>先度量；复用 Host staging；后续让 Scheduler 直接产生紧凑 TaskDescriptor</td>
+              </tr>
+              <tr>
+                <td>H2D 与计算竞争</td>
+                <td>Task 开始时仍等待 h2d_ready_event</td>
+                <td>统计 Event 延迟；合并小 Copy；预布局连续 Arena；评估 Stream 优先级</td>
+              </tr>
+              <tr>
+                <td>Graph 地址绑定不彻底</td>
+                <td>产生隐含整份 D2D 或运行期 Tensor 替换</td>
+                <td>启动时记录每字段 DIRECT_BIND/PATCH/PACK；trace 验证 Copy</td>
+              </tr>
+              <tr>
+                <td>跨 Task 状态覆盖</td>
+                <td>MTP token/embedding 或 KV 状态损坏</td>
+                <td>显式 predecessor_row + reuse_fence + Debug task_seq_no</td>
+              </tr>
+              <tr>
+                <td>非 Driver Rank 输出生命周期</td>
+                <td>临时 Tensor 提前释放，backend 仍持有地址</td>
+                <td>Slot 生命周期覆盖完整 Device Event；非 Driver 也必须安全退休</td>
+              </tr>
+              <tr>
+                <td>算法过早一起重构</td>
+                <td>Pipeline、Graph、算法错误难以定位</td>
+                <td>纵向阶段；普通 LLM → Graph → MTP → Eagle3 → Block-Spec</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="future">
+        <h2>22. 后续：MTP 大 Graph</h2>
+
+        <p>首版仍使用独立 Draft/Target Graph，以降低一次性重构风险。当前接口需要保证未来可以把固定 Launch 序列替换为：</p>
+
+        <pre><code>mtp_big_graph[slot_id].replay();</code></pre>
+
+        <p>未来大 Graph 可覆盖：</p>
+
+        <pre><code>Draft × N
+→ Target Validate
+→ Rejection Sampling
+→ DeviceStepState publish</code></pre>
+
+        <p>
+          异步双 Slot 对应同一逻辑大 Graph 的两个固定地址实例。Prefill 与 Decode 仍建议保持双 Graph，避免把不同形状和控制语义强行捕获到一个 Graph 中。
+        </p>
+
+        <div class="callout teal">
+          当前 PreparedInputArena、显式 slot_id、Adapter 固定 Task 函数和算法专属 DeviceStepState，都是为未来大 Graph 保留的必要接口，而不是首版直接实现大 Graph。
+        </div>
+      </section>
+
+      <section id="conclusion">
+        <h2>23. 最终结论</h2>
+        <p class="lead">
+          PreparedTaskPipeline 与当前异步 Scheduler 的底层语义一致：同步模式是单 Slot 的 CPU/Device 交替，
+          异步模式通过额外准备一个完整 Task，用最多一个额外 Task 的代价把 CPU Prepare 移出 Device Task 间隙。
+        </p>
+        <p>
+          方案的关键不是简单增加线程，而是同时建立固定输入 Arena、显式 Slot、DeviceStepState、前驱行映射和 launch-only Executor 边界。
+          只有这些条件共同满足，MTP 的下一步输入才能真正提前准备，Graph/Eager 才能共用数据链路，Device 空泡也才能被可靠定位和消除。
+        </p>
+        <div class="callout success">
+          <strong>实施起点：</strong>
+          NPU 普通 LLM + Prepared Eager + 单 Slot。默认保持 Legacy；每阶段通过确定性、内存与 NPU trace 验收后再推进。
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <footer>
+    xLLM PreparedTaskPipeline Design · Consensus baseline · Generated 2026-08-21
+  </footer>
+
+  <script>
+    (() => {
+      const links = Array.from(document.querySelectorAll('.toc a'));
+      const sections = links
+        .map((link) => document.querySelector(link.getAttribute('href')))
+        .filter(Boolean);
+      if (!('IntersectionObserver' in window) || sections.length === 0) return;
+
+      const byId = new Map(links.map((link) => [link.getAttribute('href').slice(1), link]));
+      const observer = new IntersectionObserver((entries) => {
+        const visible = entries
+          .filter((entry) => entry.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+        if (visible.length === 0) return;
+        links.forEach((link) => link.classList.remove('active'));
+        const active = byId.get(visible[0].target.id);
+        if (active) active.classList.add('active');
+      }, { rootMargin: '-8% 0px -78% 0px', threshold: 0 });
+
+      sections.forEach((section) => observer.observe(section));
+    })();
+  </script>
+</body>
+</html>
