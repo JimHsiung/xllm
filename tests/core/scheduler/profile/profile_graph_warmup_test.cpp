@@ -293,6 +293,55 @@ TEST(GraphWarmupTest, DecodeRoleUsesDecodeOnlyPlan) {
             GraphWarmupPlan::DECODE_ONLY);
 }
 
+TEST(GraphWarmupTest, PreparedOverlapWarmsBothFixedSlotsPerBucket) {
+  EXPECT_EQ(graph_warmup_invocations_per_bucket(
+                /*enable_prepared_task_pipeline=*/true,
+                /*enable_schedule_overlap=*/true),
+            2);
+}
+
+TEST(GraphWarmupTest, SingleSlotAndLegacyWarmEachBucketOnce) {
+  EXPECT_EQ(graph_warmup_invocations_per_bucket(
+                /*enable_prepared_task_pipeline=*/true,
+                /*enable_schedule_overlap=*/false),
+            1);
+  EXPECT_EQ(graph_warmup_invocations_per_bucket(
+                /*enable_prepared_task_pipeline=*/false,
+                /*enable_schedule_overlap=*/true),
+            1);
+}
+
+TEST(GraphWarmupTest, HybridMtpEnumeratesEveryAcceptedLengthOnBothSlots) {
+  const std::vector<int32_t> schedule = graph_warmup_accepted_length_schedule(
+      /*num_speculative_tokens=*/3,
+      /*enable_hybrid_mtp_variants=*/true,
+      /*invocations_per_variant=*/2);
+
+  EXPECT_EQ(schedule, (std::vector<int32_t>{1, 1, 2, 2, 3, 3, 4, 4}));
+}
+
+TEST(GraphWarmupTest, HybridMtpSingleSlotEnumeratesEveryAcceptedLengthOnce) {
+  const std::vector<int32_t> schedule = graph_warmup_accepted_length_schedule(
+      /*num_speculative_tokens=*/3,
+      /*enable_hybrid_mtp_variants=*/true,
+      /*invocations_per_variant=*/1);
+
+  EXPECT_EQ(schedule, (std::vector<int32_t>{1, 2, 3, 4}));
+}
+
+TEST(GraphWarmupTest, NonHybridAndOrdinaryDecodeKeepOriginalInvocationCount) {
+  EXPECT_EQ(graph_warmup_accepted_length_schedule(
+                /*num_speculative_tokens=*/3,
+                /*enable_hybrid_mtp_variants=*/false,
+                /*invocations_per_variant=*/2),
+            (std::vector<int32_t>{1, 1}));
+  EXPECT_EQ(graph_warmup_accepted_length_schedule(
+                /*num_speculative_tokens=*/0,
+                /*enable_hybrid_mtp_variants=*/true,
+                /*invocations_per_variant=*/1),
+            (std::vector<int32_t>{1}));
+}
+
 TEST(GraphWarmupTest, FormatsWarmupProgress) {
   const std::string progress = graph_warmup_progress(
       /*completed=*/3, /*total=*/8, /*token_bucket=*/8, /*latency_ms=*/12.5);
@@ -319,13 +368,26 @@ TEST(GraphWarmupTest, InjectsBootstrapEmbeddingWhenSpeculativeEnabled) {
 
   prepare_warmup_decode_sequence(&sequence,
                                  /*embedding_width=*/128,
-                                 /*num_speculative_tokens=*/3);
+                                 /*num_speculative_tokens=*/3,
+                                 /*accepted_prefix_length=*/1);
 
   const torch::Tensor embedding = sequence.get_mtp_bootstrap_embedding();
   ASSERT_TRUE(embedding.defined());
   EXPECT_EQ(embedding.dim(), 2);
   EXPECT_EQ(embedding.size(0), 1);
   EXPECT_EQ(embedding.size(1), 128);
+  EXPECT_EQ(sequence.graph_warmup_speculative_accepted_length(), 1);
+}
+
+TEST(GraphWarmupTest, RecordsHybridMtpAcceptedLengthVariantOnSequence) {
+  Sequence sequence = make_sequence(/*index=*/0, /*tokens=*/{1, 2, 3});
+
+  prepare_warmup_decode_sequence(&sequence,
+                                 /*embedding_width=*/128,
+                                 /*num_speculative_tokens=*/3,
+                                 /*accepted_prefix_length=*/3);
+
+  EXPECT_EQ(sequence.graph_warmup_speculative_accepted_length(), 3);
 }
 
 TEST(GraphWarmupTest, DeepseekV4MtpUsesFlattenedHyperConnectionWidth) {
@@ -351,7 +413,8 @@ TEST(GraphWarmupTest, SkipsBootstrapEmbeddingWhenSpeculativeDisabled) {
 
   prepare_warmup_decode_sequence(&sequence,
                                  /*embedding_width=*/128,
-                                 /*num_speculative_tokens=*/0);
+                                 /*num_speculative_tokens=*/0,
+                                 /*accepted_prefix_length=*/1);
 
   EXPECT_FALSE(sequence.get_mtp_bootstrap_embedding().defined());
 }

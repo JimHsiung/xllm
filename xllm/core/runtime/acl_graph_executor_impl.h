@@ -36,6 +36,7 @@ limitations under the License.
 #include "executor_impl.h"
 #include "executor_impl_factory.h"
 #include "options.h"
+#include "runtime/prepared_executor.h"
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
@@ -110,12 +111,33 @@ class AclGraph {
                uint32_t bucket_num_tokens,
                c10_npu::MempoolId_t graph_pool);
 
+  ModelOutput capture_prepared(CausalLM* model,
+                               const runtime::Options& options,
+                               const ForwardInput& input,
+                               std::vector<KVCache>& kv_cache,
+                               c10_npu::MempoolId_t graph_pool);
+
   // Replay captured graph with new input data
   ModelOutput replay(CausalLM* model,
                      const torch::Tensor& tokens,
                      const torch::Tensor& positions,
                      std::vector<KVCache>& kv_cache,
                      const ModelInputParams& params);
+
+  ModelOutput replay_prepared(const ForwardInput& input,
+                              bool static_graph_tasks_prepared);
+
+  bool matches_prepared_input(const ForwardInput& input) const;
+
+  void prepare_prepared_model_graph_metadata(
+      CausalLM* model,
+      const ForwardInput& input,
+      const PagedAttentionPlanDescriptor* attention_plan,
+      int64_t block_size);
+
+  bool prepare_static_prepared_graph_tasks(
+      const ModelInputParams& params,
+      const c10_npu::NPUStream& signal_stream);
 
   void prepare_replay_inputs(const torch::Tensor& tokens,
                              const torch::Tensor& positions,
@@ -178,11 +200,24 @@ class AclGraph {
       spec_verify_paged_attention_tiling_layout_;
   int64_t spec_verify_block_size_ = 0;
   int64_t spec_verify_kv_split_core_count_ = 0;
+  bool is_prepared_graph_ = false;
+  uint64_t prepared_layout_signature_ = 0;
+  const void* prepared_input_buffer_address_ = nullptr;
+  const void* prepared_tokens_address_ = nullptr;
+  const void* prepared_positions_address_ = nullptr;
+  uint64_t prepared_external_layout_signature_ = 0;
+  std::vector<const void*> prepared_external_input_addresses_;
+  torch::Tensor prepared_hidden_states_;
+  torch::Tensor prepared_aux_hidden_states_;
+  std::optional<ModelInputParams> prepared_model_graph_params_;
+  std::optional<PagedAttentionPlanDescriptor>
+      prepared_attention_plan_descriptor_;
+  const void* prepared_graph_tiling_address_ = nullptr;
 };
 
 // Executor implementation using ACL graph optimization
 // Uses NPUGraph mempool to reduce memory allocation overhead during inference
-class AclGraphExecutorImpl : public ExecutorImpl {
+class AclGraphExecutorImpl : public ExecutorImpl, public PreparedExecutor {
  public:
   AclGraphExecutorImpl(CausalLM* model,
                        const ModelArgs& args,
@@ -193,11 +228,23 @@ class AclGraphExecutorImpl : public ExecutorImpl {
 
   ForwardInput prepare_inputs(Batch& batch) override;
 
+  void prepare_prepared_graph_input(int32_t slot_id,
+                                    ForwardInput& input,
+                                    std::vector<KVCache>& kv_caches) override;
+
   // Execute model with graph optimization for decode phase
   ModelOutput run(const torch::Tensor& tokens,
                   const torch::Tensor& positions,
                   std::vector<KVCache>& kv_caches,
                   const ModelInputParams& params) override;
+
+  PreparedSlotBinding bind_prepared(int32_t slot_id,
+                                    const ForwardInput& input,
+                                    std::vector<KVCache>& kv_caches) override;
+
+  ModelOutput launch_prepared(const PreparedSlotBinding& binding,
+                              const ForwardInput& input,
+                              std::vector<KVCache>& kv_caches) override;
 
   void prepare_graph_input(const torch::Tensor& tokens,
                            const torch::Tensor& positions,
@@ -210,6 +257,7 @@ class AclGraphExecutorImpl : public ExecutorImpl {
   [[nodiscard]] int32_t graph_slot_count_for_test() const {
     return graph_slot_count_;
   }
+  [[nodiscard]] size_t prepared_graph_count_for_test(int32_t slot_id) const;
   size_t get_graph_count() const;
   size_t get_graph_memory_pool_count();
   size_t get_graph_capture_stream_count() const;
@@ -227,6 +275,7 @@ class AclGraphExecutorImpl : public ExecutorImpl {
     c10_npu::MempoolId_t graph_pool{0, 0};
     std::optional<c10_npu::NPUStream> graph_capture_stream;
     absl::flat_hash_map<uint64_t, std::shared_ptr<AclGraph>> graphs;
+    absl::flat_hash_map<uint64_t, std::shared_ptr<AclGraph>> prepared_graphs;
     std::deque<uint64_t> static_mtp_graph_keys;
     bool is_prepared = false;
   };
@@ -249,6 +298,9 @@ class AclGraphExecutorImpl : public ExecutorImpl {
                          uint64_t attention_plan_class = 0) const;
   std::optional<uint64_t> find_spec_verify_attention_plan_class(
       uint64_t lookup_key);
+  bool supports_prepared_graph(const ForwardInput& input) const;
+  uint64_t get_prepared_graph_key(const ForwardInput& input,
+                                  uint64_t attention_plan_class) const;
 };
 REGISTER_EXECUTOR("npu", AclGraphExecutorImpl);
 }  // namespace xllm::npu

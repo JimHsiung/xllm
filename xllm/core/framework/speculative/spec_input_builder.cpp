@@ -195,6 +195,14 @@ int32_t calc_ring_slot_id(int32_t position,
 
 std::vector<int32_t> build_grouped_prefill_swa_slots(const ForwardInput& input,
                                                      int32_t block_size) {
+  std::vector<int32_t> slots;
+  build_grouped_prefill_swa_slots_out(input, block_size, slots);
+  return slots;
+}
+
+void build_grouped_prefill_swa_slots_out(const ForwardInput& input,
+                                         int32_t block_size,
+                                         std::vector<int32_t>& slots) {
   DecodeRowContext ctx = make_decode_row_context(input);
   CHECK(ctx.model_managed_multiblock)
       << "grouped prefill SWA slots require multi_block_tables";
@@ -204,8 +212,10 @@ std::vector<int32_t> build_grouped_prefill_swa_slots(const ForwardInput& input,
            static_cast<size_t>(ctx.num_sequences))
       << "grouped prefill SWA manager row count mismatch";
 
-  std::vector<int32_t> slots;
-  slots.reserve(ctx.positions.size());
+  slots.clear();
+  if (slots.capacity() < ctx.positions.size()) {
+    slots.reserve(ctx.positions.size());
+  }
   for (int32_t seq_id = 0; seq_id < ctx.num_sequences; ++seq_id) {
     const int32_t kv_len = calc_kv_len(ctx.kv_seq_lens, seq_id, /*offset=*/0);
     const int32_t q_len = input.input_params.get_q_seq_len(seq_id);
@@ -221,7 +231,6 @@ std::vector<int32_t> build_grouped_prefill_swa_slots(const ForwardInput& input,
   }
   CHECK_EQ(slots.size(), ctx.positions.size())
       << "grouped prefill SWA slot/position count mismatch";
-  return slots;
 }
 
 int32_t calc_kv_len(const Slice<int32_t>& kv_seq_lens_slice,
@@ -484,12 +493,141 @@ void update_input_params(ModelInputParams& input_params,
   }
 }
 
+void reserve_decode_build_workspace(DecodeBuildWorkspace& workspace,
+                                    int64_t row_capacity) {
+  CHECK_GT(row_capacity, 0);
+  const size_t capacity = static_cast<size_t>(row_capacity);
+  DecodeBuildBuffers& buffers = workspace.buffers;
+  buffers.out_token_ids.reserve(capacity);
+  buffers.out_positions.reserve(capacity);
+  buffers.out_kv_seq_lens.reserve(capacity);
+  buffers.out_q_seq_lens.reserve(capacity);
+  buffers.out_q_cu_seq_lens.reserve(capacity + 1);
+  buffers.out_new_cache_slots.reserve(capacity);
+  workspace.auxiliary_kv_seq_lens.reserve(capacity);
+  workspace.auxiliary_q_seq_lens.reserve(capacity);
+  workspace.auxiliary_q_cu_seq_lens.reserve(capacity + 1);
+  workspace.selected_indices.reserve(capacity);
+  workspace.embedding_rows.reserve(capacity);
+}
+
+void reset_decode_build_workspace(DecodeBuildWorkspace& workspace) {
+  DecodeBuildBuffers& buffers = workspace.buffers;
+  buffers.meta = DecodeBuildMeta();
+  buffers.out_token_ids.clear();
+  buffers.out_positions.clear();
+  buffers.out_kv_seq_lens.clear();
+  buffers.out_q_seq_lens.clear();
+  buffers.out_q_cu_seq_lens.clear();
+  buffers.out_new_cache_slots.clear();
+  buffers.out_block_tables.clear();
+  buffers.out_multi_block_tables.clear();
+  buffers.out_block_table_rows = 0;
+  buffers.out_block_table_stride = 0;
+  workspace.auxiliary_kv_seq_lens.clear();
+  workspace.auxiliary_q_seq_lens.clear();
+  workspace.auxiliary_q_cu_seq_lens.clear();
+  workspace.selected_indices.clear();
+  workspace.embedding_rows.clear();
+  workspace.owns_kv_seq_lens = false;
+  workspace.owns_q_seq_lens = false;
+  workspace.owns_q_cu_seq_lens = false;
+  workspace.uses_auxiliary_kv_seq_lens = false;
+  workspace.uses_auxiliary_q_seq_lens = false;
+  workspace.uses_auxiliary_q_cu_seq_lens = false;
+}
+
+void reclaim_decode_build_workspace(ModelInputParams& input_params,
+                                    DecodeBuildWorkspace& workspace) {
+  AttentionHostInput& attention = input_params.attention.host;
+  DecodeBuildBuffers& buffers = workspace.buffers;
+  buffers.out_new_cache_slots = std::move(attention.new_cache_slots);
+  if (workspace.owns_kv_seq_lens) {
+    std::vector<int32_t>& destination = workspace.uses_auxiliary_kv_seq_lens
+                                            ? workspace.auxiliary_kv_seq_lens
+                                            : buffers.out_kv_seq_lens;
+    destination = std::move(attention.kv_seq_lens);
+  }
+  if (workspace.owns_q_seq_lens) {
+    std::vector<int32_t>& destination = workspace.uses_auxiliary_q_seq_lens
+                                            ? workspace.auxiliary_q_seq_lens
+                                            : buffers.out_q_seq_lens;
+    destination = std::move(attention.q_seq_lens);
+  }
+  if (workspace.owns_q_cu_seq_lens) {
+    std::vector<int32_t>& destination = workspace.uses_auxiliary_q_cu_seq_lens
+                                            ? workspace.auxiliary_q_cu_seq_lens
+                                            : buffers.out_q_cu_seq_lens;
+    destination = std::move(attention.q_cu_seq_lens);
+  }
+}
+
 torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values) {
   return torch::tensor(values,
                        torch::TensorOptions()
                            .dtype(torch::kInt)
                            .device(torch::kCPU)
                            .pinned_memory(true));
+}
+
+torch::Tensor copy_cpu_int_values_out(const std::vector<int32_t>& values,
+                                      torch::Tensor destination) {
+  CHECK(destination.defined());
+  CHECK(destination.device().is_cpu());
+  CHECK_EQ(destination.scalar_type(), torch::kInt);
+  CHECK_EQ(destination.dim(), 1);
+  CHECK(destination.is_contiguous());
+  CHECK_LE(values.size(), static_cast<size_t>(destination.numel()));
+  const void* destination_address = destination.data_ptr();
+  torch::Tensor active_destination = destination.narrow(
+      /*dim=*/0, /*start=*/0, static_cast<int64_t>(values.size()));
+  std::copy(
+      values.begin(), values.end(), active_destination.data_ptr<int32_t>());
+  CHECK_EQ(active_destination.data_ptr(), destination_address)
+      << "Fixed Host int32 staging replaced destination storage";
+  return active_destination;
+}
+
+torch::Tensor fill_cpu_int_range_out(int32_t start,
+                                     int32_t step,
+                                     int64_t count,
+                                     torch::Tensor destination) {
+  CHECK_GE(count, 0);
+  CHECK(destination.defined());
+  CHECK(destination.device().is_cpu());
+  CHECK_EQ(destination.scalar_type(), torch::kInt);
+  CHECK_EQ(destination.dim(), 1);
+  CHECK(destination.is_contiguous());
+  CHECK_LE(count, destination.numel());
+  const void* destination_address = destination.data_ptr();
+  torch::Tensor active_destination =
+      destination.narrow(/*dim=*/0, /*start=*/0, count);
+  int32_t* output = active_destination.data_ptr<int32_t>();
+  for (int64_t index = 0; index < count; ++index) {
+    output[index] = start + static_cast<int32_t>(index) * step;
+  }
+  CHECK_EQ(active_destination.data_ptr(), destination_address)
+      << "Fixed Host int32 range replaced destination storage";
+  return active_destination;
+}
+
+torch::Tensor fill_cpu_bool_out(bool value,
+                                int64_t count,
+                                torch::Tensor destination) {
+  CHECK_GE(count, 0);
+  CHECK(destination.defined());
+  CHECK(destination.device().is_cpu());
+  CHECK_EQ(destination.scalar_type(), torch::kBool);
+  CHECK_EQ(destination.dim(), 1);
+  CHECK(destination.is_contiguous());
+  CHECK_LE(count, destination.numel());
+  const void* destination_address = destination.data_ptr();
+  torch::Tensor active_destination =
+      destination.narrow(/*dim=*/0, /*start=*/0, count);
+  active_destination.fill_(value);
+  CHECK_EQ(active_destination.data_ptr(), destination_address)
+      << "Fixed Host bool fill replaced destination storage";
+  return active_destination;
 }
 
 void set_token_position_tensors(ForwardInput& input,

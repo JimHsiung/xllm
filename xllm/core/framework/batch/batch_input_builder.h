@@ -197,6 +197,7 @@ class BatchInputBuilder {
   bool need_unique_tokens_ = true;
   bool build_eplb_decode_token_mask_ = false;
   bool is_graph_warmup_ = false;
+  int32_t graph_warmup_speculative_accepted_length_ = 1;
   int32_t cp_size_ = 1;
 
   // copy in and out cache contents

@@ -260,6 +260,22 @@ DECLARE_COUNTER(speculative_num_accepted_tokens_plain_total);
 DECLARE_COUNTER(speculative_num_draft_tokens_constrained_total);
 DECLARE_COUNTER(speculative_num_draft_tokens_plain_total);
 
+// Prepared Task pipeline latency, overlap readiness, and Arena transfer volume.
+DECLARE_HISTOGRAM(prepared_task_prepare_cpu_latency_microseconds);
+DECLARE_HISTOGRAM(prepared_task_launch_submission_latency_microseconds);
+DECLARE_HISTOGRAM(prepared_task_consume_latency_microseconds);
+DECLARE_COUNTER(prepared_task_launch_submissions_total);
+DECLARE_COUNTER(prepared_task_ready_queue_empty_at_launch_end_total);
+DECLARE_COUNTER(prepared_task_execution_total_eager);
+DECLARE_COUNTER(prepared_task_execution_total_graph_capture);
+DECLARE_COUNTER(prepared_task_execution_total_graph_replay);
+DECLARE_COUNTER(prepared_task_graph_runtime_misses_total);
+DECLARE_COUNTER(prepared_task_graph_address_mismatches_total);
+DECLARE_COUNTER(prepared_task_staging_h2d_bytes_total);
+DECLARE_COUNTER(prepared_task_staging_h2d_copies_total);
+DECLARE_COUNTER(prepared_task_staging_d2d_bytes_total);
+DECLARE_COUNTER(prepared_task_staging_d2d_copies_total);
+
 // latency of proto conversion in seconds
 DECLARE_COUNTER(proto_latency_seconds_proto2i);
 DECLARE_COUNTER(proto_latency_seconds_i2proto);

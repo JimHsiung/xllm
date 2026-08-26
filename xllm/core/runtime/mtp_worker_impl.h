@@ -31,6 +31,26 @@ limitations under the License.
 
 namespace xllm {
 
+class MtpPreparedTaskBackend;
+
+// Slot-local pinned Host storage for MTP-generated model inputs. Prepared
+// helpers write active prefixes in place before the fixed Arena stages them.
+struct MtpPreparedHostInputWorkspace {
+  torch::Tensor token_ids;
+  torch::Tensor positions;
+  torch::Tensor selected_token_idxes;
+  torch::Tensor sample_idxes;
+  torch::Tensor do_sample;
+  torch::Tensor repeated_sampling_storage;
+};
+
+// Stack per-row embeddings into caller-owned fixed storage without replacing
+// its address. Prepared MTP uses this for the first Draft invocation so the
+// hot path does not allocate a temporary Device tensor before Arena staging.
+torch::Tensor stack_prepared_embedding_rows_out(
+    const std::vector<torch::Tensor>& embedding_rows,
+    torch::Tensor destination);
+
 #if defined(USE_NPU)
 namespace detail {
 class NpuJsonDraftTokenHandoff;
@@ -88,6 +108,9 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
       ForwardInput& inputs) override;
   void prepare_work_before_execute(const ForwardInput& inputs,
                                    ForwardInput& processed_inputs) override;
+  std::unique_ptr<MtpPreparedTaskBackend> create_prepared_task_backend(
+      uint64_t input_arena_capacity_bytes,
+      int32_t slot_count);
 
  protected:
   // MTP composite: leaves own model-specific NPU input preparation.
@@ -145,6 +168,13 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   // Default MTP behavior always compresses probs for cache storage.
   virtual void process_draft_sample_output(SampleOutput& sample_output);
 
+  // Prepared execution writes the final target-vocabulary token ids into a
+  // Slot-local fixed output. Algorithms with token-id remapping override this
+  // hook and must not replace fixed_token_ids storage.
+  virtual void process_prepared_draft_sample_output(
+      SampleOutput& sample_output,
+      torch::Tensor fixed_token_ids);
+
   SampleOutput validate(
       const SamplingParameters& sampling_params,
       const torch::Tensor& draft_token_ids,
@@ -162,7 +192,8 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
 
   // prepare inputs for draft model at Prefill phase.
   void prepare_prefill_inputs(const ForwardInput& inputs,
-                              ForwardInput& prefill_inputs);
+                              ForwardInput& prefill_inputs,
+                              bool stage_for_fixed_arena = false);
   bool supports_explicit_spec_verify_replay_update() const;
   bool should_use_explicit_spec_verify_replay_update(
       const ForwardInput& input) const;
@@ -180,10 +211,14 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
   bool use_chunked_prefill_spec_verify_path() const;
 
   // Prepare target validate input from cached target context.
-  void prepare_validate_inputs(const ForwardInput& inputs,
-                               ForwardInput& validate_inputs,
-                               bool static_graph_tasks_prepared = false,
-                               bool record_ready_event = true);
+  void prepare_validate_inputs(
+      const ForwardInput& inputs,
+      ForwardInput& validate_inputs,
+      bool static_graph_tasks_prepared = false,
+      bool record_ready_event = true,
+      bool stage_sampling_on_host = false,
+      const MtpPreparedHostInputWorkspace* fixed_host_workspace = nullptr,
+      specBuilder::DecodeBuildWorkspace* decode_build_workspace = nullptr);
   void prepare_validate_inputs(const ForwardInput& inputs,
                                ForwardInput& validate_inputs,
                                const std::vector<int32_t>& per_seq_val_tokens);
@@ -191,12 +226,18 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
       const ForwardInput& input);
 
   // prepare inputs for draft model at Decode phase.
-  void prepare_draft_inputs(const ForwardInput& inputs,
-                            ForwardInput& draft_inputs,
-                            int32_t position_offset);
+  void prepare_draft_inputs(
+      const ForwardInput& inputs,
+      ForwardInput& draft_inputs,
+      int32_t position_offset,
+      bool stage_for_fixed_arena = false,
+      const MtpPreparedHostInputWorkspace* fixed_host_workspace = nullptr,
+      specBuilder::DecodeBuildWorkspace* decode_build_workspace = nullptr);
   void update_decode_step_input(
       ForwardInput& input,
-      const std::vector<EmbeddingCache::DecodeState>& last_states) const;
+      const std::vector<EmbeddingCache::DecodeState>& last_states,
+      const MtpPreparedHostInputWorkspace* fixed_host_workspace =
+          nullptr) const;
 
   // Build draft-side input from cached target context at decode step start.
   void prepare_draft_extend_inputs(
@@ -204,7 +245,11 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
       const std::vector<EmbeddingCache::DecodeState>& last_states,
       ForwardInput& extend_input,
       bool force_two_rows = false,
-      bool wait_for_compute_stream = true);
+      bool wait_for_compute_stream = true,
+      bool stage_sampling_on_host = false,
+      const torch::Tensor& fixed_embedding_output = torch::Tensor(),
+      const MtpPreparedHostInputWorkspace* fixed_host_workspace = nullptr,
+      specBuilder::DecodeBuildWorkspace* decode_build_workspace = nullptr);
 
   struct PendingTargetContext {
     std::vector<int32_t> embedding_ids;
@@ -324,5 +369,8 @@ class MTPWorkerImpl : public SpeculativeWorkerImpl {
 #if defined(USE_NPU) || defined(USE_MLU)
   std::shared_ptr<KVCacheTransfer> kv_cache_transfer_;
 #endif
+
+ private:
+  class PreparedTaskBackend;
 };
 }  // namespace xllm

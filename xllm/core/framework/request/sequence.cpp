@@ -303,6 +303,8 @@ Sequence::Sequence(const Sequence& other, size_t index)
       mrope_position_delta_(other.mrope_position_delta_),
       output_embedding_(other.output_embedding_),
       mtp_bootstrap_embedding_(other.mtp_bootstrap_embedding_),
+      graph_warmup_speculative_accepted_length_(
+          other.graph_warmup_speculative_accepted_length_),
       num_tokens_(other.num_tokens_),
       token_to_count_map_(other.token_to_count_map_),
       num_prompt_tokens_(other.num_prompt_tokens_),
@@ -354,6 +356,12 @@ void Sequence::record_first_token(const Token& token) {
   t.token_top_tokens = token.top_tokens;
   t.token_top_logprobs = token.top_logprobs;
   first_token_ = std::move(t);
+}
+
+void Sequence::set_graph_warmup_speculative_accepted_length(
+    int32_t accepted_length) {
+  CHECK_GT(accepted_length, 0);
+  graph_warmup_speculative_accepted_length_ = accepted_length;
 }
 
 bool Sequence::try_commit_json_object_token(int32_t token_id,

@@ -145,11 +145,13 @@ class ProfileManager {
   std::shared_ptr<Request> generate_single_decode_request(
       int32_t total_length,
       std::optional<int32_t> dp_rank = std::nullopt,
-      bool is_graph_warmup = true);
+      bool is_graph_warmup = true,
+      int32_t graph_warmup_accepted_length = 1);
   std::shared_ptr<Request> try_generate_single_decode_request(
       int32_t total_length,
       std::optional<int32_t> dp_rank = std::nullopt,
-      bool is_graph_warmup = true);
+      bool is_graph_warmup = true,
+      int32_t graph_warmup_accepted_length = 1);
   int32_t measure_graph_decode_capacity(int32_t configured_max_seqs,
                                         int32_t total_length);
 
@@ -196,7 +198,8 @@ class ProfileManager {
 
   double run_decode_request(const std::vector<int32_t>& total_length_vec);
 
-  double run_graph_decode_request(const std::vector<int32_t>& total_length_vec);
+  double run_graph_decode_request(const std::vector<int32_t>& total_length_vec,
+                                  int32_t graph_warmup_accepted_length);
 
   static const std::vector<ProfileManager::CopyBlockProfile>&
   get_copy_block_profile();

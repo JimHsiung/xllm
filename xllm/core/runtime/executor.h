@@ -24,6 +24,7 @@ limitations under the License.
 #include "framework/model/model_output.h"
 #include "runtime/executor_impl.h"
 #include "runtime/options.h"
+#include "runtime/prepared_executor.h"
 
 namespace xllm {
 
@@ -46,6 +47,18 @@ class Executor final {
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& params);
 
+  void prepare_prepared_graph_input(int32_t slot_id,
+                                    ForwardInput& input,
+                                    std::vector<KVCache>& kv_caches);
+
+  PreparedSlotBinding bind_prepared(int32_t slot_id,
+                                    const ForwardInput& input,
+                                    std::vector<KVCache>& kv_caches);
+
+  ModelOutput forward_prepared(const PreparedSlotBinding& binding,
+                               const ForwardInput& input,
+                               std::vector<KVCache>& kv_caches);
+
   void prepare_graph_input(const torch::Tensor& tokens,
                            const torch::Tensor& positions,
                            std::vector<KVCache>& kv_caches,
@@ -56,6 +69,7 @@ class Executor final {
 
  private:
   std::unique_ptr<ExecutorImpl> impl_;
+  PreparedExecutor* prepared_impl_ = nullptr;
 };
 
 }  // namespace xllm

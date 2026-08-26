@@ -1,0 +1,2444 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="xLLM PreparedTaskPipeline 生产者—消费者执行链路重构方案">
+  <title>xLLM PreparedTaskPipeline 执行链路重构方案</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f3f6fb;
+      --surface: #ffffff;
+      --surface-soft: #f8fafc;
+      --ink: #172033;
+      --muted: #5f6c80;
+      --line: #dbe3ee;
+      --primary: #1958c7;
+      --primary-dark: #103b89;
+      --primary-soft: #eaf1ff;
+      --teal: #087f73;
+      --teal-soft: #e7f7f4;
+      --success: #137a54;
+      --success-soft: #e8f7f0;
+      --warn: #a35b00;
+      --warn-soft: #fff3df;
+      --danger: #a3333d;
+      --danger-soft: #fff0f1;
+      --purple: #6842b8;
+      --purple-soft: #f1edff;
+      --code: #101827;
+      --code-ink: #dce7f8;
+      --shadow: 0 12px 32px rgba(24, 45, 78, 0.08);
+      --radius: 14px;
+      --content: 1120px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html {
+      scroll-behavior: smooth;
+      scroll-padding-top: 20px;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top right, rgba(25, 88, 199, 0.13), transparent 34rem),
+        radial-gradient(circle at 0 38rem, rgba(8, 127, 115, 0.08), transparent 28rem),
+        var(--bg);
+      font-family:
+        Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+        sans-serif;
+      line-height: 1.72;
+    }
+
+    a {
+      color: var(--primary);
+      text-decoration: none;
+    }
+
+    a:hover { text-decoration: underline; }
+
+    code,
+    pre {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    }
+
+    code {
+      padding: 0.12rem 0.34rem;
+      border-radius: 5px;
+      background: #edf2f8;
+      color: #18345f;
+      font-size: 0.92em;
+    }
+
+    pre {
+      overflow-x: auto;
+      margin: 1rem 0;
+      padding: 1rem 1.15rem;
+      border-radius: 10px;
+      background: var(--code);
+      color: var(--code-ink);
+      font-size: 0.89rem;
+      line-height: 1.58;
+      tab-size: 2;
+    }
+
+    pre code {
+      padding: 0;
+      color: inherit;
+      background: transparent;
+      font-size: inherit;
+    }
+
+    .hero {
+      border-bottom: 1px solid rgba(219, 227, 238, 0.9);
+      background: linear-gradient(135deg, #0b214b 0%, #173f84 52%, #1958c7 100%);
+      color: #fff;
+    }
+
+    .hero-inner {
+      width: min(calc(100% - 40px), var(--content));
+      margin: 0 auto;
+      padding: 58px 0 50px;
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      color: #bcd2ff;
+      font-size: 0.82rem;
+      font-weight: 750;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      max-width: 970px;
+      margin: 0;
+      font-size: clamp(2rem, 4.6vw, 3.35rem);
+      line-height: 1.17;
+      letter-spacing: -0.035em;
+    }
+
+    .subtitle {
+      max-width: 930px;
+      margin: 18px 0 0;
+      color: #dce7ff;
+      font-size: 1.08rem;
+    }
+
+    .meta-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 26px;
+    }
+
+    .meta-pill {
+      padding: 6px 11px;
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.09);
+      color: #f4f7ff;
+      font-size: 0.85rem;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 255px minmax(0, 1fr);
+      gap: 28px;
+      width: min(calc(100% - 40px), 1390px);
+      margin: 32px auto 70px;
+      align-items: start;
+    }
+
+    .toc {
+      position: sticky;
+      top: 18px;
+      max-height: calc(100vh - 36px);
+      overflow-y: auto;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, 0.94);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+
+    .toc-title {
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: 0.77rem;
+      font-weight: 800;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .toc ol {
+      margin: 0;
+      padding-left: 1.25rem;
+    }
+
+    .toc li {
+      margin: 0.28rem 0;
+      color: #8a95a6;
+      font-size: 0.86rem;
+      line-height: 1.36;
+    }
+
+    .toc a { color: #34445e; }
+    .toc a.active { color: var(--primary); font-weight: 750; }
+
+    main { min-width: 0; }
+
+    section {
+      margin-bottom: 24px;
+      padding: 30px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    h2 {
+      margin: 0 0 18px;
+      font-size: 1.65rem;
+      line-height: 1.3;
+      letter-spacing: -0.02em;
+    }
+
+    h3 {
+      margin: 1.8rem 0 0.7rem;
+      font-size: 1.18rem;
+      line-height: 1.35;
+    }
+
+    h4 {
+      margin: 1.35rem 0 0.5rem;
+      font-size: 1rem;
+    }
+
+    p { margin: 0.72rem 0; }
+    ul, ol { padding-left: 1.35rem; }
+    li { margin: 0.38rem 0; }
+    .lead { color: #34445e; font-size: 1.05rem; }
+
+    .callout {
+      margin: 1rem 0;
+      padding: 13px 16px;
+      border-left: 4px solid var(--primary);
+      border-radius: 8px;
+      background: var(--primary-soft);
+    }
+
+    .callout.success { border-left-color: var(--success); background: var(--success-soft); }
+    .callout.warn { border-left-color: var(--warn); background: var(--warn-soft); }
+    .callout.danger { border-left-color: var(--danger); background: var(--danger-soft); }
+    .callout.teal { border-left-color: var(--teal); background: var(--teal-soft); }
+
+    .callout strong { display: inline-block; margin-right: 0.2rem; }
+
+    .grid-2,
+    .grid-3,
+    .grid-4 {
+      display: grid;
+      gap: 14px;
+      margin: 1rem 0;
+    }
+
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+    .card {
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: var(--surface-soft);
+    }
+
+    .card h3,
+    .card h4 { margin-top: 0; }
+    .card p:last-child,
+    .card ul:last-child { margin-bottom: 0; }
+
+    .tag {
+      display: inline-block;
+      margin: 0 5px 5px 0;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: var(--primary-soft);
+      color: var(--primary-dark);
+      font-size: 0.78rem;
+      font-weight: 700;
+    }
+
+    .tag.green { color: #0d6847; background: var(--success-soft); }
+    .tag.orange { color: #8c4d00; background: var(--warn-soft); }
+    .tag.red { color: #8b2732; background: var(--danger-soft); }
+    .tag.purple { color: #56369a; background: var(--purple-soft); }
+
+    .table-wrap {
+      overflow-x: auto;
+      margin: 1rem 0;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+      font-size: 0.92rem;
+    }
+
+    th,
+    td {
+      padding: 11px 13px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #f1f5fa;
+      color: #34445e;
+      font-weight: 750;
+      white-space: nowrap;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+
+    .diagram {
+      overflow-x: auto;
+      margin: 1rem 0;
+      padding: 20px;
+      border: 1px solid #cfdbeb;
+      border-radius: 12px;
+      background: linear-gradient(180deg, #f9fbff 0%, #f5f8fc 100%);
+    }
+
+    .flow-row {
+      display: flex;
+      align-items: stretch;
+      gap: 8px;
+      min-width: 760px;
+    }
+
+    .flow-node {
+      flex: 1 1 0;
+      min-width: 120px;
+      padding: 12px 11px;
+      border: 1px solid #b8c8df;
+      border-radius: 10px;
+      background: #fff;
+      text-align: center;
+      box-shadow: 0 5px 14px rgba(33, 65, 110, 0.06);
+    }
+
+    .flow-node strong { display: block; color: #173e78; }
+    .flow-node small { display: block; margin-top: 4px; color: var(--muted); line-height: 1.35; }
+    .flow-node.worker { border-color: #8ccfc7; background: #f1fbf9; }
+    .flow-node.launch { border-color: #b3a0dc; background: #f8f5ff; }
+    .flow-node.device { border-color: #8fb0e6; background: #f3f7ff; }
+
+    .arrow {
+      display: grid;
+      flex: 0 0 24px;
+      place-items: center;
+      color: #7c8da8;
+      font-size: 1.25rem;
+      font-weight: 800;
+    }
+
+    .state-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      margin: 1rem 0;
+      padding: 16px;
+      border-radius: 11px;
+      background: #f6f9fd;
+      border: 1px solid var(--line);
+    }
+
+    .state {
+      padding: 7px 11px;
+      border-radius: 8px;
+      border: 1px solid #b9c9df;
+      background: #fff;
+      color: #21406d;
+      font-size: 0.86rem;
+      font-weight: 760;
+    }
+
+    .state-arrow { color: #8291a8; font-weight: 800; }
+
+    .timeline {
+      display: grid;
+      grid-template-columns: 145px minmax(0, 1fr);
+      gap: 0;
+      margin: 1rem 0;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+    }
+
+    .timeline-label,
+    .timeline-track {
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .timeline-label {
+      background: #f1f5fa;
+      color: #34445e;
+      font-weight: 750;
+    }
+
+    .timeline-track { background: #fff; }
+    .timeline > :nth-last-child(-n + 2) { border-bottom: 0; }
+
+    .bar {
+      display: inline-block;
+      margin: 2px 5px 2px 0;
+      padding: 4px 9px;
+      border-radius: 6px;
+      background: var(--primary-soft);
+      color: var(--primary-dark);
+      font-size: 0.83rem;
+      font-weight: 700;
+    }
+
+    .bar.cpu { background: var(--teal-soft); color: #08695f; }
+    .bar.device { background: var(--purple-soft); color: #553594; }
+    .bar.result { background: var(--warn-soft); color: #865000; }
+
+    .decision {
+      display: grid;
+      grid-template-columns: 145px minmax(0, 1fr);
+      gap: 12px;
+      padding: 13px 0;
+      border-bottom: 1px dashed var(--line);
+    }
+
+    .decision:last-child { border-bottom: 0; }
+    .decision-key { color: var(--muted); font-size: 0.88rem; font-weight: 750; }
+    .decision-value { min-width: 0; }
+
+    .checklist {
+      list-style: none;
+      padding-left: 0;
+    }
+
+    .checklist li {
+      position: relative;
+      padding-left: 1.65rem;
+    }
+
+    .checklist li::before {
+      position: absolute;
+      left: 0;
+      top: 0.07rem;
+      content: "✓";
+      color: var(--success);
+      font-weight: 850;
+    }
+
+    .no-list {
+      list-style: none;
+      padding-left: 0;
+    }
+
+    .no-list li {
+      position: relative;
+      padding-left: 1.65rem;
+    }
+
+    .no-list li::before {
+      position: absolute;
+      left: 0;
+      top: 0.07rem;
+      content: "×";
+      color: var(--danger);
+      font-weight: 850;
+    }
+
+    .phase {
+      display: grid;
+      grid-template-columns: 72px minmax(0, 1fr);
+      gap: 14px;
+      margin: 0.8rem 0;
+      padding: 15px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: var(--surface-soft);
+    }
+
+    .phase-id {
+      display: grid;
+      place-items: center;
+      align-self: start;
+      width: 58px;
+      height: 58px;
+      border-radius: 50%;
+      background: var(--primary);
+      color: #fff;
+      font-weight: 800;
+    }
+
+    .phase h3 { margin: 0 0 5px; }
+    .phase p { margin: 0.35rem 0; }
+
+    details {
+      margin: 0.85rem 0;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: #fff;
+    }
+
+    summary {
+      cursor: pointer;
+      padding: 11px 14px;
+      color: #24446f;
+      font-weight: 760;
+    }
+
+    details > div { padding: 0 14px 13px; }
+
+    .footnote {
+      color: var(--muted);
+      font-size: 0.86rem;
+    }
+
+    footer {
+      width: min(calc(100% - 40px), var(--content));
+      margin: -38px auto 45px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 0.86rem;
+    }
+
+    @media (max-width: 1080px) {
+      .layout { grid-template-columns: 1fr; }
+      .toc { position: static; max-height: none; }
+      .toc ol { columns: 2; }
+      .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 720px) {
+      .hero-inner { padding: 40px 0 36px; }
+      .layout { width: min(calc(100% - 24px), 1390px); margin-top: 18px; }
+      section { padding: 21px 18px; }
+      .toc ol { columns: 1; }
+      .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
+      .decision { grid-template-columns: 1fr; gap: 2px; }
+      .timeline { grid-template-columns: 105px minmax(0, 1fr); }
+      .phase { grid-template-columns: 54px minmax(0, 1fr); }
+      .phase-id { width: 46px; height: 46px; }
+    }
+
+    @media print {
+      body { background: #fff; }
+      .hero { background: #173f84 !important; print-color-adjust: exact; }
+      .layout { display: block; width: 100%; margin: 0; }
+      .toc { display: none; }
+      section { break-inside: avoid; box-shadow: none; }
+      footer { margin-top: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <div class="hero-inner">
+      <p class="eyebrow">xLLM Execution Architecture</p>
+      <h1>PreparedTaskPipeline：面向异步调度的生产者—消费者执行链路重构方案</h1>
+      <p class="subtitle">
+        将一次完整 Prefill/Decode 视为 Task，由 Worker 侧提前完成 CPU 输入准备与 H2D，
+        Launch 侧只提交 Device 算子，从结构上移除 Task 间必须串行执行的 CPU 工作。
+      </p>
+      <div class="meta-row">
+        <span class="meta-pill">状态：主体开发基本完成，进入真实设备集成调测与 Bug 收口</span>
+        <span class="meta-pill">代码基线：main @ 3906f5a914fb</span>
+        <span class="meta-pill">实施分支：feat/prepared-task-pipeline</span>
+        <span class="meta-pill">首版后端：NPU</span>
+        <span class="meta-pill">文档日期：2026-08-26</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="toc" aria-label="目录">
+      <p class="toc-title">目录</p>
+      <ol>
+        <li><a href="#summary">执行摘要</a></li>
+        <li><a href="#background">背景与问题</a></li>
+        <li><a href="#goals">目标与非目标</a></li>
+        <li><a href="#decisions">关键设计决策</a></li>
+        <li><a href="#architecture">总体架构</a></li>
+        <li><a href="#slot">ExecutionSlot</a></li>
+        <li><a href="#timeline">单次异步时序</a></li>
+        <li><a href="#input">输入准备与所有权</a></li>
+        <li><a href="#adapter">Adapter 与 Executor</a></li>
+        <li><a href="#graph">Graph 适配</a></li>
+        <li><a href="#paths">LLM / MTP 路径</a></li>
+        <li><a href="#algorithms">其他投机算法</a></li>
+        <li><a href="#state">跨 Task Device 状态</a></li>
+        <li><a href="#memory">显存与 Buffer</a></li>
+        <li><a href="#output">输出与 Consume</a></li>
+        <li><a href="#lifecycle">生命周期与错误</a></li>
+        <li><a href="#compatibility">支持范围</a></li>
+        <li><a href="#files">代码组织</a></li>
+        <li><a href="#phases">分阶段实施</a></li>
+        <li><a href="#implementation-progress">实施进展</a></li>
+        <li><a href="#validation">验证与验收</a></li>
+        <li><a href="#risks">风险与缓解</a></li>
+        <li><a href="#future">后续大 Graph</a></li>
+      </ol>
+    </nav>
+
+    <main>
+      <section id="summary">
+        <h2>1. 执行摘要</h2>
+        <p class="lead">
+          本方案不改变 Scheduler 的一次异步前推语义，也不重写 xLLM 的模型、KV Cache、Sampler
+          和分布式分层；它只重构 Worker 到 Executor 之间的数据链路。
+        </p>
+
+        <div class="diagram" aria-label="总体数据流">
+          <div class="flow-row">
+            <div class="flow-node">
+              <strong>Scheduler / RPC</strong>
+              <small>产生 ForwardInput，异步模式仍延迟一拍处理请求增删</small>
+            </div>
+            <div class="arrow">→</div>
+            <div class="flow-node worker">
+              <strong>Worker 单线程</strong>
+              <small>Prepare、CPU metadata、H2D、Consume</small>
+            </div>
+            <div class="arrow">→</div>
+            <div class="flow-node launch">
+              <strong>Launch 线程</strong>
+              <small>只做 Event、Graph/Eager/Collective launch</small>
+            </div>
+            <div class="arrow">→</div>
+            <div class="flow-node device">
+              <strong>Device</strong>
+              <small>完整 Prefill/Decode Task 串行执行</small>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid-4">
+          <div class="card">
+            <span class="tag green">核心目标</span>
+            <h3>移除 CPU 临界依赖</h3>
+            <p>Task N 执行期间准备 Task N+1，避免在两个 Device Task 之间构造输入。</p>
+          </div>
+          <div class="card">
+            <span class="tag">异步模式</span>
+            <h3>双 Slot</h3>
+            <p>同步模式 1 Slot，异步模式 2 Slot，严格保持当前只提前一个 Task。</p>
+          </div>
+          <div class="card">
+            <span class="tag purple">执行约束</span>
+            <h3>Launch-only</h3>
+            <p>Executor 热路径不读取 CPU 数据、不动态构造 metadata、不分配输入输出 Buffer。</p>
+          </div>
+          <div class="card">
+            <span class="tag orange">兼容策略</span>
+            <h3>启动时二选一</h3>
+            <p>Legacy 与 Prepared 新链路不热切换；Graph miss 仅回退 Prepared Eager。</p>
+          </div>
+        </div>
+
+        <div class="callout success">
+          <strong>结论：</strong>
+          方案在架构上可行。它能消除 Task 间强制串行的 CPU 输入准备；最终是否出现空泡，取决于
+          Prepare + H2D 是否能在前一 Task 的 Device 执行窗口内完成。
+        </div>
+      </section>
+
+      <section id="background">
+        <h2>2. 背景与当前问题</h2>
+
+        <h3>2.1 当前异步调度已经具备“一步前推”</h3>
+        <p>
+          当前调度在开启 schedule overlap 后，会先提交当前 Batch，再获取上一 Batch 的真实结果。
+          Scheduler 使用 fake token 暂时推进状态，请求结束或取消最多额外执行一次 Task。这与目标中的
+          双 Slot 生产者—消费者模型在底层原理上是一致的。
+        </p>
+
+        <pre><code>Scheduler iteration N:
+  1. schedule_request()            → 构造 Task N
+  2. engine.step(Task N)           → 提交 Task N，立即得到 fake output
+  3. update_last_step_result(N-1)  → 获取并处理 Task N-1 的真实输出</code></pre>
+
+        <h3>2.2 Worker 仍承担 Task 内与 Task 间的动态输入构造</h3>
+        <p>当前路径中，输入转 Device、投机验证输入构造、前一输出修正、部分 Graph 输入更新等工作分散在 Worker 和 Executor 调用前后。</p>
+        <ul>
+          <li><code>WorkerImpl::step_async()</code> 在工作线程执行模型调用和 overlap 修正。</li>
+          <li><code>ForwardInput::to(device)</code> 可能动态创建和转换多组 Tensor。</li>
+          <li>MTP/DFlash 等路径会在 Draft 与 Target 之间继续构造验证输入。</li>
+          <li>部分投机路径存在 Stream synchronize、D2H 读取和基于 Host 结果的后续输入构造。</li>
+        </ul>
+
+        <h3>2.3 空泡来源需要拆分</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>空泡类型</th><th>表现</th><th>本方案能否解决</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Task 间 CPU 输入准备</td>
+                <td>前一 Task 结束后才开始 H2D、metadata 或 Graph 输入绑定</td>
+                <td><span class="tag green">核心解决目标</span></td>
+              </tr>
+              <tr>
+                <td>生产者跟不上</td>
+                <td>Prepare + H2D 时间长于前一 Task 的 Device 时间</td>
+                <td><span class="tag orange">只能观测和继续优化</span></td>
+              </tr>
+              <tr>
+                <td>Eager 逐算子 dispatcher</td>
+                <td>模型内部每个算子仍需要 Host launch</td>
+                <td><span class="tag orange">不由第一阶段消除</span></td>
+              </tr>
+              <tr>
+                <td>Backend / Collective 等待</td>
+                <td>通信或 Stream 依赖造成 Device 等待</td>
+                <td><span class="tag">保留正确依赖，单独定位</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="goals">
+        <h2>3. 目标与非目标</h2>
+
+        <div class="grid-2">
+          <div class="card">
+            <h3>首版必须实现</h3>
+            <ul class="checklist">
+              <li>一次完整 Prefill/Decode 作为一个 Task。</li>
+              <li>Worker 提前准备最终 Device 输入并提交 H2D。</li>
+              <li>Launch 线程只做 Device 命令提交。</li>
+              <li>同步 1 Slot、异步 2 Slot。</li>
+              <li>Graph 与 Prepared Eager 使用同一组固定输入地址。</li>
+              <li>新旧链路启动阶段二选一。</li>
+              <li>固定随机种子下与旧链路确定性对齐。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>首版明确不做</h3>
+            <ul class="no-list">
+              <li>不改变 Scheduler 的 ahead depth。</li>
+              <li>不做服务期新旧链路热切换。</li>
+              <li>不做通用 Patch DAG。</li>
+              <li>不把完整 MTP 捕获成单个大 Graph。</li>
+              <li>不同时改造所有 Device backend。</li>
+              <li>不引入 Task 重试或 Pipeline 失败恢复协议。</li>
+              <li>不承诺所有负载绝对零空泡。</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section id="decisions">
+        <h2>4. 关键设计决策</h2>
+
+        <div class="decision">
+          <div class="decision-key">Task 粒度</div>
+          <div class="decision-value">一次完整 Prefill/Decode；MTP Decode 包含 Draft × N、Target Validate、Rejection 和状态发布。</div>
+        </div>
+        <div class="decision">
+          <div class="decision-key">并发深度</div>
+          <div class="decision-value">同步 1 Slot，异步 2 Slot；与当前只提前一步的 Scheduler 语义一致。</div>
+        </div>
+        <div class="decision">
+          <div class="decision-key">线程模型</div>
+          <div class="decision-value">复用现有 WorkerImpl 单线程作为 Prepare/Consume 状态所有者；新增唯一 Launch 线程。</div>
+        </div>
+        <div class="decision">
+          <div class="decision-key">输入传递</div>
+          <div class="decision-value">保留 <code>const ForwardInput&amp;</code>，Prepare Ack 前短期借用，不复制完整 ForwardInput。</div>
+        </div>
+        <div class="decision">
+          <div class="decision-key">输出语义</div>
+          <div class="decision-value">同步 Future 返回真实输出；异步 Future 只表示提交成功，真实输出由 <code>get_last_step_result()</code> 唯一消费。</div>
+        </div>
+        <div class="decision">
+          <div class="decision-key">Graph 策略</div>
+          <div class="decision-value">Graph replay miss 可回退 Prepared Eager；不允许运行时回退 Legacy Worker 链路。</div>
+        </div>
+        <div class="decision">
+          <div class="decision-key">错误语义</div>
+          <div class="decision-value">首版保持当前 fail-fast，不同时引入 Task 级恢复、重试和跨 Rank 错误协议。</div>
+        </div>
+        <div class="decision">
+          <div class="decision-key">首版范围</div>
+          <div class="decision-value">NPU；普通 LLM、MTP、Eagle3。DFlash/DSpark 作为同架构后续阶段，Suffix 保持 Legacy。</div>
+        </div>
+      </section>
+
+      <section id="architecture">
+        <h2>5. 总体架构与分层</h2>
+
+        <pre><code>Worker                              （外部接口与启动期分流）
+├── WorkerImpl* impl_               （现有模型/KV/Sampler/Legacy step_async）
+└── PreparedTaskPipeline            （新增组合组件）
+    ├── PreparedTaskAdapter         （LLM/MTP/Eagle3 固定 Task 函数）
+    ├── ExecutionSlot[1 or 2]
+    ├── ready_queue                 （Worker → Launch，SPSC）
+    ├── completed_queue             （Launch → Worker，SPSC）
+    ├── output_fifo                 （Consume 后的有序 Host 输出）
+    └── Launch thread
+
+PreparedTaskAdapter
+└── PreparedExecutor               （NPU 首版能力接口）
+    ├── PreparedInputArena[slot_count]
+    ├── Graph binding
+    └── Prepared Eager binding</code></pre>
+
+        <h3>5.1 Worker 作为组合拥有者</h3>
+        <p>
+          <code>PreparedTaskPipeline</code> 放在外层 Worker，而不是塞进 <code>WorkerImpl</code> 基类，
+          也不分别复制到 LLM/MTP 子类。这样 Legacy 的 <code>WorkerImpl::step_async()</code> 可以保持原样。
+        </p>
+
+        <pre><code>Worker::step_async(input) {
+  if (prepared_pipeline_ != nullptr) {
+    return prepared_pipeline_->submit(input);
+  }
+  return impl_->step_async(input);  // Legacy 原路径
+}</code></pre>
+
+        <h3>5.2 单状态所有者</h3>
+        <p>
+          Slot 状态、Prepare 和 Consume 只由 WorkerImpl 单线程修改。RPC、SHM polling、Launch 线程都不能直接重排或回收 Slot。
+          Launch 线程只进行 <code>READY → RUNNING → COMPLETED</code> 所需的 Device 提交，并通过 CompletionTicket 返回结果。
+        </p>
+      </section>
+
+      <section id="slot">
+        <h2>6. ExecutionSlot 与队列</h2>
+
+        <div class="state-row" aria-label="ExecutionSlot 状态机">
+          <span class="state">FREE</span><span class="state-arrow">→</span>
+          <span class="state">PREPARING</span><span class="state-arrow">→</span>
+          <span class="state">READY</span><span class="state-arrow">→</span>
+          <span class="state">RUNNING</span><span class="state-arrow">→</span>
+          <span class="state">COMPLETED</span><span class="state-arrow">→</span>
+          <span class="state">CONSUMING</span><span class="state-arrow">→</span>
+          <span class="state">FREE</span>
+        </div>
+
+        <div class="callout">
+          <strong>READY 的准确含义：</strong>
+          Host 已完成所有运行所需的描述符构造，H2D 已提交，输入不可再由 Host 修改；但 H2D 可以仍在进行，
+          Launch 通过 Event 在 Device Stream 上建立依赖。
+        </div>
+
+        <h3>6.1 Slot 主要内容</h3>
+        <div class="grid-2">
+          <div class="card">
+            <h4>Pipeline 通用字段</h4>
+            <ul>
+              <li><code>slot_id</code> 与 Debug-only <code>task_seq_no</code></li>
+              <li><code>TaskKind</code></li>
+              <li><code>h2d_ready_event</code></li>
+              <li><code>task_output_event</code></li>
+              <li><code>host_output_ready_event</code></li>
+              <li><code>reuse_fence</code></li>
+              <li>最小 Host source lease</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Adapter / Executor 字段</h4>
+            <ul>
+              <li>PreparedInputArena lease</li>
+              <li>固定 Invocation binding</li>
+              <li>算法专属 DeviceStepState</li>
+              <li><code>predecessor_row</code> Device 映射</li>
+              <li>最小 D2H 输出 Buffer</li>
+            </ul>
+          </div>
+        </div>
+
+        <h3>6.2 有界 SPSC</h3>
+        <ul>
+          <li><code>ready_queue</code>：唯一生产者为 Worker 状态线程，唯一消费者为 Launch 线程。</li>
+          <li><code>completed_queue</code>：唯一生产者为 Launch 线程，唯一消费者为 Worker 状态线程。</li>
+          <li>容量与 Slot 数一致；首版不设计超过一步的可配置 ahead depth。</li>
+          <li><code>task_seq_no</code> 仅用于 Debug FIFO 断言，不进入 RPC、ForwardInput 或 Release 热路径。</li>
+        </ul>
+      </section>
+
+      <section id="timeline">
+        <h2>7. 单次异步 Decode 时序</h2>
+
+        <div class="timeline" aria-label="异步时序">
+          <div class="timeline-label">Scheduler</div>
+          <div class="timeline-track">
+            <span class="bar">构造 Task N</span>
+            <span class="bar">等待 Prepare Ack</span>
+            <span class="bar result">GetLast(N-1)</span>
+            <span class="bar">处理真实输出</span>
+          </div>
+
+          <div class="timeline-label">Worker 线程</div>
+          <div class="timeline-track">
+            <span class="bar cpu">Prepare N</span>
+            <span class="bar cpu">H2D enqueue N</span>
+            <span class="bar cpu">READY + Ack</span>
+            <span class="bar result">Consume N-1</span>
+          </div>
+
+          <div class="timeline-label">Launch 线程</div>
+          <div class="timeline-track">
+            <span class="bar device">取 READY N</span>
+            <span class="bar device">提交完整 Task N</span>
+            <span class="bar result">提交 D2H</span>
+          </div>
+
+          <div class="timeline-label">Device</div>
+          <div class="timeline-track">
+            <span class="bar device">Execute N-1</span>
+            <span class="bar device">Execute N</span>
+          </div>
+        </div>
+
+        <h3>7.1 Prepare Ack</h3>
+        <p>Prepare Ack 在以下条件全部满足后返回：</p>
+        <ol>
+          <li>所有 CPU metadata 已构造或复制到 Slot 所有的存储；</li>
+          <li>所有输入 H2D 已提交到 <code>prepare_stream</code>；</li>
+          <li>已记录 <code>h2d_ready_event</code>；</li>
+          <li>异步 DMA 源由 Slot 持有，原始 ForwardInput 不再被访问；</li>
+          <li>Task 已发布为 READY。</li>
+        </ol>
+        <p><strong>Ack 不等待 H2D 完成，也不做 Host synchronize。</strong></p>
+
+        <h3>7.2 Future 语义</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>模式</th><th><code>step_async()</code> Future</th><th>真实输出入口</th></tr></thead>
+            <tbody>
+              <tr><td>同步 / 1 Slot</td><td>Task Consume 后返回真实 ForwardOutput</td><td>Future</td></tr>
+              <tr><td>异步 / 2 Slot</td><td>Prepare Ack 后成功结束，不承载真实输出</td><td><code>get_last_step_result()</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="input">
+        <h2>8. 输入准备、H2D 与所有权</h2>
+
+        <h3>8.1 保持 const 引用接口</h3>
+        <pre><code>step_async(const ForwardInput&amp; input)
+  → enqueue PrepareCommand{&amp;input}
+  → calling thread waits Prepare Ack
+  → Worker never accesses input after Ack</code></pre>
+
+        <p>
+          该设计不深拷贝整个 ForwardInput，也不要求把所有上层接口改成按值或右值传递。
+          Ack 等待替代了原实现中调用方同步执行 <code>prepare_work_before_execute()</code> 的生命周期保证。
+        </p>
+
+        <h3>8.2 Host source lease</h3>
+        <p>Slot 只保留异步 DMA 真正需要的 Host 资源：</p>
+        <ul>
+          <li>Pinned packed input buffer；</li>
+          <li>可能跨 Ack 继续被 DMA 读取的 Tensor storage；</li>
+          <li>来自 SHM、可能被下一 step 覆盖的必要稳定副本。</li>
+        </ul>
+
+        <p>
+          首版允许复用当前稳定化逻辑，但目标是将逐 step <code>clone()</code> 收敛为 Slot 级可复用 Pinned Staging Arena，
+          并用 <code>prepare_cpu_latency</code> 和 Host allocation 指标判断是否需要进一步重构 Scheduler 输出格式。
+        </p>
+
+        <h3>8.3 Stream 与 Event</h3>
+        <div class="grid-3">
+          <div class="card">
+            <h4>prepare_stream</h4>
+            <p>Worker 提交 H2D 和不依赖前驱 Device 输出的输入更新。</p>
+          </div>
+          <div class="card">
+            <h4>task_stream</h4>
+            <p>完整 Task 串行执行。Task 内 Draft、Target、Patch 和通信均按顺序提交。</p>
+          </div>
+          <div class="card">
+            <h4>result_stream</h4>
+            <p>等待 Task 输出 Event 后提交最小 D2H，不阻塞下一 Task 的 task_stream。</p>
+          </div>
+        </div>
+
+        <p>
+          同一 <code>task_stream</code> 内依赖使用 FIFO；只有跨 Stream 才使用 Event。
+          Device Event wait 是 Stream 依赖命令，不是计算 Kernel，也不能退化为 Host synchronize。
+        </p>
+      </section>
+
+      <section id="adapter">
+        <h2>9. Adapter 与 PreparedExecutor</h2>
+
+        <h3>9.1 三阶段 Adapter</h3>
+        <pre><code>class PreparedTaskAdapter {
+ public:
+  virtual TaskKind classify(const ForwardInput&amp;) = 0;
+
+  virtual void prepare(const ForwardInput&amp;,
+                       ExecutionSlot&amp;,
+                       PrepareContext&amp;) = 0;
+
+  virtual void launch(ExecutionSlot&amp;,
+                      LaunchContext&amp;) = 0;
+
+  virtual ForwardOutput consume(ExecutionSlot&amp;) = 0;
+};</code></pre>
+
+        <ul>
+          <li>Pipeline 只管理 Slot、队列、生命周期和 Promise。</li>
+          <li>Adapter 只描述一次完整 Task 的固定逻辑调用。</li>
+          <li>Graph/Eager、ACL 类型、Graph cache 和 Arena 绑定都封装在 Executor 侧。</li>
+        </ul>
+
+        <h3>9.2 独立 PreparedExecutor 能力</h3>
+        <p>不直接扩展所有现有 ExecutorImpl，避免其他 backend 被迫提供空实现。</p>
+
+        <pre><code>class PreparedExecutor {
+ public:
+  virtual PreparedSlotBinding bind_prepared(
+      int32_t slot_id,
+      int32_t invocation_index,
+      const PreparedInvocationDescriptor&amp; descriptor) = 0;
+
+  virtual void launch_prepared(
+      const PreparedSlotBinding&amp; binding,
+      Stream&amp; task_stream) = 0;
+};</code></pre>
+
+        <div class="callout teal">
+          <strong>边界说明：</strong>
+          <code>bind_prepared()</code> 在 Worker Prepare 阶段调用，可以进行 CPU key 计算和绑定；
+          <code>launch_prepared()</code> 才属于 Executor 消费热路径，必须是 launch-only。
+        </div>
+
+        <h3>9.3 Launch 阶段允许与禁止</h3>
+        <div class="grid-2">
+          <div class="card">
+            <h4>允许</h4>
+            <ul class="checklist">
+              <li>固定 <code>switch</code> / <code>for</code></li>
+              <li>Stream Event wait / record</li>
+              <li>Graph replay</li>
+              <li>Prepared Eager 算子提交</li>
+              <li>Collective / broadcast launch</li>
+              <li>框架 dispatcher 必需的 Host 控制</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>禁止</h4>
+            <ul class="no-list">
+              <li><code>.item()</code>、D2H 读取或 Host synchronize</li>
+              <li>依据 Device 数据做 CPU 分支</li>
+              <li>动态构造 metadata 或替换 Tensor 字段</li>
+              <li>运行期分配输入输出 Device Buffer</li>
+              <li>修改 Scheduler、Request 或 BlockManager</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section id="graph">
+        <h2>10. Graph 适配</h2>
+
+        <h3>10.1 统一最终输入 Arena</h3>
+        <pre><code>PreparedExecutor
+└── PreparedInputArena[slot_count]
+    ├── Slot 0: tokens / positions / block tables / sampling / state
+    └── Slot 1: tokens / positions / block tables / sampling / state</code></pre>
+
+        <p>
+          Worker 直接 H2D 到最终 Arena。Graph 和 Prepared Eager 都消费这些地址，不采用
+          “ExecutionSlot Buffer → Graph persistent Buffer”的整份 D2D 路径。
+        </p>
+
+        <p>启动期为字段选择固定布局策略：</p>
+        <ul>
+          <li><code>DIRECT_BIND</code>：Graph/Eager 直接绑定 Arena 字段；</li>
+          <li><code>DEVICE_PATCH</code>：由前驱状态生成或修正少量字段；</li>
+          <li><code>DEVICE_PACK</code>：确有布局变换需求时，由固定 Kernel 写最终地址。</li>
+        </ul>
+
+        <h3>10.2 显式 Slot，而不是隐式轮转</h3>
+        <p>
+          Legacy ACL Graph 继续保持当前 <code>next_replay_slot_</code> 隐式轮转。
+          Prepared 新路径显式传入 <code>slot_id</code>，一次 MTP Task 中 Draft 与 Target 必须使用同一个逻辑 Slot：
+        </p>
+
+        <pre><code>Task(slot=0):
+  draft_graph.bind(slot=0)
+  target_graph.bind(slot=0)
+
+Task(slot=1):
+  draft_graph.bind(slot=1)
+  target_graph.bind(slot=1)</code></pre>
+
+        <h3>10.3 Graph fallback</h3>
+        <ul>
+          <li>Prepare 阶段计算 Graph key、查询启动期已捕获的 Graph 并绑定。</li>
+          <li>Graph miss 只影响单次模型 Invocation，可回退 Prepared Eager。</li>
+          <li>一次 MTP Task 可以出现 <code>Draft Graph × N → Target Eager</code>。</li>
+          <li>服务期间不做 lazy/background capture。</li>
+          <li>不允许运行时从 Prepared Pipeline 回退 Legacy Worker 执行。</li>
+        </ul>
+      </section>
+
+      <section id="paths">
+        <h2>11. LLM 与 MTP 固定执行路径</h2>
+
+        <h3>11.1 顶层 TaskKind</h3>
+        <pre><code>enum class TaskKind {
+  PREFILL_LIKE,  // PREFILL / CHUNKED_PREFILL / MIXED
+  DECODE,
+  EMPTY,
+};</code></pre>
+
+        <p>算法类型由启动时选择的 Adapter 决定，不在 Task 热路径增加 MTP/Eagle3/DFlash 类型判断。</p>
+
+        <h3>11.2 普通 LLM</h3>
+        <pre><code>LLM PREFILL_LIKE / DECODE:
+  wait(h2d_ready_event)
+  → model forward
+  → lm_head / sampling
+  → publish LLMPreparedState
+  → result D2H</code></pre>
+
+        <h3>11.3 MTP Prefill</h3>
+        <pre><code>Target Prefill
+→ Target lm_head / Sampling
+→ Device Patch：token + embedding
+→ Draft Prefill
+→ Draft 状态更新
+→ 发布 MTPPreparedState</code></pre>
+
+        <p>
+          Target 输出不能先 D2H 再由 CPU 构造 Draft Prefill 输入。Target token 和 embedding 必须在 Device 上直接写入 Draft 的最终 InputArena。
+        </p>
+
+        <h3>11.4 MTP Decode</h3>
+        <pre><code>Task continuation patch
+→ Draft step 0
+→ MTP_NEXT_DRAFT patch
+→ Draft step 1
+→ ...
+→ Draft step N-1
+→ MTP_TARGET_VERIFY patch
+→ Target Validate
+→ Rejection Sampling
+→ MTP_PUBLISH_STEP_STATE
+→ 最小结果 D2H</code></pre>
+
+        <p>固定语义入口：</p>
+        <pre><code>TASK_CONTINUATION
+MTP_PREFILL_TO_DRAFT
+MTP_NEXT_DRAFT
+MTP_TARGET_VERIFY
+MTP_PUBLISH_STEP_STATE</code></pre>
+
+        <p>
+          常用路径争取融合为单 Kernel；特殊路径可以是固定小型 Kernel 序列。首版不设计通用 Patch DAG。
+          当前 <code>mtp_async_input_builder.cpp</code> 中运行期的 <code>arange/stack/to/zeros_like</code> 等动态 Device Tensor 操作需要改造成预分配输出与固定 Patch。
+        </p>
+
+        <h3>11.5 EMPTY</h3>
+        <p>
+          EMPTY 仍需参加必要的分布式 collective。输入使用启动期固定 fake input，不在 Launch 阶段临时创建 Tensor。
+        </p>
+      </section>
+
+      <section id="algorithms">
+        <h2>12. 其他投机算法适配</h2>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>算法</th><th>Task 拓扑</th><th>适配判断</th><th>计划</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><strong>Eagle3</strong></td>
+                <td>MTP 拓扑；Target aux hidden 为 3H，并做 draft→target token 映射</td>
+                <td>无架构性障碍，可复用 MTP Adapter 主体</td>
+                <td><span class="tag green">阶段 5</span></td>
+              </tr>
+              <tr>
+                <td><strong>DFlash</strong></td>
+                <td>一次 Block Draft → Target Validate → Context-KV 写入</td>
+                <td>需移除当前 Validate 后 D2H/synchronize，并在 Device 生成 Context-KV 写入索引</td>
+                <td><span class="tag orange">阶段 6</span></td>
+              </tr>
+              <tr>
+                <td><strong>DSpark</strong></td>
+                <td>DFlash + 固定 N 轮 Markov sampling / broadcast</td>
+                <td>固定循环可 launch-only，但需预分配循环 Tensor 和 Sampling descriptor</td>
+                <td><span class="tag orange">阶段 6</span></td>
+              </tr>
+              <tr>
+                <td><strong>Suffix</strong></td>
+                <td>CPU suffix tree 根据上一 Task 的真实接受 token 生成下一组 Draft</td>
+                <td>与完整提前 Prepare 存在根本依赖；除非将 suffix cache/search 迁移 Device</td>
+                <td><span class="tag red">保持 Legacy</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          <strong>Suffix 为什么不能直接接入：</strong>
+          Task N+1 的 CPU suffix 查询必须等待 Task N 的真实接受 token，而异步 Pipeline 要在消费 N 之前完成 N+1 Prepare。
+          使用旧历史会改变提案语义，等待 D2H 则重新引入 Device 空泡。
+        </div>
+      </section>
+
+      <section id="state">
+        <h2>13. 跨 Task Device 状态与 KV Block</h2>
+
+        <h3>13.1 predecessor_row</h3>
+        <p>请求在相邻 Task 间可能新增、删除和重排，不能假设 row index 保持不变。</p>
+
+        <pre><code>Task C row 0 ← Task B row 0
+Task C row 1 ← Task B row 2
+Task C row 2 ← -1              // NEW_REQUEST</code></pre>
+
+        <p>
+          映射由 Scheduler/Batch 构造 ForwardInput 时顺手生成，避免 Worker 再做 request_id 字符串哈希扫描。
+          Device Patch gather 继续请求的状态；新请求保留 Worker 已写入的初始值。
+        </p>
+
+        <h3>13.2 Adapter 专属 DeviceStepState</h3>
+        <div class="grid-2">
+          <div class="card">
+            <h4>LLMPreparedState</h4>
+            <ul>
+              <li>next token</li>
+              <li>sampled row</li>
+              <li>valid mask</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>MTPPreparedState</h4>
+            <ul>
+              <li>accepted tokens / accepted length</li>
+              <li>tail token / previous token</li>
+              <li>tail embedding / previous embedding</li>
+              <li>position offset</li>
+            </ul>
+          </div>
+        </div>
+
+        <p>
+          Eagle3 使用 3H embedding 布局；DFlash/DSpark 后续定义 Context-KV 专属状态。Pipeline 不解释这些字段，只持有 Slot 与 Event。
+        </p>
+
+        <p>
+          speculative Publish 必须提交完整 verify width，而不是只提交当前有效前缀；第 0 列始终有效，后续无效列必须构成连续 suffix。
+          因而单步 accepted length 的闭区间为 <code>[1, verify_width]</code>。Host 模板已经包含第 0 个提交 token，前驱状态相对模板的
+          额外推进量仅为 <code>[0, verify_width - 1]</code>，所以 expanded Target Verify 使用
+          <code>q_max_seq_len - 1</code> 作为 KV plan headroom。MTP/Eagle3 与 DFlash/DSpark 的 State Publish 均强制输入 width
+          精确等于启动期 <code>accepted_token_capacity</code>；MTP Backend 还要求该容量精确等于模型最大 verify width，避免容量、
+          Arena 布局和 attention plan 上界发生静默偏差。
+        </p>
+
+        <p>
+          DeepSeek-V4 multi-manager 的下标语义固定为“存在的角色按 <code>SWA → C4 → C128</code> 排列”。Scheduler 导出、
+          Engine manager 初始化、模型 <code>group_infos</code> 与 Prepared Device staging 必须使用同一顺序；缺少某个 compression
+          role 时允许跳过该角色，但不允许改变剩余角色的相对顺序。metadata builder 会拒绝 C128-before-C4、重复 ratio、非 token
+          compression group 或非 SWA 的 manager 0，Prepared Block-Spec 还要求输入 manager 数量精确等于 Target 模型的角色集合。
+        </p>
+
+        <h3>13.3 KV Block 生命周期</h3>
+        <ul>
+          <li>Scheduler/BlockManager 仍是唯一分配者。</li>
+          <li>Device Patch 只消费已准备好的 block table，不申请 Block。</li>
+          <li>已提交 Task 引用的 Block 必须延迟释放，直到对应 Slot 安全退休。</li>
+          <li>Executor 不参与 Block 分配、抢占或回收决策。</li>
+          <li>复用现有 schedule-overlap lookahead 最坏情况预留，覆盖最多额外执行一个 Task。</li>
+        </ul>
+
+        <h3>13.4 reuse_fence</h3>
+        <p>
+          后继 Task 读取完前驱 DeviceStepState 后，在 <code>task_stream</code> 记录 <code>reuse_fence</code>。
+          Slot 再次进入 PREPARING 前，<code>prepare_stream</code> 等待该 Fence；Host 不同步等待。
+        </p>
+      </section>
+
+      <section id="memory">
+        <h2>14. 显存与 Buffer 规划</h2>
+
+        <h3>14.1 双 Slot 只复制跨 Task 并存数据</h3>
+        <ul>
+          <li>Draft / Target 最终输入 Arena；</li>
+          <li>block table、predecessor mapping；</li>
+          <li>算法专属 DeviceStepState；</li>
+          <li>最小 Device/Host 输出；</li>
+          <li>Event 与 backend 必需的 slot-local Graph pool。</li>
+        </ul>
+
+        <h3>14.2 Task 内共享一份串行 Workspace</h3>
+        <ul>
+          <li>N 轮 Draft 历史与临时 logits；</li>
+          <li>Target logits；</li>
+          <li>Rejection scratch；</li>
+          <li>activation、sampling、communication workspace。</li>
+        </ul>
+
+        <pre><code>Prepared memory ≈
+  slot_count × (input arena + step state + minimal result)
+  + one shared task workspace
+  + backend-required graph-local pool</code></pre>
+
+        <p>
+          不保存 N 份完整 ForwardOutput，不在运行期扩容 Device Buffer。所有上限由启动配置的最大 batch、最大 token、
+          block-table width 和 speculative width 推导。
+        </p>
+      </section>
+
+      <section id="output">
+        <h2>15. 输出、D2H 与 Consume</h2>
+
+        <pre><code>task_stream records task_output_event
+→ result_stream waits task_output_event
+→ async D2H into slot-local pinned output
+→ host_output_ready_event
+→ CompletionTicket
+→ Worker Consume
+→ output_fifo
+→ get_last_step_result()</code></pre>
+
+        <ul>
+          <li>只 D2H Host 真正需要的数据；DeviceStepState 不为下一 Task 做 D2H。</li>
+          <li>Worker 等待 Host output Event、转换输出并回收 Slot。</li>
+          <li>首版不增加 completion thread、Host Callback 或忙轮询。</li>
+          <li>异步正常 Consume 由 <code>get_last_step_result()</code> 驱动。</li>
+          <li>WorkerService 的 fake-token 行为和外部 RPC 接口保持不变。</li>
+        </ul>
+
+        <div class="callout success">
+          <strong>关键顺序：</strong>
+          Worker 必须先把 Task N 发布为 READY，再等待和消费 Task N-1。这样 Host Consume 与 Device Execute(N) 重叠，
+          不会阻塞两个 Device Task 之间的提交。
+        </div>
+      </section>
+
+      <section id="lifecycle">
+        <h2>16. 生命周期与错误语义</h2>
+
+        <h3>16.1 固定配置下复用同一 Pipeline</h3>
+        <div class="state-row">
+          <span class="state">CREATED</span><span class="state-arrow">→</span>
+          <span class="state">RUNNING</span><span class="state-arrow">↔</span>
+          <span class="state">QUIESCENT</span><span class="state-arrow">→</span>
+          <span class="state">STOPPED</span>
+        </div>
+
+        <ul>
+          <li><code>quiesce()</code>：pause/preempt 前通过正常 GetLast 收回在途 Task，使所有 Slot 回到 FREE。</li>
+          <li><code>resume()</code>：重新开放同一个 Pipeline，不重新分配 Arena、不重绑 Graph。</li>
+          <li><code>shutdown()</code>：停止新 Task，安全退休已提交 Device 操作并销毁资源。</li>
+          <li>不设计通用 DrainPolicy，也不向 TaskKind 添加 STOP/DRAIN 控制 Task。</li>
+        </ul>
+
+        <h3>16.2 首版保持 fail-fast</h3>
+        <p>
+          当前 xLLM 大量使用 <code>CHECK</code>，ThreadPool runnable 也没有统一异常捕获与 Promise 错误传播。
+          本次性能数据链路重构不同时扩展为 Task 重试或 Pipeline 恢复项目。
+        </p>
+        <ul>
+          <li>Prepare、Launch、Device、Collective、Consume 的非预期错误记录 Task 阶段与 Slot 后 Fatal。</li>
+          <li>不在某一 Rank 重试已可能进入 Collective 的 Task。</li>
+          <li>正常请求取消、结束、Graph miss 不属于执行失败。</li>
+          <li>不允许运行时切换回 Legacy 继续服务。</li>
+        </ul>
+      </section>
+
+      <section id="compatibility">
+        <h2>17. 支持范围与启动限制</h2>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>能力</th><th>Prepared 首版</th><th>处理方式</th></tr></thead>
+            <tbody>
+              <tr><td>NPU 普通 LLM</td><td>支持</td><td>阶段 1–3</td></tr>
+              <tr><td>NPU MTP</td><td>支持</td><td>阶段 4</td></tr>
+              <tr><td>NPU Eagle3</td><td>支持</td><td>阶段 5</td></tr>
+              <tr><td>NPU DFlash / DSpark</td><td>静态宽度后续支持</td><td>阶段 6</td></tr>
+              <tr><td>Graph miss</td><td>支持</td><td>单 Invocation 回退 Prepared Eager</td></tr>
+              <tr><td>JSON grammar</td><td>不支持</td><td>启动阶段使用 Legacy</td></tr>
+              <tr><td>Adaptive pruning</td><td>不支持</td><td>启动阶段使用 Legacy</td></tr>
+              <tr><td>Suffix</td><td>不支持</td><td>使用 Legacy</td></tr>
+              <tr><td>运行期 update_weights</td><td>不支持</td><td>Prepared 模式明确拒绝</td></tr>
+              <tr><td>CUDA / MUSA / MLU / DCU</td><td>首版不支持</td><td>启动阶段使用 Legacy</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>
+          配置全部在启动阶段决定，不做功能热开关。一个实例一旦启用 Prepared Pipeline，就不会在服务期切换到 Legacy；
+          后续删除 Legacy 时，只需移除 Worker 分流与旧 <code>WorkerImpl::step_async()</code>。
+        </p>
+      </section>
+
+      <section id="files">
+        <h2>18. 代码组织与改动边界</h2>
+
+        <h3>18.1 建议新增文件</h3>
+        <pre><code>xllm/core/runtime/prepared_task/
+├── prepared_task_types.h
+├── prepared_task_pipeline.h
+├── prepared_task_pipeline.cpp
+├── prepared_task_adapter.h
+├── llm_prepared_task_adapter.h
+├── llm_prepared_task_adapter.cpp
+├── mtp_prepared_task_adapter.h
+├── mtp_prepared_task_adapter.cpp
+├── eagle3_prepared_task_adapter.h
+└── eagle3_prepared_task_adapter.cpp
+
+xllm/core/runtime/
+├── prepared_executor.h
+├── acl_prepared_executor.h
+└── acl_prepared_executor.cpp</code></pre>
+
+        <h3>18.2 重点修改文件</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>位置</th><th>改动</th><th>边界</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><code>worker.h/.cpp</code></td>
+                <td>持有 Pipeline；启动期选择；step/get-last 分流</td>
+                <td>Legacy WorkerImpl 路径保持原样</td>
+              </tr>
+              <tr>
+                <td><code>worker_impl.h/.cpp</code></td>
+                <td>提供窄化的 Worker 单线程命令提交能力</td>
+                <td>不把 Prepared 状态机塞进基类</td>
+              </tr>
+              <tr>
+                <td><code>executor.h/.cpp</code></td>
+                <td>暴露可选 PreparedExecutor capability</td>
+                <td>现有 ExecutorImpl::run() 不变</td>
+              </tr>
+              <tr>
+                <td><code>acl_graph_executor_impl.*</code></td>
+                <td>显式 Slot 绑定、Arena 直绑、Prepared Graph/Eager binding</td>
+                <td>Legacy 隐式 Graph Slot 轮转继续保留</td>
+              </tr>
+              <tr>
+                <td><code>mtp_async_input_builder.*</code></td>
+                <td>动态 Tensor 操作改为预分配输出与固定 Device Patch</td>
+                <td>不构建通用 Patch DAG</td>
+              </tr>
+              <tr>
+                <td>Batch / Scheduler 构造</td>
+                <td>顺手生成 predecessor_row</td>
+                <td>不感知 Slot、Graph、Adapter</td>
+              </tr>
+              <tr>
+                <td><code>ExecutionConfig</code></td>
+                <td>增加 Prepared Pipeline 启动参数与兼容性校验</td>
+                <td>默认 Legacy，首版 NPU</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <details>
+          <summary>当前代码锚点</summary>
+          <div>
+            <ul>
+              <li><code>xllm/core/runtime/worker.cpp</code>：WorkerImpl 类型选择与外层转发。</li>
+              <li><code>xllm/core/runtime/worker_impl.cpp::step_async</code>：Legacy async/overlap 主路径。</li>
+              <li><code>xllm/core/scheduler/continuous_scheduler.cpp::step_with_schedule_overlap</code>：先 Step、后 GetLast 的一步前推顺序。</li>
+              <li><code>xllm/core/runtime/acl_graph_executor_impl.cpp</code>：当前 GraphSlot 与隐式 replay slot 轮转。</li>
+              <li><code>xllm/core/framework/speculative/mtp_async_input_builder.cpp</code>：现有 MTP 动态输入构造。</li>
+              <li><code>xllm/core/runtime/dflash_worker_impl.cpp</code>：当前 Validate 后同步、D2H 与 Context-KV Host 构造。</li>
+              <li><code>xllm/core/runtime/suffix_worker_impl.cpp</code>：CPU suffix tree 与真实输出依赖。</li>
+            </ul>
+          </div>
+        </details>
+      </section>
+
+      <section id="phases">
+        <h2>19. 分阶段实施计划</h2>
+
+        <div class="phase">
+          <div class="phase-id">1</div>
+          <div>
+            <h3>普通 LLM · Prepared Eager · 1 Slot</h3>
+            <p>打通 Prepare/Launch/Consume，验证同步语义、输入 Arena 和 launch-only 边界。</p>
+            <span class="tag">正确性基座</span><span class="tag">无 Graph</span>
+          </div>
+        </div>
+
+        <div class="phase">
+          <div class="phase-id">2</div>
+          <div>
+            <h3>普通 LLM · Prepared Eager · 2 Slot</h3>
+            <p>接入现有异步 Scheduler，验证 fake token、输出 FIFO、Prepare(N+1)/Execute(N) 重叠。</p>
+            <span class="tag green">首次验证 Task 间空泡</span>
+          </div>
+        </div>
+
+        <div class="phase">
+          <div class="phase-id">3</div>
+          <div>
+            <h3>NPU Graph</h3>
+            <p>显式 Slot、固定 Arena 直绑、Graph replay/Prepared Eager fallback，验证无整份 D2D。</p>
+            <span class="tag purple">Graph</span><span class="tag">固定地址</span>
+          </div>
+        </div>
+
+        <div class="phase">
+          <div class="phase-id">4</div>
+          <div>
+            <h3>纯 MTP</h3>
+            <p>实现 MTP Prefill 与 Decode 固定函数、DeviceStepState、predecessor_row 和 Device Patch；先 Eager 后 Graph。</p>
+            <span class="tag green">核心投机路径</span>
+          </div>
+        </div>
+
+        <div class="phase">
+          <div class="phase-id">5</div>
+          <div>
+            <h3>Eagle3</h3>
+            <p>复用 MTP Adapter，增加 3H aux-hidden 布局与 Device token-id mapping。</p>
+            <span class="tag">MTP 变体</span>
+          </div>
+        </div>
+
+        <div class="phase">
+          <div class="phase-id">6</div>
+          <div>
+            <h3>DFlash / DSpark 静态宽度</h3>
+            <p>独立 Block-Spec Adapter，移除当前 Task 内 D2H/synchronize，Device 更新 Context KV。</p>
+            <span class="tag orange">独立 Adapter</span><span class="tag red">不含 Adaptive</span>
+          </div>
+        </div>
+
+        <div class="callout">
+          每个阶段都在启动参数后独立启用和验收。未完成的算法继续走 Legacy，避免一次大改动混合 Pipeline、Graph 和算法问题。
+        </div>
+      </section>
+
+      <section id="implementation-progress">
+        <h2>实施进展（2026-08-26）</h2>
+
+        <div class="callout success">
+          <strong>当前结论：</strong>
+          阶段 1–6 的主体功能、固定 Prepared 执行链路与离线验收基础设施已基本完成，当前工作重心已转入
+          真实 NPU 集成调测、确定性与 Graph replay/trace 验收，以及由真实模型链路暴露问题后的 Bug 修复收口。
+          在 MTP、Eagle3、DFlash/DSpark 的真实请求 E2E 和四个生产/Graph 门禁全部通过前，仍不得宣告最终交付完成。
+          已在 <code>feat/prepared-task-pipeline</code> 分支完成阶段 1 的代码闭环，并完成阶段 2 的
+          双 Slot、异步 Scheduler 与输出 FIFO 代码接入。阶段 3 已接入独立 PreparedExecutor capability、
+          显式 Graph Slot 绑定、启动期 capture / replay 决策及 Prepared Eager fallback，并通过 NPU 条件编译和
+          无设备单测。阶段 4 已落地 Worker 专属 MTP Backend/factory、按 Invocation 固定 Arena 分区、
+          Draft/Target/EMPTY 固定绑定、prepare stream 主输入 staging、固定 Draft token matrix、固定 greedy rejection workspace
+          及 Prefill <code>index_select_out</code>；阶段 5 已复用 MTP 的 3H embedding Arena/State，并以固定地址
+          <code>index_select_out</code> 完成 Eagle3 draft→target token mapping。阶段 6 第一版代码闭环已经完成：独立
+          Block-Spec Plan/Adapter、DFlash/DSpark Worker Backend/factory、固定模型输入输出、Device Context-KV write、
+          DSpark 固定 N 轮 Markov sample/broadcast workspace 与 <code>bias_out</code> 均已接线；DSpark Query/Target
+          分别按 N/N+1 cache-slot 几何绑定。MTP 与 Block-Spec Launch 也已统一绑定各自明确的 compute stream，
+          continuation、rejection、state publish、Context-KV patch/write 和完成 Event 保持同一流顺序。最新相关回归为
+          Prepared 84/84、Graph warmup 29/29、Embedding Cache 8/8、Batch 56/56、Spec Input 31/31、MTP Async 31/31、Sampler 21/21（另有 3 项 MLU-only 用例跳过）、step comparator 14/14、真实 NPU DSA 11/11
+          与 ACL Graph 35/35 全部通过；Qwen3-0.6B Prepared Graph 严格单/双 Slot E2E 的推理与 Graph 正确性已完成
+          14/14 响应、441/441 Decode step 精确对照以及两个 Slot 的 capture/replay 地址门禁，但随后复核发现首轮 runner
+          漏报四个服务在 teardown 阶段的 pybind GIL abort，因此干净进程生命周期仍待加固 runner 下的完整复验；
+          Prepared DSA patch/cache-scatter 的 warmed MSTX 区间也已确认 CANN 物理 allocation 为 0。普通 LLM Worker 生成的 supplemental metadata、DP/EP padding、EPLB、expanded verify、
+          MTP shifted token、greedy sampling control 以及 penalty/token-stat sampling metadata 也已收敛到固定 Arena/Host staging；Graph token override 与 Arena
+          token source 保持同源并校验地址稳定性。Arena 的 Device source 已由整份 Plan 宽泛许可收敛为逐字段显式声明，
+          当前仅外部 <code>input_embedding</code> 与 MTP bootstrap embedding 可进入 D2D；普通 metadata 意外落到 Device
+          会在 Prepare 阶段拒绝。已被 Arena 重绑的旧 attention packed buffer 会立即释放，只有仍实际持有外部历史状态地址时才保留
+          Device owner。Arena H2D 已进一步改为只复制连续 Host source 区间，完整跳过显式 Device source 的对齐占位，避免先用
+          Host 零数据覆盖目标再执行 D2D；实际 H2D 字节数与 copy 次数均可观测。Worker 已具备 cache allocation 成功后的
+          MTP/Eagle3/DFlash/DSpark speculative Prepared
+          延迟构造接线，但生产启动门禁尚未启用这些工厂；Graph 与 speculative 启动门禁均保留。普通 LLM 的真实
+          Qwen3-0.6B Eager E2E 已完成：Legacy、Prepared 单 Slot、Prepared 双 Slot 均为 7/7 请求通过，Prepared 与
+          Legacy 的 14/14 个可比请求在 content、usage 和 metadata 上精确一致，阶段 2 的普通 LLM 正确性闭环已通过。
+          Prepared Graph 底层 capability 已在真实 NPU 上完成 35/35 回归：启动期 capture、同一显式 Slot/Arena replay、
+          runtime miss Prepared Eager 以及 capture/replay hidden states 一致性均已实际执行。普通 LLM Prepared Eager 双 Slot
+          也已完成真实稳态 msprof 验收：同形状预热后采集窗口内无 CANN Host/Device allocation，Prepared Arena D2D 为零，
+          Prepare/Launch/Consume 与 H2D 指标逐项一致，并确认 Prepare 与真实 Device Task 重叠。DeepSeek-V4 MTP 真实 E2E
+          的 Legacy 基线已在三个验收轮次中保持 5/5 请求、3960 tokens 通过；最新 step-audit 轮次从 8 个 rank
+          采集到 632 条逐 step 状态记录。Prepared 单 Slot 按预期被仍为 false 的 speculative 生产门禁在启动期拒绝，
+          尚未执行模型请求；临时验证门禁开启后的完整 server 构建虽已通过，但执行 E2E 前外部任务重新占满 NPU，
+          因此立即恢复门禁为 false。随后进一步补齐 Prepared MTP Consume 的逐 step trace hook；本轮又为
+          Eagle3 增加可审计的算法标识，为 DFlash/DSpark 补齐 Legacy/Prepared Consume 后的通用逐 step trace、
+          多 rank 严格比较器和单/双 Slot runner；阶段 3 也新增普通 LLM greedy Decode 逐 step trace、Graph capture/replay
+          指标门禁及 Qwen Graph 单/双 Slot runner，并于 22:09:24–22:10:46 完成最新 gated 全量重构建。随后又将
+          Prepared MSTX marker/metrics 一致性、稳态 CANN allocation、整份 Arena D2D、双 Slot overlap、Graph replay
+          和地址稳定性固化为自动 trace 验收器，现有普通 LLM R8 真实 trace 回放通过；普通 LLM 无 profiler
+          A/B 也已具备交替运行顺序、逐请求正确性和成对中位数性能门禁 runner。新增多 rank trace Python/runner 后又于
+          22:47:53–22:48:40 完成当前 gated 源码的最新增量入口构建验证，三个 Ninja 目标均确认无待编译 C++ 变更；
+          22:33:08–22:34:00 的 Prepared C++ 聚焦回归仍为 58/58。进一步完成 speculative 多 rank trace 的
+          rank→PID/metrics 采集、单库/多库按 PID 过滤、逐 rank 验收与聚合门禁，既有 R8 真 trace 的默认/显式 PID
+          分析结果与原报告逐字段一致。普通 Qwen Worker Graph 首轮真实 E2E 已暴露并修复两个阶段 3 问题：
+          初次 capture 将 synthetic warmup 的 KV=16 paged-attention tiling 固化后错误 replay 到真实 Decode；现已由
+          <code>prepare_paged_attention_tiling_host()</code> 逐 step 生成 Host tiling，并通过最终 Slot Arena 直接 H2D 到固定地址。
+          修复后 Legacy、Prepared 单 Slot、Prepared 双 Slot 的最终响应均为 7/7，两个候选合计 14/14 个响应在
+          content、usage 与 metadata 上精确一致，434 个共有逐 step 状态也全部一致。旧 runner 中双 Slot 每请求多出的
+          1 个 step 来自将 schedule-overlap 候选错误地对照非 overlap Legacy，并非允许宽松忽略的模型差异；所有普通、MTP、
+          Eagle3、DFlash/DSpark 与 speculative Graph runner 现均按相同 schedule-overlap 语义建立各自 Legacy 基线，且显式关闭
+          prefix cache。随后补齐每个 Graph bucket 在双 Slot Prepared 模式下执行两次 warmup，使 Slot 0/1 分别捕获完整 shape
+          集合；专项回归 25/25 通过。MTP 与 DFlash 的每个 speculative 叶 invocation 也会在 Arena staging 前生成逐 step
+          Graph tiling，固定 speculative partition 地址契约已由 Prepared 59/59 覆盖。随后为要求
+          <code>requires_graph_forward_metadata()</code> 的模型增加每个 Graph 实例独立、持久的 metadata state：capture 前在
+          Prepare stream 创建并填充，replay binding 每 step 原位刷新同一地址；<code>metadata_ready_event</code> 统一后移到
+          Graph binding/metadata Device 更新提交完成之后。普通 Decode 因此不再被一概排除，但
+          <code>is_spec_verify</code>、hybrid 和 Device-authoritative DSA 仍保持显式 Graph fail-fast。新增地址稳定与 replay/eager
+          一致性用例已在真实 NPU 上执行通过：完整 <code>acl_graph_executor_test</code> 增至 35/35，验证 capture/replay
+          Prepare 次数、Graph-local metadata 地址稳定及 replay/eager 输出一致。随后继续实现
+          Device-authoritative DSA 的 Graph 固定 workspace 合同：metadata builder 不构造 stale Host geometry，model capture 内
+          只提交 fixed out/in-place geometry patch，Graph key/replay 对所有外部 manager table、geometry output 与 scratch 的
+          layout 和底层地址做完整身份校验。该路径受独立的
+          <code>kPreparedDeviceDsaGraphE2EValidated=false</code> 门禁保护，尚未进入 capability；CPU-only Graph builder 用例 1/1
+          已执行通过。当前源码在两个生产门禁和该 DSA 子门禁均关闭时，于 2026-08-26 00:23:03–00:28:53 完成完整构建，
+          随后无需设备的 Prepared 59/59 与 Graph warmup 25/25 回归均再次实际执行通过。为执行上述双 Slot warmup 修复后的
+          Qwen Graph 严格复验，普通 Graph 门禁曾在独立验证窗口临时开启，并于 00:38:16–00:40:31 完成 server/export/all-tests
+          构建；runner 启动前的全空闲预检发现外部 PID 539652、539655、539657–539669、539671 已占用全部 16 张卡，
+          因而正确以退出码 75 停止，未创建 <code>20260826-prepared-graph-e2e-double-slot-warmup-fix</code> 结果目录，也未启动、
+          终止或干预任何服务。普通 Graph 门禁随即恢复为 false，并在三个门禁均关闭的最终源码上于
+          00:43:37–00:46:00 再次完成标准 <code>python setup.py build</code>：顶层退出码 0、无失败标记，server、export module
+          与 all-tests 目标均成功，产物时间分别为 00:45:37 与 00:45:47。设备继续被占用期间，下一阶段已建立 dormant 的
+          speculative Target Verify direct-bind 合同：<code>PreparedInputArena</code> 只在 token、position、query/KV lengths、
+          cache slots/table、linear-state 与 accepted-token metadata 全部进入同一固定 Slot Arena，且 token 数、uniform verify
+          width 与 Host/Device 行数严格一致时设置 <code>prepared_spec_verify_direct_bind</code>；同时清除 Legacy graph-update
+          source 标记并拒绝外部 draft token source、预提交 static task、expanded/hybrid verify 与 multi-manager 输入。
+          Executor 侧实现已编译，但由独立 <code>kPreparedSpecVerifyGraphE2EValidated=false</code> 门禁保持 dormant，不会扩大当前
+          production capability。新增两项 CPU-only 合同测试后，Prepared 聚焦回归增至 61/61，Graph warmup 仍为 25/25。
+          四个门禁全部关闭的源码于 01:11:32–01:16:51 再次完成标准 <code>python setup.py build</code>，顶层退出码 0、无失败
+          标记，server、export module 与 all-tests 目标均成功；server 于 01:13:40 staged（515,555,744 字节），export module
+          于 01:15:16 生成（528,160,152 字节）。设备占用期间又完成 expanded/hybrid Target Verify 的下一阶段实现：Prepared
+          Host 根据 sequence-scoped query/KV lengths 一次构造 tokenwise expanded KV，主 block table 按模型最大 verify 容量固定
+          padding，并以 CPU dense copy 生成 tokenwise block rows；paged indptr/indices/last-page-len 使用固定容量布局，由同一 Slot
+          Arena 一次 H2D。Launch patch 已修正 chunked-prefill 主 KV 为每 sequence 最后一个 verify token 的长度，同时在固定地址
+          原位更新 tokenwise expanded KV、paged indptr、compact indices、last-page-len 和 cache slots；paged indices 的后半容量仅承接
+          invalid scatter tail，Graph 只由 indptr 消费前半有效前缀。Arena 合同进一步校验 expanded rows、固定 block 宽度、paged shape、
+          <code>query_start_loc</code>、linear-state、accepted-token metadata 与逐 token Host KV 值，且所有动态 Tensor 必须同属一个 Slot。
+          ACL Graph 为每个 attention plan class 独立持有 graph-local tiling storage，plan class 进入 Prepared Graph key；动态 tiling update
+          在 capture/replay 提交前执行，运行期未知 plan class 保守选择 Prepared Eager。hybrid causal-conv 的 static signature 也进入 key，
+          capture 建立 <code>AclGraphTaskUpdateContext</code>，Prepare stream 先 signal task-ready Event，再记录 invocation metadata-ready Event，
+          replay 强制验证该预提交状态。上述实现仍由
+          <code>kPreparedSpecVerifyGraphE2EValidated=false</code> 保持 dormant。
+
+          本轮聚焦回归为 Prepared 62/62、MTP Async 23/23、Graph warmup 25/25、ACL Graph 35/35，全部命令退出码为 0；其中新增
+          expanded Arena 两轮地址/layout 稳定测试及 query-start、逐 token KV、paged shape 三类负向合同，并验证 chunked Target Verify
+          的 sequence/tokenwise KV 与 paged metadata 全部原位更新。四个门禁全部关闭的源码于 01:57:49–02:02:47 再次执行标准
+          <code>python setup.py build</code>，准确退出码为 0，main server、export module 与 all-tests 目标均完成；稳定 server 于
+          02:00:06 staged（515,622,176 字节），Python export module 于 02:01:31 生成（528,161,048 字节），日志
+          <code>20260826-prepared-expanded-verify-full-build.log</code> 无失败标记，<code>git diff --check</code> 通过。
+
+          随后补齐 predecessor KV 的 attention-plan headroom 合同：Prepared expanded verify 将最大可能前驱推进量显式记录为
+          <code>q_max_seq_len - 1</code>，Graph plan lookup、key 与 capture/replay tiling update 统一使用
+          “Host 模板最大 KV + headroom”的保守上界；若该闭区间跨越 block endpoint/attention plan bucket，或超过模型
+          <code>max_position_embeddings</code>，Prepare 阶段直接选择 Prepared Eager，不进入 Graph capture/replay。Arena 同时要求
+          expanded direct-bind 的 headroom 精确等于 verify width - 1，非 expanded direct-bind 必须为 0。新增 bucket endpoint、跨 bucket、
+          非法 headroom/block size 合同后，<code>acl_graph_bucket_policy_test</code> 为 5/5、Prepared 为 62/62、ACL Graph 为 35/35，
+          均实际执行通过。四个门禁全部关闭的源码随后完成标准完整构建，退出码 0；稳定 server 于 02:24:21 staged
+          （515,621,960 字节），export module 于 02:25:53 生成（528,160,832 字节），日志
+          <code>20260826-prepared-spec-verify-plan-headroom-full-build.log</code> 无失败标记。
+
+          在此基础上又关闭了 expanded attention 的陈旧 Host runtime source：<code>expanded_kv_seq_lens_vec</code> 在 Prepared
+          direct-bind 中只保留为 plan/headroom 模板，<code>ExpandedDecodeMetadataBuilder</code> 不再据其构造运行时 CPU Tensor/vector；
+          Prepared Eager 与 Graph 的 attention metadata 均直接引用 predecessor continuation 原位更新后的 Slot Arena
+          <code>expanded_kv_seq_lens</code>。两轮 staging 合同确认地址/layout 不变、Host runtime mirror 为空且第二轮动态 KV 值被消费；
+          非 direct-bind 对照仍保留原 Host metadata。Prepared 62/62 与 MTP async input builder 8/8 均实际执行通过。最终源码于
+          02:38:35–02:43:27 再次完成标准 <code>python setup.py build</code>，退出码 0，server/export/all-tests 全部编译完成；
+          稳定 server 于 02:40:29 staged（515,621,960 字节），export module 于 02:41:54 生成（528,160,832 字节），日志
+          <code>20260826-prepared-device-authoritative-expanded-kv-full-build.log</code> 无失败标记，<code>git diff --check</code> 通过。
+
+          随后完成 continuation accepted-length/headroom 静态审计并把推导固化为运行时合同：Prepared greedy rejection 即使首个
+          draft token 被拒绝也保证第 0 列有效，后续无效列为连续 suffix，因此 accepted length 为
+          <code>[1, verify_width]</code>；Host 模板已包含该提交 token，前驱相对模板只会额外推进
+          <code>[0, verify_width - 1]</code>，既有 <code>q_max_seq_len - 1</code> plan headroom 没有少算。
+          MTP/Eagle3 与 DFlash/DSpark Publish 现在都要求 accepted-token 输入为完整固定宽度，MTP 启动期进一步要求
+          <code>accepted_token_capacity == max_verify_width</code>；expanded Target Verify Prepare 同时校验
+          <code>q_max_seq_len == accepted_token_capacity</code> 与 headroom 精确等于 capacity - 1。首 token 拒绝、全接受、
+          Publish 短宽度以及容量/verify width 不一致的正负向用例接入后，<code>sampler_test</code> 为 19/19（另有 3 个既有
+          MLU-only 跳过）、<code>mtp_async_state_test</code> 为 24/24、<code>prepared_task_pipeline_test</code> 为 64/64，命令均退出 0。
+          四个门禁保持 false 的最终源码于 03:03:26–03:05:56 再次执行标准 <code>python setup.py build</code>，准确退出码为 0；
+          main server、export module 与 all-tests 三个 Ninja 目标分别完成到 1/1、2/2、49/49。稳定 server 于 03:04:21 staged
+          （515,622,056 字节），Python export module 于 03:04:31 生成（528,160,928 字节）；日志
+          <code>20260826-prepared-accepted-headroom-full-build.log</code> 未命中失败标记，
+          <code>git diff --check --ignore-submodules=all</code> 通过。该验证仍属于代码合同与构建回归，不替代真实 speculative E2E。
+
+          下一离线阶段消除了 DeepSeek-V4 multi-manager 的隐式注册顺序依赖。Scheduler 侧原本已按固定
+          <code>SWA → C4 → C128</code> 角色导出，但 Engine 与模型 metadata 曾按 <code>compress_ratios</code> 首次出现顺序注册；
+          当配置先出现 C128、后出现 C4 时，相同 manager 下标会在两侧代表不同角色。现在 Engine manager 初始化、
+          <code>deepseek_v4_build_cache_specs()</code> 与模型 <code>group_infos</code> 均按规范角色顺序构造；
+          <code>validate_dsa_group_order()</code> 在普通和 Device-authoritative metadata 路径 fail-fast，Prepared Block-Spec 也要求
+          manager 数量精确等于 Target 模型的 SWA/C4/C128 角色集合。新增 canonical subset 正向测试和 C128-before-C4 death test 后，
+          <code>prepared_task_pipeline_test</code> 于 03:21:29 完成 66/66，退出码 0。最终源码于 03:22:18–03:24:49 再次运行标准
+          <code>python setup.py build</code>，退出码 0，main、export、all-tests 分别完成到 1/1、2/2、50/50；稳定 server 于
+          03:23:16 staged（515,622,440 字节），export module 于 03:23:26 生成（528,161,320 字节）。日志
+          <code>20260826-prepared-manager-role-order-full-build.log</code> 无失败标记，
+          <code>git diff --check --ignore-submodules=all</code> 通过。该阶段解决下标语义和 fail-fast，不替代真实 compressor E2E。
+          随后将规范 token-manager 角色顺序提炼为轻量公共 helper
+          <code>canonical_dsa_token_manager_ratios()</code>，Engine、<code>deepseek_v4_build_cache_specs()</code> 与模型
+          <code>group_infos</code> 共用同一实现。反序/重复配置 <code>{128,4,1,128}</code> 的聚焦合同确认输出恒为
+          <code>{4,128}</code>；测试不再直接包含带静态模型注册的 <code>deepseek_v4.h</code>，从而消除重复 factory/args-loader
+          注册告警。<code>prepared_task_pipeline_test</code> 于 03:46:47 完成 22 个 suite 的 67/67，退出码 0；日志
+          <code>20260826-prepared-canonical-manager-helper-pipeline-test.log</code> 未命中失败或重复注册标记。随后于
+          03:47:17–03:49:49 运行标准 <code>python setup.py build</code>，顶层退出码 0，main、export、all-tests 分别完成到
+          1/1、2/2、56/56；稳定 server 于 03:48:13 staged（515,622,232 字节），export module 于 03:48:23 生成
+          （528,161,104 字节）。日志 <code>20260826-prepared-canonical-manager-helper-full-build.log</code> 无失败标记。
+
+          03:55 前后设备出现稳定全空闲窗口后，普通 Graph 门禁仅在独立验证构建中临时开启，Qwen3-0.6B、seed=1234、greedy
+          的严格单/双 Slot r1 完成两组 Legacy 与两组 Prepared Graph 推理：均为 7/7 请求、11,334 tokens；14/14 个可比响应的
+          content、usage、metadata 全部精确一致，单 Slot 217/217 与双 Slot 224/224、合计 441/441 个 Decode step 精确一致。
+          单 Slot Graph capture/replay 为 4/31，双 Slot为 8/32，address mismatch 均为 0，结果目录为
+          <code>20260826-prepared-graph-e2e-strict-r1</code>。但运行结束后重新扫描完整日志发现，旧 runner 在 cleanup 前完成 fatal
+          扫描且忽略 <code>wait</code> 状态，四个服务均在正常注销 API/Collective/Worker server 后触发
+          <code>pybind11::handle::dec_ref() PyGILState_Check() failure</code> 并 abort；因此 r1 的响应、逐 step 与 Graph 指标成立，
+          但 runner 顶层退出 0 和“fatal marker 为空”属于生命周期漏报，不能计作干净 E2E 退出。
+
+          进程退出路径已在 <code>run()</code> 返回、Master/Engine 销毁后重新获取并保留主线程 GIL，使更晚的 torch/pybind
+          静态对象析构持有有效 GIL；<code>20260826-prepared-python-teardown-full-build.log</code> 对应标准构建退出 0，main 2/2，
+          export 与 all-tests 均确认 no work，稳定 server 于 04:10:20 staged（515,622,480 字节）。外部
+          <code>run_standalone_case.sh</code> 同时改为先显式停止并 <code>wait</code>、记录 <code>shutdown_exit</code>，再扫描
+          pybind/terminate/fatal marker。r2 首个 Legacy 单 Slot仍为 7/7 请求和 11,334 tokens，日志已不再出现 pybind abort，
+          API/Collective/Worker server 均完成注销；但进程被原 10 秒清理窗口判为仍存活并强杀，结果
+          <code>shutdown_exit=137</code>，所以 <code>20260826-prepared-graph-e2e-strict-r2</code> 按预期整体失败且未继续后续 case，
+          不能作为生命周期通过证据。runner 随后将 shutdown 窗口参数化为默认 60 秒，识别 zombie 后立即 <code>wait</code> 回收，
+          并处理 <code>/proc</code> 消失竞态；<code>20260826-prepared-runner-zombie-reap-check-r2.log</code> 的模拟正常退出子进程
+          验证为 <code>zombie_reap_status=0</code>。后续审计又发现 readiness 的 900 秒轮询仍直接使用 <code>kill -0</code>，
+          若服务在 ready 前成为 zombie 会被误判为存活并无谓等待到超时；该循环现复用同一个
+          <code>process_is_running()</code>，一旦观察到 <code>/proc/&lt;pid&gt;/stat</code> 状态 <code>Z</code> 即 fail-fast。
+          14 个相关 runner 全部通过 <code>bash -n</code>；离线 fork 的真实 zombie fixture 被判定为停止，仍存活的父进程被判定为运行。
+
+          r3 临时门禁构建 <code>20260826-prepared-graph-e2e-strict-r3-gate-build.log</code> 再次退出 0，但构建结束时严格空闲预检
+          检测到 16 个 NPU 活跃上下文，因而在启动任何服务、创建结果目录前停止；未绕过预检，也未终止或干预占卡任务。
+          普通 Graph 门禁随即恢复 false，并于 04:40:22–04:42:38 完成最终标准构建：main、export、all-tests 均成功，顶层退出码 0；
+          稳定 server 于 04:42:13 staged（515,622,480 字节），export module 于 04:42:23 生成（528,161,104 字节），日志
+          <code>20260826-prepared-graph-e2e-strict-r3-final-gated-build.log</code> 无失败标记。最终 gated 产物随后再次执行
+          <code>prepared_task_pipeline_test</code>，22 个 suite 的 67/67 用例全部通过，命令退出码 0，日志
+          <code>20260826-prepared-python-teardown-final-pipeline-test.log</code> 未命中失败或重复注册标记。阶段 3 的普通 Qwen Graph 推理、逐 step
+          与 capture/replay 正确性已经闭环，但完整 clean lifecycle 必须在下一全空闲窗口用加固后的 runner 重跑四个 case，要求全部
+          <code>shutdown_exit=0</code> 且 cleanup 后 fatal marker 为空后才能闭环。expanded/hybrid speculative 的 predecessor 动态接受长度、
+          graph-local tiling/workspace 与 Legacy 数值一致性仍需真实模型验证，四种 speculative 算法 E2E、逐 step 确定性对照及其
+          allocation/D2D/overlap trace 尚未完成。<code>kSpeculativePreparedPipelineE2EValidated</code>、
+          <code>kPreparedGraphE2EValidated</code>、<code>kPreparedSpecVerifyGraphE2EValidated</code> 与
+          <code>kPreparedDeviceDsaGraphE2EValidated</code> 继续保持 false，Legacy 仍为默认路径。
+
+          随后闭环 static hybrid MTP Target Verify Graph 的动态 accepted-length 启动预热缺口。该 Graph key 包含
+          <code>num_accepted_tokens</code>，而旧 synthetic warmup 只构造 accepted length=1，运行时长度
+          <code>2..verify_width</code> 无法命中已捕获 Graph，只能回退 Prepared Eager。现在仅对 NPU hybrid MTP
+          按 accepted length 外层、Slot 内层确定性枚举所有变体：verify width=4 时单 Slot 顺序为
+          <code>1,2,3,4</code>，双 Slot为 <code>1,1,2,2,3,3,4,4</code>；普通 LLM、非 hybrid 与非 speculative
+          的 warmup 次数保持不变。动态长度已从 <code>Sequence</code> 贯通 <code>BatchInputMeta</code>、
+          <code>BatchInputBuilder</code>、Prepared/普通 <code>ForwardInput</code>、shared-memory serialization，最终进入
+          MTP bootstrap <code>EmbeddingCache</code>；synthetic warmup 同步构造 position/correction offset、previous-row topology
+          与 <code>all_draft_accepted</code>，确保每个固定地址 Slot 的 cache 状态与对应 key 一致。专项回归分别为
+          <code>profile_graph_warmup_test</code> 29/29、<code>embedding_cache_test</code> 8/8、
+          <code>batch_test</code> 56/56、<code>prepared_task_pipeline_test</code> 67/67，命令均退出 0。四个门禁保持 false 的源码
+          随后完成标准 <code>python setup.py build</code>，顶层退出码 0，main、export 与 all-tests 均完成；稳定 server
+          为 515,622,816 字节（05:21:44），export module 为 528,161,448 字节（05:23:12），日志
+          <code>20260826-prepared-hybrid-accepted-warmup-final-build.log</code> 未命中失败标记，
+          <code>git diff --check --ignore-submodules=all</code> 通过。该闭环解决离线 variant 覆盖，不替代真实 hybrid
+          capture/replay 数值、地址与 runtime Graph 命中验证。最新检查仍有外部 PID 1286019–1286034 占用全部 16 张 NPU，
+          每个上下文约 59,568 MiB；未启动服务，也未终止或干预外部任务。
+
+          在全变体预热之上又补齐了真实 E2E 的逐 rank 可追溯门禁。原 speculative Graph runner 只校验聚合
+          capture/replay 计数，无法证明每个 accepted length 和每个固定 Slot 均被启动期捕获；ACL Graph Executor 现在为
+          hybrid linear-attention Target Verify 输出 <code>event=prepared_speculative_graph_execution</code> verbose trace，逐次记录
+          mode、Slot、Graph key、warmup 标志、accepted length、verify width 与 static-task 预提交状态。新增
+          <code>validate_prepared_speculative_graph_trace.py</code> 按 rank 强制每个 <code>(Slot, accepted length)</code> 恰好启动期
+          capture 一次、运行期不得 capture、replay 必须已预提交 static task 且以相同 Graph key 可追溯到对应 warmup capture；
+          <code>run_prepared_speculative_graph_e2e.sh</code> 可通过
+          <code>VALIDATE_HYBRID_ACCEPTED_GRAPH_VARIANTS=true</code> 对单/双 Slot 的全部 rank 启用严格校验。初版 validator 专项 5/5、
+          标准容器内完整 <code>tests/scripts</code> discovery 43/43、<code>prepared_task_pipeline_test</code> 22 个 suite 的
+          67/67 均通过，命令退出码均为 0。四个门禁保持 false 的源码于 05:39:22–05:41:22 完成最终标准
+          <code>python setup.py build</code>，顶层退出码 0，main、export 与 all-tests 49/49 目标完成；稳定 server 为
+          515,623,096 字节（05:40:56），export module 为 528,161,728 字节（05:41:06），日志
+          <code>20260826-prepared-graph-variant-trace-final-build.log</code> 未命中失败标记。最新容器侧资源复核仍显示上述 16 个
+          外部 PID 占满设备，每个上下文约 59,576 MiB；未启动或干预任何服务，因此该门禁仍待下一全空闲窗口以真实 trace 验收。
+          随后的离线审计发现初版 provenance 只按 Slot/accepted-length 配对，同配对但不同 Graph key 的 replay 可能误通过；现已把
+          capture/replay Graph key 集合写入报告并强制 replay key 必须实际由该配对启动期捕获。新增负向用例后专项为 6/6，容器内
+          完整脚本 discovery 为 44/44，命令退出码均为 0。继续审计后又要求同一 Slot 的不同 accepted length 必须使用不同
+          Graph key，并为 duplicate capture、verify-width/Slot/accepted-length 越界、warmup replay 和无 capture 的 runtime replay
+          补齐负向覆盖；最终专项为 10/10，容器内完整脚本 discovery 为 48/48，命令退出码均为 0。
+
+          阶段 6 的模型资源准备也取得新进展：共享目录中发现
+          <code>/mnt/cfs/9n-das-admin/llm_models/Qwen3-8B</code> 与
+          <code>/mnt/cfs/9n-das-admin/llm_models/Qwen3-8B-DFlash-b16</code>。target/draft 的 hidden size=4096、
+          attention heads=32、KV heads=8、head dim=128、vocab=151,936 与 max position=40,960 全部一致；draft architecture 为
+          <code>DFlashDraftModel</code>，mask token 151,669 落在 vocab 内，5 个 target layer id 也都落在 target 36 层范围。
+          使用该真实配对执行 <code>run_prepared_block_spec_e2e.sh</code> 资源预检时，runner 在创建结果目录和启动服务前准确退出 75，
+          <code>20260826-prepared-dflash-qwen3-8b-resource-preflight</code> 未生成，日志
+          <code>20260826-prepared-dflash-qwen3-8b-resource-preflight.log</code> 记录的仍是外部 PID 1286019–1286034；未干预设备。
+          该结果把“缺少 checkpoint”收敛为“真实执行等待 NPU”，不能计作 DFlash Legacy 或 Prepared E2E 通过。
+
+          随后将这组手工核对固化为可执行的启动前合同。新增公共 <code>safetensors_manifest.py</code>，只读取 index 与 shard
+          header、不 materialize tensor payload，并统一校验 index 引用 shard 全部存在且不会越出 checkpoint 目录；MTP/Eagle3
+          validator 已切换到该公共实现并保持专项 19/19。<code>validate_block_spec_checkpoint_pair.py</code> 在加载权重和 NPU 资源检查前
+          验证 target/draft 路径不同、权重存在、DFlash/DSpark draft 类型、hidden/vocab 一致、target 总层数声明、capture layer 为唯一
+          合法整数且不越界、Draft 层数等于 capture 数、mask/noise token 落在 draft vocab 内，以及 checkpoint block size 合法；同时
+          兼容 Qwen3.5 的嵌套 <code>text_config</code> 和 DeepSeek-V4 DSpark 字段别名。DFlash 进一步按真实 loader 固化 Target 的
+          <code>model.*</code>/<code>model.language_model.*</code> 前缀、embedding/final norm/首末层 norm/LM head shape，以及 Draft 的根/
+          <code>model.</code> 双前缀、5H <code>fc</code> capture、hidden/final norm 和所有 Draft 层 attention/MLP/norm 键与 shape；报告显式
+          记录 Target/Draft shard 数和 Draft 复用 Target embedding/LM head。该门禁已接入 Eager
+          <code>run_prepared_block_spec_e2e.sh</code>、Graph <code>run_prepared_speculative_graph_e2e.sh</code>、
+          profiler <code>run_prepared_task_pipeline_trace.sh</code> 与 Eager/Graph
+          <code>run_prepared_speculative_trace_matrix.sh</code> 四条真实工作流。专项先增至 17/17，容器内完整
+          <code>tests/scripts</code> discovery 先增至 84/84；Prepared 核心 67/67 与 registry 3/3 也再次通过。真实
+          Qwen3-8B/<code>Qwen3-8B-DFlash-b16</code> 与 Qwen3.5-27B/<code>Qwen3.5-27B-DFlash</code> 两组配对均为 28/28；
+          Target/Draft shard 数分别为 5/1 与 11/1，Draft <code>fc</code> shape 分别为 [4096,20480] 与 [5120,25600]，五层逐层
+          attention/MLP/norm shape 全部匹配。报告仍为 <code>20260826-qwen3-8b-dflash-checkpoint-pair.json</code> 与
+          <code>20260826-qwen35-27b-dflash-checkpoint-pair.json</code>。四类 runner 的八次顺序复验全部满足错误 DSpark 配对在设备检查前
+          退出 1、正确 DFlash 配对先通过 28 项合同再因 16 个外部进程退出 75，八个结果目录全部不存在；日志统一使用
+          <code>20260826-block-spec-weight-contract-{eager,graph,trace,matrix}-{invalid,valid}.log</code>。最终标准构建退出 0，server 当次
+          staging 成功且 export/all-tests 均无失败，日志为 <code>20260826-prepared-block-spec-weight-contract-build.log</code>。真实运行一旦
+          越过空闲检查并创建目录，Eager、Graph 与 trace runner 都会写入 <code>checkpoint-pair.json</code> 保存模型合同证据。
+
+          继续资源审计后又发现三组真实 Qwen3 DSpark 配对：Qwen3-4B/8B/14B Target 分别对应
+          <code>dspark_qwen3_4b_block7</code>、<code>dspark_qwen3_8b_block7</code> 与 <code>dspark_qwen3_14b_block7</code>。审计首先发现真实
+          Draft architecture 为 <code>Qwen3DSparkModel</code>，旧 validator 会误报算法错配；现已支持该 runtime alias，并在继承 DFlash
+          backbone 全部合同的基础上强制两个 Markov 矩阵均为 [vocab,markov_rank]，按
+          <code>confidence_head_with_markov</code> 验证 confidence projection input width，允许 runtime 支持的可选 bias，并支持 4B
+          <code>tie_word_embeddings=true</code> 时由 Target embedding 提供 LM head。专项增至 21/21、完整脚本 discovery 增至 88/88。
+          三组真实配对均为 32/32，Target/Draft shard 数分别为 3/1、5/1、8/1；markov rank 均为 256，confidence weight 分别为
+          [1,2816]、[1,4352]、[1,5376]。JSON 报告为 <code>20260826-qwen3-{4b,8b,14b}-dspark-checkpoint-pair.json</code>。
+          四类 runner 又完成八次 DSpark 顺序复验：错误 DFlash 配对退出 1、正确 DSpark 配对通过 32 项合同后因同一批 16 个外部进程
+          退出 75，八个结果目录均不存在；日志统一使用
+          <code>20260826-qwen3-dspark-weight-contract-{eager,graph,trace,matrix}-{invalid,valid}.log</code>。最终标准构建再次退出 0，日志为
+          <code>20260826-prepared-qwen3-dspark-weight-contract-build.log</code>。
+
+          DeepSeek-V4 DSpark 还有独立于 Qwen backbone 的 <code>mtp.*</code> loader 合同。真实 Target
+          <code>DeepSeek-V4-Flash</code> 与 Draft <code>DeepSeek-V4-Flash-0731-w8a8</code> 的 config 都声明 43 层主干，但 runtime 会把
+          三个 <code>dspark_target_layer_ids</code> 映射为有效 Draft 层数 3；旧 validator 直接比较 43 与 3 会误拒绝，现已与
+          <code>configure_deepseek_v4_dspark_args()</code> 保持一致。新增合同验证 Target 根前缀、embedding/norm/head/4H HC head、首末层与
+          46 个 shard，并验证 Draft <code>mtp.0/1/2</code> attention/FFN/norm、<code>main_proj [4096,12288]</code>、dedicated
+          embedding/head、4H HC head、Markov、bias-less confidence projection 及 74 个 shard；真实报告 32/32，文件为
+          <code>20260826-deepseek-v4-dspark-checkpoint-pair.json</code>。专项增至 22/22、完整脚本 discovery 增至 89/89。四类 runner 的
+          八次顺序复验同样满足错误 DFlash 配对退出 1、正确 DSpark 配对通过合同后退出 75、八个结果目录不存在；日志统一使用
+          <code>20260826-deepseek-dspark-weight-contract-{eager,graph,trace,matrix}-{invalid,valid}.log</code>。最终标准构建退出 0，日志为
+          <code>20260826-prepared-deepseek-dspark-weight-contract-build.log</code>。
+
+          随后对阶段 4/5 的真实模型加载合同做了同样收敛。新增
+          <code>validate_mtp_eagle3_checkpoint_pair.py</code>，在 NPU 检查前验证路径/权重、target/draft runtime 类型、architecture、
+          hidden/vocab、target/draft MTP 层数、target/draft family、特殊 token，以及 Eagle3 单层 Draft、有效 3 层 Target capture
+          和 draft vocab 子集。审计首先发现本地 Kimi-K2.5 Eagle3 checkpoint 的 <code>model_type=kimi_k25_eagle3</code>
+          尚未注册，且既有 runner 错把 ATB Eagle3 默认成 TORCH；现已为相同 one-layer Eagle3 权重布局注册
+          <code>kimi_k25_eagle3</code> CausalLM/ModelArgs 别名，并将 Eagle3 五类工作流默认 kernel 后端改为 ATB，MTP 与
+          Block-Spec 继续使用 TORCH。更深一层的启动审计又确认：Kimi Target 自动选择 VLM Master，而 Eagle3 必须使用 LLM
+          speculative engine；Kimi 的 DeepSeek-V2 text backbone 也尚未发布 Draft 所需的 3H residual。现已新增
+          <code>KimiK25TextForCausalLM</code> 工厂，复用 DeepSeek-V2 backbone 并从
+          <code>language_model.model.</code>/<code>language_model.lm_head.</code> 前缀加载权重；原 VLM 工厂与自动
+          <code>backend=vlm</code> 保持不变，Eagle3 Eager、Graph、profiler trace 与 trace-matrix runner 显式传入
+          <code>--backend=llm</code>。真实 safetensors 索引审计现已固化为启动合同：validator 读取 index 与所需 shard header，
+          不 materialize tensor payload，强制 Kimi Target 的 <code>language_model.model.*</code>/<code>language_model.lm_head.*</code>
+          前缀及 embedding/final norm/lm_head shape，同时强制 Draft 的 <code>fc/midlayer/norm/lm_head</code> 模块与输出 shape；
+          <code>fc.weight</code> 必须为 <code>[7168, 21504]</code>，与 3H 输入一致。缺少 runtime 前缀、缺少 Draft 模块及错误
+          embedding/norm/lm_head/fc shape 的负向用例均在 NPU 检查前失败。DeepSeek-V2 ATB forward 同时接入
+          <code>AuxHiddenCapture</code>，按配置层在 decoder 前抓取 residual stream 并返回连续 3H aux hidden states。
+          validator 专项 15/15、模型注册编译与 3/3 执行、完整 scripts discovery 74/74、Prepared 核心 67/67 均通过。
+          重新生成的 DeepSeek-V4 Target/MTP Draft 报告初版为 13 项，Kimi-K2.5 Target/Eagle3 Draft 报告扩展为 21 项，
+          真实检查全部通过，分别为
+          <code>20260826-deepseek-v4-mtp-checkpoint-pair.json</code> 与
+          <code>20260826-kimi-k25-eagle3-checkpoint-pair.json</code>。MTP Eager、Eagle3 Eager、speculative Graph、profiler trace
+          与 trace-matrix 五类 runner 再次各完成一组错误/正确配对测试：错误配对均退出 1，正确配对均先通过合同再因
+          PID 1286019–1286034 占卡退出 75，10 个结果目录都未创建；真正进入运行后均保存
+          <code>checkpoint-pair.json</code>。最终四个生产/Graph 门禁仍为 false；07:00–07:01 标准
+          <code>python setup.py build</code> 准确退出 0，server 1/1、export 2/2、all-tests 48/48 三阶段完成且无失败标记；
+          server 为 515,631,888 字节（07:00:57），export module 为 528,170,512 字节（07:01:07），日志为
+          <code>20260826-prepared-kimi-eagle3-target-final-build.log</code>。这证明新 Target text factory、3H capture 与完整当前源码
+          可编译。本轮仅修改 Python validator/test 后又于 07:16–07:17 运行相同标准入口，顶层退出 0、三个 Ninja 目标均明确
+          <code>no work to do</code>、无失败标记，稳定 server 重新 staged；日志为
+          <code>20260826-prepared-eagle3-weight-layout-final-build.log</code>。上述 metadata/header 合同仍不替代真实权重加载和请求 E2E。
+
+          随后继续补齐 DeepSeek-V4 MTP 的真实权重布局合同。源码 loader 审计确认 Target 采用根前缀
+          <code>embed/layers/norm/head/hc_head_*</code>，Draft 采用 <code>model.layers.0.*</code>；Draft checkpoint 只持有
+          transformer body，embedding 与 LM head 会在加载完成后由 Target 共享，因此不能错误地把 Draft 中缺少这两项判为损坏。
+          validator 现会合并 safetensors index 映射与 loader 同样可见的未索引独立 safetensors 文件，并且只读取所需 shard header、
+          不 materialize payload。Target 合同覆盖首末 decoder layer、embedding/final norm/lm_head，以及
+          <code>hc_head_fn=[4,16384]</code>、<code>hc_head_base=[4]</code>、<code>hc_head_scale=[1]</code>；Draft 合同覆盖
+          enorm/hnorm/final norm、<code>e_proj/h_proj=[4096,4096]</code>、attention/FFN 模块和同样的 4H HC head。
+          两类权重布局负向用例、Target/Draft <code>hc_mult</code> 不一致用例及缺失索引 shard 用例加入后专项为 19/19，标准容器内
+          完整 scripts discovery 为 78/78。validator 同时要求 index 引用的全部 shard 都位于 checkpoint 目录且真实存在，并记录
+          shard 数量。真实 DeepSeek-V4 MTP 报告现为 25/25（Target 70 shards、Draft 1 shard），除两侧各自的 4H shape 外还要求
+          <code>target_hc_mult == draft_hc_mult</code>；<code>weight_layout.target_inspected</code> 与
+          <code>draft_inspected</code> 均为 true；Kimi Eagle3 为 23/23（Target 126 shards、Draft 2 shards）。
+          五类 runner 的十次顺序复验仍全部满足错误配对退出 1、正确配对通过合同后因 PID 1286019–1286034 退出 75，且十个
+          <code>20260826-mtp-weight-layout-*-result</code> 目录均未创建。专项与完整脚本日志为
+          <code>20260826-mtp-weight-layout-validator-tests.log</code>、<code>20260826-mtp-weight-layout-all-script-tests.log</code>；
+          更新后的报告仍为 <code>20260826-deepseek-v4-mtp-checkpoint-pair.json</code> 与
+          <code>20260826-kimi-k25-eagle3-checkpoint-pair.json</code>。07:31 再次从标准 <code>setup.py build</code> 入口执行，
+          顶层退出 0，server/export/all-tests 三个 Ninja 目标均明确 <code>no work to do</code>，无失败标记，稳定 server 重新 staged；
+          日志为 <code>20260826-prepared-mtp-weight-layout-final-build.log</code>。当前源码随后又从标准
+          <code>setup.py test --test-name ... --device npu</code> 入口执行 Prepared Pipeline 67/67 与模型注册 3/3，退出码均为 0；日志为
+          <code>20260826-mtp-weight-layout-prepared-pipeline-test.log</code> 和
+          <code>20260826-mtp-weight-layout-model-registry-test.log</code>。四个生产/Graph 门禁继续保持 false；这些 header
+          合同仍不能替代真实完整权重加载、请求 E2E、逐 step 确定性或 Graph replay/trace。
+
+          本轮继续审计阶段 4/5 的固定输出链路时定位并修复了 Eagle3 Prepared 的真实地址身份问题：
+          <code>draft_token_matrix.select(dim=1, ...)</code> 返回按列跨行的非连续固定 Slot view，而旧
+          <code>map_draft_token_ids_to_target_out()</code> 会先对输出调用 <code>flatten()</code>；对非连续输出执行
+          <code>flatten()</code> 会生成临时 Tensor，映射值因而可能没有写回固定 Slot storage。现在 Eagle3 直接以该非连续列 view
+          作为 <code>index_select_out</code> 的输出并在提交后校验 <code>data_ptr</code> 不变；MTP/Eagle3 统一通过
+          <code>copy_prepared_draft_token_ids_out()</code> 写入固定列。Sampler 在 <code>argmax_out</code> 前校验固定输出的一维
+          shape、Device、int64 dtype 与连续性，并在调用后校验地址不变；Prepared token/embedding 模型输出及 selected embedding
+          gather 也统一校验 shape、Device、dtype、连续性和 storage 地址身份。标准聚焦入口实际完成
+          <code>sampler_test</code> 24 项中的 21/21（3 项 MLU-only 明确跳过）、<code>mtp_async_state_test</code> 31/31 和
+          <code>prepared_task_pipeline_test</code> 84/84，命令退出码均为 0；非连续 Eagle3 mapping 在相同固定矩阵上重复 100 轮，
+          100/100 均确认值写回原列且 storage 地址不变。日志分别为
+          <code>20260826-mtp-eagle3-fixed-output-sampler-test.log</code>、
+          <code>20260826-mtp-eagle3-fixed-output-state-test.log</code> 与
+          <code>20260826-mtp-eagle3-fixed-output-prepared-test.log</code>。Prepared 聚焦入口编译的 27 个目标全部完成，并执行
+          24 个 suite 的 84/84；本轮没有另行执行标准完整 <code>python setup.py build</code>，最新完整构建仍是此前
+          Prepared Rejection / Block-Spec Fixed Output Binding 轮次的 all-tests 50/50，不把本轮聚焦验证误报为新完整构建。
+          四个生产/Graph 门禁继续保持 false。随后 r12 外层 NPU 公共预检连续三次遇到 DCMI <code>-8005</code>，按合同退出 75；
+          未创建运行结果、未启动验证服务，也未终止或干预外部任务，因此真实 Eagle3 模型 E2E 仍待设备恢复。
+        </div>
+
+        <h3>已完成</h3>
+        <ul class="checklist">
+          <li>新增通用 PreparedTaskPipeline、PreparedTaskAdapter 和 ExecutionSlot 状态机；状态线程负责 Prepare/Consume，唯一 Launch 线程负责 Device Task 提交。</li>
+          <li>实现 1/2 Slot 有界 Prepare/Ready/Completed 队列、单调 <code>task_seq_no</code>、Prepare Ack 输入所有权边界，以及 Device Event 完成后的安全 Slot 复用。</li>
+          <li>新增固定容量 <code>PreparedInputArena</code>：启动期分配 pinned Host 与 Device Buffer，复用现有 ForwardInput 连续布局规划并直接绑定 Device views；超容量 fail-fast。Arena 内部长期复用同一 <code>ForwardInputBufferPlan</code>，每轮仅 <code>entries.clear()</code> 保留 vector capacity；模型字段替换改用窄 <code>ModelTensorPlanSourceOverrides</code>，不再复制整份 <code>ModelInputParams</code> 临时对象；int64 Host metadata 在 dtype 已匹配时通过 <code>from_blob</code> 直接包装既有 vector。</li>
+          <li>新增普通 LLM Adapter，Prepared Eager 复用既有 prepare stream 与 compute stream；非 Driver Rank 无输出时同样记录完成 Event。</li>
+          <li>Worker 启动期二选一分流；同步 <code>step/step_async</code> Future 返回真实输出，Prepared 单 Slot 不使用 Legacy 的 last-step 输出队列。</li>
+          <li>接入 <code>quiesce/resume/shutdown</code>、sleep/wakeup，并在 Prepared 模式明确拒绝运行期 <code>update_weights</code>。</li>
+          <li>新增 <code>--enable_prepared_task_pipeline</code>（默认 false）和 <code>--prepared_task_input_buffer_size</code>（默认 64 MiB）。</li>
+          <li>阶段 2 按 <code>enable_schedule_overlap</code> 自动选择同步 1 Slot 或异步 2 Slot；异步 <code>submit</code> 在 Prepare Ack 后返回空结果，真实输出仅由 <code>get_last_step_result()</code> 按 <code>task_seq_no</code> FIFO 消费。</li>
+          <li>双 Slot 分别持有独立固定 Arena；状态线程可在 Task N 的 Launch 尚未返回时完成 Task N+1 Prepare，消费后按 0/1/0 顺序安全复用 Slot。</li>
+          <li>普通 LLM 异步 Decode 在 compute stream 上等待前驱 Event，并以非同步 <code>replace_token</code> 原位修正 fake token；输出 Event 同时作为 Host Consume 和 Slot 复用边界。</li>
+          <li>Prepared schedule overlap 会对所有 Rank 发起 GetLast，使非 Driver Rank 也能退休 completed Slot；Engine 仍只使用各 DP Driver 的真实输出。</li>
+          <li>Prepared Pipeline 在 Task 分类和 Prepare 前显式解包 RPC packed Host payload，使远端传输输入与 Legacy <code>ForwardInput::to()</code> 保持一致；真实 warmup Prefill 不再因默认空字段被误判为 EMPTY。专项用例 <code>UnpacksTransportPayloadBeforePrepare</code> 已覆盖该边界。</li>
+          <li>启动期严格限制为 NPU、native LLM、非 speculative、无 Graph、非 disaggregated PD、无 SHM、无 JSON grammar；不满足时 fail-fast，避免服务期回退 Legacy。</li>
+          <li>阶段 3 新增独立 <code>PreparedExecutor</code> capability；仅 NPU ACL Graph Executor 实现，未要求其他 backend 的 <code>ExecutorImpl</code> 增加空接口。Adapter 在 Prepare 阶段生成并保存 <code>slot_id + graph_key + mode + handle</code>，Launch 只消费固定绑定。</li>
+          <li>Prepared Graph 使用与 Pipeline 一致的显式 Slot；Prepared graph cache 与 Legacy cache 分离，Legacy <code>next_replay_slot_</code> 隐式轮转保持不变。运行期 miss 固定回退 Prepared Eager，只有标记为 <code>is_graph_warmup</code> 的启动期 miss 才允许 capture。</li>
+          <li>固定 Arena 为每次布局生成 offset/dtype/shape 指纹；Graph bind 同时校验 Arena 基地址、token/position 地址及模型输入地址覆盖。Prepared capture 直接绑定 Arena 输入，replay 不调用 Legacy <code>GraphPersistentParam::update()</code>，避免 Prepared Arena 到 Graph persistent input 的整份 D2D。</li>
+          <li>当前已启用的 Prepared Graph capability 保守限定为单 DP、单 CP、普通 Decode、非 speculative、非 hybrid 且非 Device-authoritative DSA；要求 graph-forward metadata 的普通 Decode 已支持 Graph-local 持久 state，不满足其余能力条件的 invocation 在 Prepare 阶段选择 Prepared Eager，不回退 Legacy Worker 链路。speculative Target Verify direct-bind 实现虽已编译，仍由独立 E2E 门禁保持 dormant。</li>
+          <li>要求 <code>requires_graph_forward_metadata()</code> 的 Prepared Graph 在每个显式 Slot/key 对应的 <code>AclGraph</code> 内独立持有 <code>ModelGraphMetadataState</code> 与 <code>ModelInputParams</code>；capture binding 在 Prepare 阶段预建实例并填充 metadata，replay binding 每 step 原位刷新相同持久地址。普通 LLM、MTP 与 DFlash 的 ready Event 均在 Graph binding/metadata Device 更新提交后记录，compute stream 不会越过 Prepare 工作。新增 <code>PreparedBindingRefreshesGraphForwardMetadataAtStableAddresses</code> 覆盖 capture/replay Prepare 次数、metadata 地址稳定及 replay/eager 输出一致；真实 NPU 完整 <code>acl_graph_executor_test</code> 35/35 已执行通过。</li>
+          <li>Device-authoritative DSA 的 Graph 实现已编译但保持 dormant：<code>DSAMetadataBuilder</code> 在 Graph 模式只绑定固定 workspace，DeepSeek-V4 capture 将 device q/KV lengths、manager tables 到所有 geometry output 的 out/in-place patch 记录进 Graph；<code>AclGraph</code> 为外部 manager table、geometry output 和 scratch 建立 dtype/shape/stride fingerprint 与逐 Tensor 地址列表，replay 任一地址或 layout 改变即走既有 address-mismatch 安全路径。CPU-only <code>PreparedDsaGeometryUsesDeviceLengthsAcrossCompressionBoundary</code> 以 <code>enable_graph=true</code> 验证无 stale Host geometry、固定地址与跨 C4 boundary 数值，1/1 通过；<code>kPreparedDeviceDsaGraphE2EValidated</code> 仍为 false，真实 capture/replay 前不会扩大 capability。</li>
+          <li>speculative Target Verify 的 direct-bind Graph 合同已扩展到 expanded/hybrid 输入并保持 dormant：Arena staging 将 <code>input_tokens_override</code> 重绑到同一 Slot token view，清空 Legacy draft source/address-stable/static-task 状态，并以 <code>prepared_spec_verify_graph_contract_is_complete()</code> 验证 chunked-prefill、uniform verify width、token/position 与 attention 行数、linear-state/accepted-token metadata 以及固定 Arena 地址。expanded 模式进一步要求 tokenwise KV/block rows、paged indptr/indices/last-page-len、<code>query_start_loc</code> 和逐 token Host KV 值完整一致，且拒绝 multi-manager 与 Arena 外动态 Tensor。<code>StagesSpecVerifyDirectBindContractAtStableAddresses</code>、<code>RejectsLegacySpecVerifyReplaySourcesFromDirectBindArena</code> 和 <code>StagesExpandedSpecVerifyMetadataAtStableArenaAddresses</code> 已覆盖 direct/expanded 两轮地址与 layout 稳定及 query-start/KV/paged shape 负向合同；<code>kPreparedSpecVerifyGraphE2EValidated</code> 仍为 false，真实模型 capture/replay 尚未进入 capability。</li>
+          <li>Prepared expanded verify 新增 predecessor KV plan-headroom 合同：Host 模板最大 KV 到 <code>template + q_max_seq_len - 1</code> 必须落在同一个保守 attention-plan bucket，且不得超过模型最大位置；否则 Prepare 阶段选择 Prepared Eager。plan lookup、Graph key、graph-local tiling 初始化与 capture/replay 动态 tiling update 共用同一保守上界，避免用陈旧 <code>meta.kv_max_seq_len</code> 选择 split。block endpoint、跨 bucket 与非法参数用例使 <code>acl_graph_bucket_policy_test</code> 增至 5/5。</li>
+          <li>Prepared direct-bind 的 expanded KV runtime source 已收敛到 Device：Host <code>expanded_kv_seq_lens_vec</code> 仅作为 staging/plan-headroom 模板，attention metadata 不再由其创建 CPU runtime tensor/vector，而是直接绑定 continuation 原位 patch 的固定 Arena Tensor。两轮 Arena 合同验证第二轮动态 KV 值、底层地址和 layout 均正确，非 direct-bind 8/8 对照验证既有 Host metadata 语义不变。</li>
+          <li>Prepared Target Verify Prepare/Launch 边界已修正为明确的 sequence/tokenwise 合同：chunked-prefill 主 attention KV 只保留每 sequence 最终值，expanded KV 与 block rows 按 verify token 展开；Host 一次构造固定容量 expanded/paged 布局并由 Arena H2D，Launch 使用启动期固定 workspace 原位更新 expanded KV、paged indptr/compact indices/last-page-len 与 token cache slots。<code>PatchesChunkedTargetVerifyExpandedMetadataWithoutReplacingStorage</code> 校验所有目标底层地址不被替换。</li>
+          <li>Prepared expanded Graph 已按 attention plan class 建立 graph-local tiling：启动 warmup 可执行冷分类，运行期未知 class 选择 Prepared Eager，plan class 与 static causal-conv signature 均进入 Graph key；每个 <code>AclGraph</code> 独立持有 tiling Tensor，动态 update 在 capture/replay 前提交。hybrid capture 建立 <code>AclGraphTaskUpdateContext</code> 并记录 causal-conv task，Prepare stream 在 invocation metadata-ready Event 之前 signal task-ready Event，replay 校验 signature 与预提交状态。实现和现有 static-signature helper 已通过编译/35/35 ACL Graph 回归，但生产能力仍受 speculative Graph E2E 门禁保护。</li>
+          <li>真实 NPU <code>acl_graph_executor_test</code> 已执行 Prepared runtime miss、启动期 capture 与同一显式 Slot/Arena replay；capture 后 cache 数量由 0 增至 1，replay 命中相同 graph key/native handle，capture/replay hidden states 通过 <code>torch::allclose</code>。完整目标 13 个 suite 的 35/35 用例通过；新增用例同时覆盖 Graph-local forward metadata 的 capture/replay Prepare 次数、持久地址稳定与 replay/eager 输出一致。该 capability 现已由真实 Qwen Worker Graph 单/双 Slot E2E 补充，生产门禁仍保持关闭。</li>
+          <li>真实 Qwen Graph 首轮定位到 Prepared capture 复用了 synthetic warmup 的 KV=16 paged-attention tiling；现在普通 LLM 每个 Decode step 都在 Prepare 中生成 Host tiling，再由最终 Arena H2D 到固定地址。最新严格复验中 Legacy 与 Prepared 单/双 Slot均为 7/7，合计 14/14 个候选响应精确匹配同调度 Legacy，441/441 个逐 step 状态一致；单/双 Slot Graph capture/replay 分别为 4/31、8/32，address mismatch 均为 0。</li>
+          <li>Graph warmup 现在按 Prepared Slot 数量计算每个 bucket 的完整 invocation 进度：普通 bucket 在 schedule-overlap 双 Slot执行 2 次，单 Slot与 Legacy 保持 1 次；static hybrid MTP Target Verify 进一步按 accepted length 外层、Slot 内层枚举 <code>[1, verify_width]</code> 的全部 Graph key 变体，verify width=4 时单 Slot为 <code>1,2,3,4</code>，双 Slot为 <code>1,1,2,2,3,3,4,4</code>。<code>profile_graph_warmup_test</code> 最新 29/29 通过。所有 E2E runner 也改为按相同 schedule-overlap 语义选择 Legacy 基线，不放宽或截断双 Slot 的额外 step。</li>
+          <li>hybrid speculative Graph 新增逐 execution verbose trace 与严格多 rank validator；单/双 Slot E2E 可强制验证所有 <code>(Slot, accepted length)</code> 启动期 capture 唯一且完整、同 Slot不同 accepted length 的 Graph key 唯一、运行期无 capture、replay static-task 已预提交且以相同 Graph key 存在 warmup provenance。专项 10/10 与容器内完整脚本 discovery 48/48 通过，真实 runner 默认仍不越过生产门禁。</li>
+          <li>Block-Spec Eager、Graph、profiler trace 与 Eager/Graph trace-matrix 四条 runner 已接入 checkpoint 配对预检：除 DFlash/DSpark 类型、权重、hidden/vocab、target layer、capture layers、mask/noise token 与 block-size 配置外，Qwen DFlash/DSpark 还在 NPU 检查前验证真实 Target/Draft safetensors 前缀、关键模块、全部五层 attention/MLP/norm shape、5H capture、共享或 tied embedding/LM head 与所有 index shard；DSpark 额外验证 runtime architecture alias、Markov 与 confidence head。DeepSeek-V4 DSpark 则验证 runtime 将 43 层 config 主干重映射为 3 层 <code>mtp.*</code> Draft，以及 dedicated vocabulary basis、main projection、4H HC head 和全部 46/74 个 shard。专项 22/22、完整脚本 discovery 89/89 通过，两组真实 DFlash 配对为 28/28，Qwen 三组与 DeepSeek 一组真实 DSpark 配对均为 32/32并生成全绿 JSON 报告；真正进入运行后各结果目录会保留 <code>checkpoint-pair.json</code>。</li>
+          <li>MTP/Eagle3 五类 Eager、Graph 与 trace runner 已统一接入 checkpoint 配对预检：MTP runtime/family/层数与 Eagle3 runtime/单层/3H capture/vocab 合同在 NPU 检查前 fail-fast；本地 Kimi checkpoint 的 <code>kimi_k25_eagle3</code> alias 已注册，Eagle3 runner 默认 ATB。专项 13/13、模型注册 2/2、完整脚本 discovery 72/72 通过；两组真实 MTP/Eagle3 报告全绿，五类 runner 的 10 次顺序测试均符合错误配对退出 1、正确配对随后因占卡退出 75、结果目录不存在。</li>
+          <li>MTP 与 DFlash Prepared Backend 在 speculative 叶 invocation Arena staging 前调用 <code>prepare_prepared_graph_input()</code>，因此逐 step tiling 会进入各自固定 partition，而不是从叶模型外部临时 Device buffer 旁路；<code>StagesGraphTilingAtStableSpeculativePartitionAddresses</code> 覆盖两个 Slot/partition 地址稳定性，Prepared 回归增至 59/59。</li>
+          <li>阶段 4 在 Engine 构造输入时生成相邻 Task 的 <code>predecessor_row</code>；支持请求新增、删除和重排，重复 request id fail-fast，并已贯通固定 Arena、Packed RPC 与共享内存序列化。</li>
+          <li>新增 Slot-local <code>MtpDeviceStepState</code>，覆盖 accepted token/length、tail/previous token 与 embedding、position/KV base 和 valid mask；新增固定 <code>MtpPublishPatchWorkspace</code>，可从 rejection 原始输出以 out/in-place 操作直接发布，不再先构造临时 <code>AcceptedState</code>，且目标 Tensor 地址保持不变。</li>
+          <li>accepted-token Publish 合同已收紧为完整固定宽度：第 0 列必须有效、无效项只能是连续 suffix，故 accepted length 为 <code>[1, width]</code>；Host 模板已包含首个提交 token，continuation 相对模板的最大 KV 推进量为 <code>width - 1</code>。MTP/Eagle3 与 DFlash/DSpark 都拒绝短宽度发布，MTP Backend 还在启动期拒绝 capacity 与 max verify width 不一致；expanded Target Verify Prepare 对 <code>q_max_seq_len</code>、capacity 和 headroom 三者做闭环校验。</li>
+          <li>MTP Graph warmup 的动态 accepted length 已显式贯通 <code>Sequence → BatchInputMeta/BatchInputBuilder → ForwardInput → shared memory → EmbeddingCache</code>，Prepared 与普通输入构造保持一致；synthetic bootstrap 同步设置 position/correction offset、previous-row topology 与 <code>all_draft_accepted</code>，使每个固定 Slot 的 cache 状态、Target Verify 输入和 Graph key 对应同一接受长度。该传播由 Graph warmup 29/29、Embedding Cache 8/8、Batch 56/56 与 Prepared 67/67 覆盖。</li>
+          <li>新增固定容量 <code>MtpPredecessorPatchWorkspace</code> 和 <code>TASK_CONTINUATION</code> Device Patch；仅使用 out/in-place Torch 操作，<code>-1</code> 新请求及未发布前驱行保留 Worker 初始值。</li>
+          <li>Prepared Pipeline 新增前驱状态读取协议：后继 Task 在 Launch 开头完成读取后立即发布 <code>reuse_fence</code>，前驱 Slot 进入下一次 PREPARING 前由 Adapter 在 prepare stream 等待 Fence；Host 只等待 Fence 已提交，不等待后继完整 Task。</li>
+          <li>新增 <code>MtpPreparedTaskAdapter</code> 和窄 <code>MtpPreparedTaskBackend</code> 契约；Adapter 在启动期预构造 Prefill、Decode、EMPTY 三套固定模板，Launch 按 <code>TASK_CONTINUATION → Draft×N → Target Verify → Rejection → Publish</code> 顺序调用，前驱 continuation 保证只提交一次。</li>
+          <li>补齐 reuse 协议边界：前驱 Slot 已退休为 FREE 后仍可建立读取关系；单 Slot 允许自前驱并依赖同一 task stream FIFO；Prefill/EMPTY 即使携带 mapping 也不读取前驱状态。双 Slot continuation 标记使用独立字节，避免 <code>vector&lt;bool&gt;</code> 跨 Slot 共享机器字的数据竞争；MTP/Eagle3 共用 Adapter 的离线契约已覆盖三个连续 Decode Task 的 0→1→0 复用、即时前驱读取及 Slot 复用时 continuation 状态重置。</li>
+          <li>新增 <code>MtpPreparedTaskBackendBase</code>：启动期一次性为 1/2 个 Slot 分配固定 <code>PreparedInputArena</code>、<code>MtpDeviceStepState</code>、Predecessor/Publish workspace；Prepare 只重绑 Worker 生成的固定 Draft/Target source/destination，Launch 统一执行 continuation gather、原始 rejection 输出 Publish、<code>reuse_fence</code> 与完成 Event，Consume 统一等待并退休输出。</li>
+          <li>Backend 基座显式支持首个 Decode 无前驱 Task：保留 Worker 已准备的初始行，同时维持固定 Invocation 拓扑；Publish 前校验 rejection token/embedding 与 Slot State/Workspace 位于同一 Device。连续 Input Buffer 在 NPU 编译产物中也按实际 Device 区分 CPU/NPU 地址包装，避免将 CPU Arena 地址误标为 NPU Tensor。</li>
+          <li>固定 Invocation 计划新增显式 <code>input_partition</code>；每个 Slot 的 Arena 按 Prefill、每轮 Draft 和 Target Verify 的实际生命周期划分独立分区，同一 Invocation 内重用地址，不同在途 Invocation 不再共享输入存储。</li>
+          <li>新增 Worker 专属 <code>MTPWorkerImpl::PreparedTaskBackend</code> 及启动期 factory：为 Prefill/Draft/Target/EMPTY 固定构造并绑定模型输入、输出与 rejection 资源，Launch 根据已准备的 descriptor 直接分发在线模型 Invocation。</li>
+          <li>Worker 主输入在 prepare stream 内 staging 到对应固定 Arena 分区；Draft 采样结果写入每 Slot 固定 token matrix，后续 Target Verify 与 Publish 只消费固定 views，避免逐轮拼接和输出 Tensor 替换。</li>
+          <li>新增 <code>GreedyTokenIdRejectionWorkspace</code> 与 <code>greedy_masked_sample_from_token_ids_out()</code>：candidate、match、accepted-prefix、rejected-token 和 masked-output 均在启动期按 Slot 分配，Launch 仅使用 <code>eq_out</code>、<code>logical_and_out</code>、<code>where_out</code> 写回固定地址。</li>
+          <li>Prefill hidden fallback 使用预分配 selection indices 与 <code>torch::index_select_out</code> 写入固定 <code>prefill_selected_embeddings</code>，不再由 <code>index_select()</code> 返回新的热路径 Tensor。</li>
+          <li>Eagle3 的 <code>get_embedding_placeholder_size()</code> 通过虚接口将 3H 布局复用到既有 MTP Arena/State；<code>hot_token_id_</code> 启动期固定为 <code>kLong</code>，Prepared Draft 采样通过 <code>map_draft_token_ids_to_target_out()</code> 写入固定 Target token 列且保持存储地址不变。</li>
+          <li>Worker Prepared 初始化拆分为构造期 LLM 与 cache allocation 后 speculative 两类：只有 KV/embedding cache 成功后才创建 MTP/Eagle3 或 DFlash/DSpark Backend、Adapter 和 Pipeline；同步、异步及带 transfer 的 allocation 都经过同一完成边界，失败不创建、重复成功不重复初始化，初始化前禁止回退 Legacy step。speculative E2E 编译期启动门禁仍为关闭。</li>
+          <li>新增 <code>PreparedModelOutputWorkspace</code>：每 Slot/Invocation 预分配 Draft/Target greedy token 与 selected-embedding 输出，Sampler 通过 <code>argmax_out</code> 写固定 token 地址，speculative hidden gather 通过 <code>index_select_out</code> 写固定 embedding 地址；Prepared greedy Draft 明确关闭无需消费的 probs 生成，避免 cache compression 分支产生临时 Tensor。</li>
+          <li>Target Prefill 现在保留完整 hidden 供 Context-KV 写入，同时通过同一 <code>PreparedModelOutputWorkspace</code> 将 selected hidden 直接写入 Slot 固定地址；MTP/Eagle3 与 DFlash/DSpark 共用该路径，Block-Spec Consume 不再临时转换 selection indices 或分配 <code>index_select</code> 输出。</li>
+          <li>Draft Prefill 与后续 Draft Decode 共用启动期按 <code>max_tokens_per_batch</code> 分配的固定 pinned Host 零 embedding staging，并按当前 token 数取窄视图后由固定 Arena 直接 H2D；首轮 Draft Decode 的逐行 embedding 通过 <code>torch::stack_out</code> 写入 Slot-local 固定 Device workspace，不再由 <code>torch::stack()</code> 产生临时 Device Tensor。Prefill selection index、base position 与 base KV length 也改为启动期固定 pinned Host staging，移除对应的逐 Task <code>torch::tensor()</code>、<code>make_cpu_int_tensor()</code> 和临时 vector 分配。上述地址稳定性已由离线契约覆盖，仍需真实 allocation/D2D trace 确认模型/backend 内部行为。</li>
+          <li>MTP Prepared 的首轮 Draft、后续 Draft 与 Target Verify 生成的 token/position/selected/sample index 统一写入每 Slot 启动期分配的 <code>MtpPreparedHostInputWorkspace</code> pinned Host storage；<code>copy_cpu_int_values_out()</code>、<code>fill_cpu_int_range_out()</code> 与可注入固定 indices 的 <code>update_sampling_params()</code> 只返回活动前缀 view，不再为这些控制量逐 Invocation 创建临时 Host Tensor。专项契约同时验证写入值、range 和底层地址稳定；仍需真实 Host allocation trace 确认 Torch/model/backend 内部行为。</li>
+          <li>DFlash/DSpark Prepared 已复用通用 <code>SpeculativePreparedHostInputWorkspace</code>，为每个 Slot 预分配 anchor、query、target pinned Host token/position/selected/sample index 与 <code>do_sample</code> storage；各阶段只原位写入活动前缀，不再调用临时 <code>make_cpu_int_tensor()</code>、<code>torch::arange()</code> 或 greedy <code>repeat_interleave()</code>。MTP 的 greedy validate 也改用固定 <code>do_sample</code> staging；首个无前驱 Decode 通过独立 anchor workspace 原位写入 token/position，不再 clone 原始 Host Tensor，且不会被后续 Draft/Target generated workspace 覆盖。token/control 存储的地址独立性及复用稳定性已由专项契约覆盖，Legacy 与 adaptive 路径保持原行为。</li>
+          <li>新增 <code>repeat_speculative_sampling_metadata_out()</code>：Prepared MTP/Eagle3 与 DFlash/DSpark 将 frequency/presence/repetition penalty、temperature、top-p/top-k、unique-token ids/counts/lens 以及 filter mask/bitmask 按原 <code>repeat_interleave(dim=0)</code> 语义写入 Slot-local 固定 UInt8 Host scratch，覆盖 float/int32/int64 和一/二维布局；<code>do_sample</code> 继续由独立固定 bool staging 管理，不由该 helper 重复。容量不足、非 CPU、非连续、非 UInt8 destination 或缺少 row dimension 时 fail-fast，不回退到临时 Tensor；专项 death test 已覆盖容量不足、destination dtype 错误、destination 非连续和 source 第 0 维为空。Block-Spec Query 在同步打包进最终 Arena Host buffer 后才允许 Target 复用同一 sampling scratch；MTP 也在每个 Slot 内复用 generated sampling scratch，不跨 Slot 共享。</li>
+          <li>Prepared speculative Host 容器进一步按 Slot 复用：<code>EmbeddingCache::read_decode_states_out()</code> 写入调用方预留的 <code>DecodeState</code> storage，MTP 与 DFlash/DSpark Backend 在启动期为每个 Slot 预留容量并在 Prepare 中原位更新 token、position 与 KV length；固定 Host workspace 分支直接写 pinned Tensor，不再为这些控制量替换 vector allocation。sampling 输出的一/二维 shape 也改用栈上 <code>std::array</code>，维度超出合同即 fail-fast。地址稳定契约由 <code>embedding_cache_test</code> 覆盖，Legacy 分支保持原行为。</li>
+          <li>本轮静态审计确认 MTP 与 Block-Spec Prepared Backend 的直接 Torch Tensor 创建均位于启动期 Slot 资源分配；热路保留的 D2H 只用于 Consume/结果退休。进一步为 MTP/Block-Spec 每个 Slot 固定持有 <code>DecodeBuildWorkspace</code>，row builder vector 在调用间 clear 并保留容量，移入临时 <code>ForwardInput</code> 的 attention vector 在 Arena staging 后 reclaim 回 workspace；有前驱的稳态 Decode 直接读取原输入，不再复制整份 <code>working_input</code>，DFlash Target Validate 也移除额外 <code>ForwardInput</code> 副本。仍须由真实 allocation trace 判定 helper、Torch、model/backend 内部行为，不以静态审计代替性能验收，也不宣称 Prepared Host 热路已经完全无分配。</li>
+          <li>Slot 从 Decode/Prefill 转为 EMPTY 时会显式清理旧 token、position、连续 Host/Device buffer 及模型 tensor views，避免复用上次 Invocation 的地址；MTP/Block-Spec Leaf reset 不再重建整份 <code>ForwardInput</code>，只清除 Event、binding、输出和活动引用，从而保留其内部 vector capacity。</li>
+          <li>Prepared Slot 已保证输入存活到完成 Event，因此叶模型 no-sync 执行不再为每个 Invocation 额外 <code>make_shared&lt;ForwardInput&gt;</code>；采样后及时释放不再使用的 logits、selected-hidden 与 top-k 中间引用，降低 Launch Host 分配和在途峰值持有。尚未接线的 DSA cross-step top-k reuse 在 Prepare 明确 fail-fast。</li>
+          <li>Prepared Arena staging 对 q/kv 长度、cache slot、block table、ring metadata 等优先消费已有 Host mirror，直接打包到固定 Slot Arena；不再先由 speculative helper H2D 到临时 attention buffer、再 D2D 到最终 Arena。无 Host 来源的模型状态仍显式保留 Device source。</li>
+          <li>MTP/Eagle3 与 DFlash/DSpark 的 Prepared 输入 helper 在 Host metadata 已齐备时不再调用 <code>rebuild_device_buffer()</code>；token/position、attention metadata 与 sampling control 由最终 Slot Arena 执行唯一一次 H2D。Legacy、adaptive 与现有 speculative Graph helper 继续保留原 Device buffer 路径。</li>
+          <li>普通 LLM Worker 在 prepare 后生成的 supplemental metadata 通过 <code>stage_generated_metadata()</code> 追加到同一 Slot Arena 的固定尾部，并在追加完成后重新记录 ready Event；覆盖 DP/EP padding、EPLB decode mask/expert array、expanded verify metadata、<code>num_accepted_tokens</code>、MTP shifted tokens 与 <code>in_prefix_slots</code>。若字段已经是当前 Arena 的稳定 Device view，则原位保留而不重复加入 tail plan；仅 Worker 真正新建的 Host metadata 才追加，Arena 外且无 Host mirror 的 Device metadata 继续 fail-fast。专项用例 <code>KeepsExistingArenaViewsWithoutAppendingGeneratedTail</code> 已覆盖该行为。</li>
+          <li>Prepared 模式下 DP/EP padding 先保留 CPU Host source，再直接 H2D 到最终 Arena；MTP/Eagle3 与 DFlash/DSpark 的 greedy <code>selected_token_idxes</code>、<code>sample_idxes</code> 及相关 token/position control 改由 Host staging，Legacy 与 adaptive 路径保持原行为。</li>
+          <li>DeepSeek-V4 的多 manager block table 已进入固定 pinned Host Arena；DFlash/DSpark 每个 Slot 最多预分配 3 个 manager Device table，按 DeepSeek-V4 的 SWA/C4/C128 注册顺序上传活动前缀，并将每次上传计入 Prepared H2D bytes/copies。MTP 与 Block-Spec 不再因 multi-block table 本身拒绝 Prepared binding。</li>
+          <li>Prepared speculative DeepSeek-V4 将 continuation 后的 Device KV/query lengths 作为权威几何，在 Device 上重建 cu-seqlens、max tensors、C4/C128 compressed positions 与 cache slots，并将 manager request rows 均匀展开到 tokenwise target rows；SWA block table 按 circular ring 生成逻辑列，SWA cache slots 继续复用固定 Device storage。sparse/indexer 与 Quant Lightning Indexer 的 opaque max-seqlen 同时采用包含一轮最大前驱推进的安全 headroom，避免继续消费 stale Host scalar。</li>
+          <li>每个 DFlash/DSpark Slot 新增固定 <code>DSADeviceGeometryWorkspace</code>：query/KV prefix sums 通过 <code>cumsum_out</code>、max scalars 通过 <code>amax_out</code>、global <code>start_pos</code> 通过 <code>sub_out</code> 写入预分配 Device tensor；C4/C128 compressed positions、C4/C128 token slots 的 compact scatter 结果和 SWA logical block table 也写入启动期固定 storage，仅向模型暴露活动前缀/连续二维 view。进一步将 boundary mask/rank/destination、token block lookup/valid mask、SWA logical/physical column、gather/valid mask，以及 manager row indices 和每个 manager 独立的 expanded table 全部纳入 Slot workspace；<code>arange_out</code> 在每次 invocation 的当前 Task stream 上写入 indices，避免启动期默认流初始化后被其他流提前读取。真实 NPU 用例同时覆盖列连续但行 stride 带 padding 的 token-manager view、C128 request rows 2→8 固定扩展及 SWA 2→8 扩展，并校验主要最终输出、<code>start_pos</code> 和 expanded table 的底层地址没有被替换。</li>
+          <li>Device-native DSA patch 在 metadata pack 前执行，避免先上传随后被替换的 stale Host geometry；authoritative Prepared 构建现在只保留 DSA 结构骨架、RoPE table 与 cache 描述，不再先创建随后立即丢弃的 Host seq/cumulative/compressed position 和 manager metadata。Prepared 分支已用 <code>remainder_out</code>、<code>eq_out</code>、<code>where_out</code>、<code>index_select_out</code> 与 <code>gather_out</code> 将当前显式 geometry 中间输出写入固定 storage，Legacy 兼容分支保持原临时 Tensor 实现。真实 NPU caching allocator 定向审计确认，预热后重复 patch 不增加 live allocation block 或当前 allocated bytes，但累计 allocation request 仍增加 35 次；分解为 geometry-only 8、C4-only 17、C128-only（含 row expansion）19、SWA-only（含 row expansion）15，三类 manager 增量与 geometry 基础精确加和为 35。随后以 <code>xllm.PreparedDSA.Patch.*</code> 五个 MSTX range 对同一测试重采 msprof：all-manager、geometry-only、C4-only、C128-only、SWA-only 五个 warmed 区间内 <code>aclrtMallocPhysical/Alloc/Free</code> 均为 0；全测试仅有的 2 次 <code>aclrtMallocPhysical</code> 都发生在首个 marker 之前。五个区间分别记录 26/1696 B、4/256 B、12/768 B、13/832 B、9/608 B 的内部 D2D，单次最大 96 B，因此可以证明 warmed patch 没有 CANN 物理分配，但不能表述为 backend allocation/copy-free。该结论仍是 metadata patch 定向 trace，不替代真实 DeepSeek-V4 模型全链路 allocation/D2D 或 Graph capture/replay；Device 动态 DSA 遇到 Prepared Graph-ready metadata 继续 fail-fast，生产 Graph 门禁保持关闭。</li>
+          <li>DSA metadata 新增显式 <code>device_geometry_authoritative</code> 语义位；Prepared C4/C128 token manager 在 patch 时强制 compressed slot 行数与对应 compressed-position/RoPE 行数精确一致，模型 compressor 与 index-cache 写入不再用 <code>min(rows)</code> 静默吞掉固定宽度不匹配。Prepared cache scatter 会过滤负 padding slot，并用固定形状 sentinel-row 恢复保证尾部 <code>-1</code> 不会别名覆盖 cache row 0；主 index cache 与 scale cache 共用同一 slot 合同，Legacy 可变 committed-row 路径保持原行为。真实 NPU 用例以 <code>{0,-1,2,-1}</code> 验证有效 row 0、row 2 更新且 padding 行完全不改写 cache；预热后 live block/current bytes 稳定，仍记录 24 次 caching-allocator request。对应 <code>xllm.PreparedDSA.Scatter.CacheRows</code> MSTX 区间为 630.9 μs、24 个 Device task、4 次共 12 B 的内部 D2D（最大 4 B），CANN allocation 为 0；全测试 2 次物理 malloc 均在 marker 前。该低层 scatter 合同已闭环，真实 compressor 算子执行仍随 DeepSeek-V4 模型 E2E 验收。</li>
+          <li>Graph 的 <code>input_tokens_override</code> 与 token Tensor 强制使用同一 Arena source，重新绑定后校验固定地址；非稳定 speculative verify draft source、MTP top-k state 与 CP plan 在 Prepare 阶段显式拒绝，Prepared 启动同时要求 CP=1。</li>
+          <li><code>history_compressed_kv</code> 与 <code>history_k_rope</code> 被分类为外部模型状态，不复制进输入 Arena；其余无法由 Host 重建的模型状态仍保留显式 Device source，等待真实 allocation/D2D trace 决定后续收敛范围。</li>
+          <li>每个 <code>ForwardInput</code> 新增 Prepared Arena H2D 字节/copy 次数、必要 D2D 字节/copy 次数统计，并累计到 <code>prepared_task_staging_h2d_bytes_total</code>、<code>prepared_task_staging_h2d_copies_total</code>、<code>prepared_task_staging_d2d_bytes_total</code>、<code>prepared_task_staging_d2d_copies_total</code>；后续性能专项将与 NPU trace 逐 Task 对照。</li>
+          <li><code>ForwardInputBufferPlan</code> 移除整份 Plan 的 <code>allow_device_sources</code> 开关，Device source 必须通过逐字段 <code>add_external_device_source()</code> 声明；当前白名单仅包含无 Host mirror 的 <code>input_embedding</code> 与 <code>mtp_bootstrap_embeddings</code>，attention、sampling、DP/EP、EPLB 与 expanded verify metadata 保持 Host-only，新字段默认不能静默引入 D2D。</li>
+          <li>Arena 重绑完成后清理旧 <code>attention_host_buffer</code>/<code>attention_device_buffer</code> 及容量 metadata，避免 Prepared input 无意义持有临时 packed buffer；若 <code>history_compressed_kv</code> 或 <code>history_k_rope</code> 的地址仍位于该 Device buffer 内，则仅保留必要 Device owner，防止外部模型状态悬空。</li>
+          <li><code>ForwardInputBufferPlan::copy_host_sources()</code> 将相邻 Host entry 合并为连续 H2D range，并跳过外部 Device source 的完整对齐区间；primary staging 与追加 metadata 均使用同一规则。零元素 Device tensor 不计入 D2D source/copy 统计，避免空输入污染指标。</li>
+          <li>Prepared Pipeline 新增 CPU Prepare、continuation/Launch 提交与 Device completion/Consume 三段微秒级直方图；双 Slot 每次 Launch 同时累计总提交数，以及提交结束时没有下一 READY successor 的次数。该比值用于先定位 Host 生产/提交不足，真实 Device Task 边界仍以 NPU trace 为准。</li>
+          <li>Prepared 模型 invocation 新增 Eager、启动期 Graph capture、Graph replay 三类执行计数，以及运行期 Graph miss 和固定 Arena 地址不匹配计数。无 Graph binding 的普通 Prepared Eager 在 Worker Prepared 入口计数，带 binding 的 Eager/capture/replay 由 Executor 在实际 <code>launch_prepared()</code> 计数，因此 Graph miss fallback 及 MTP/Eagle3/DFlash/DSpark 的每个叶 invocation 都进入同一分母；不支持 Graph 的正常 Eager 不误计为 runtime miss。</li>
+          <li>Prepared Pipeline 新增不执行 stream synchronize 的 MSTX Host range：<code>xllm.PreparedTask.Prepare</code>、<code>xllm.PreparedTask.Launch</code> 与 <code>xllm.PreparedTask.Consume</code>。标记只包围既有 Host 阶段，不改变 stream、Event 或提交顺序；真实 msprof 数据可将 Host range 与 <code>TASK</code>、<code>MEMCPY_INFO</code>、<code>CANN_API</code> 时间线直接关联。</li>
+          <li>新增只读 trace 分析器，自动解析 msprof SQLite 的 MSTX、Device Task、Memcpy 与 CANN API，输出 marker/metrics 一致性、Prepare/Device 重叠、H2D/D2H/D2D 分类、allocation 计数及 device gap 分位数；另对 TCMalloc growth before/after 做逐栈差分并用当前 server 的 <code>addr2line</code> 符号化。分析器不会修改 profiler 原始数据。</li>
+          <li>MTP/Eagle3 verbose trace 新增逐 step 状态审计：每个 request 记录 algorithm、embedding id、base position、base KV length、committed length、accepted draft length 与完整 accepted-token 行；旧 MTP 日志没有 algorithm 字段时仍按 MTP 解析，新的 Eagle3 日志必须显式记录 <code>algorithm=Eagle3</code>，避免把继承路径误当成 MTP 证据。Legacy 继续复用已有 Host accepted-token 结果；Prepared Backend 在 Task completion Event 已同步后读取固定 rejection 输出与 Target Verify base state，仅 verbose trace 开启时执行审计 D2H，因此关闭 trace 时不新增拷贝。<code>tools/compare_mtp_step_trace.py</code> 按 request id 精确比较 Legacy/Prepared 的 step 数、算法、token、接受长度及 base 状态，拒绝中间负 padding、长度不一致、缺失 request/base state 与多余/缺失请求；专项 Python 单测现为 5/5。比较器支持多组 <code>LABEL=BASELINE,CANDIDATE</code> 聚合，MTP 与 Eagle3 runner 均会对单/双 Slot 的每个对应 rank 建立 16 组门禁，而不再只检查 rank 0。验收客户端同时发送由 phase/request index 生成的稳定 <code>request_id</code> 与 <code>x_request_id</code>，确保三个独立服务进程中的 trace 可以按同一 request key 对齐；mock 请求已验证两个字段一致。</li>
+          <li>DFlash/DSpark 新增独立的通用 <code>event=speculative_step_state</code>，不复用或伪装成 MTP：Legacy 在 accepted token 已转 CPU、写 Target/Context cache 前记录修正后的 Host base position/KV；Prepared 在 Task completion Event 同步后复用 Consume 的 accepted-token D2H，并从 continuation 与实际 chunked/tokenwise Target KV metadata 还原同一 base state。记录包含显式 DFlash/DSpark algorithm、request/embedding、完整 token 行和 accepted draft length，默认关闭时只执行 logger enabled 检查。新增 <code>tools/compare_speculative_step_trace.py</code>，强制校验期望算法并支持多 rank pair 聚合；5/5 专项单测覆盖精确一致、token/base mismatch、算法错误、非后缀 padding 与多 rank 失败归属。<code>run_prepared_block_spec_e2e.sh</code> 已固化 Legacy、Prepared 单 Slot、Prepared 双 Slot的最终响应和每 rank 逐 step 门禁；当前机器没有可识别的 DFlash/DSpark checkpoint，因此脚本要求显式提供 Target/Draft 路径，不用不相干的 MTP 数据冒充。</li>
+          <li>普通 LLM 新增 <code>event=llm_step_state</code> greedy Decode 审计：跳过 synthetic Graph warmup，对每个真实 request 记录 embedding、base position/KV 与当步 token；默认关闭时只执行 logger enabled 检查，verbose 开启时的 D2H 仅用于确定性验收。<code>tools/compare_llm_step_trace.py</code> 以 request 为键比较完整 Decode 顺序，拒绝缺失 request/base state 与 fake token，专项单测 4/4 通过。<code>run_prepared_graph_e2e.sh</code> 同时门禁最终响应、单/双 Slot逐 step 状态与 <code>graph_capture&gt;0</code>、<code>graph_replay&gt;0</code>、address mismatch=0；<code>run_prepared_speculative_graph_e2e.sh</code> 则按 MTP/Eagle3 或 DFlash/DSpark 自动选择正确比较器，为阶段 4–6 固化同样的 Graph 验收。指标 validator 的正向/负向 mock 分别按预期退出 0/1，两类 Graph runner 在资源占用时均于模型启动前以 75 停止。</li>
+          <li>新增 <code>tools/validate_prepared_task_trace.py</code>，将 Prepare/Launch/Consume marker 与 metrics 一致、可选 Prepared staging D2D=0、最大 D2D 小于 Arena 容量、warmed CANN allocation=0、双 Slot Prepare 与前一 Task Device work 重叠，以及 Graph replay/address mismatch 变为显式门禁。<code>run_prepared_task_pipeline_trace.sh</code> 现可切换 Eager/Graph，并自动串联 msprof、分析与验收；Graph 模式在当前资源占用下于采集前以 75 停止且不创建结果目录。</li>
+          <li>Prepared trace 现支持多 rank：profiling hook 对每个 HTTP rank 保存独立 before/after metrics 和 service PID；分析器以 PID 同时过滤 MSTX、Device Task、Memcpy 与 CANN allocation，并能从包含多个 <code>msprof_*.db</code> 的结果中精确选择该 PID 所在数据库。runner 对每个 rank 独立执行相同 acceptance，最后由 <code>tools/aggregate_prepared_task_trace_validation.py</code> 强制 rank 从 0 连续、汇总 marker 并保留失败归属；speculative 仅放宽必要的 Prepared staging D2D=0 条件，整份 Arena D2D、allocation、overlap 与 Graph 地址门禁不放宽。</li>
+          <li>新增 <code>tools/compare_e2e_performance.py</code> 与 <code>run_prepared_eager_performance_ab.sh</code>：默认执行 3 组成对 Legacy/Prepared 双 Slot负载并按奇偶轮次交替先后顺序，先以既有严格比较器门禁逐请求 content/usage/metadata，再对 total/completion token throughput 与 p50/p95 client latency 的成对中位数执行可配置阈值。默认阈值只用于发现明显回退，不作为“性能收益”结论；当前资源预检按预期退出 75，尚无真实 A/B 数据。</li>
+          <li>真实模型验收脚本已固化 Legacy、Prepared Eager 单 Slot、Prepared Eager 双 Slot 三个顺序运行阶段，统一使用 Qwen3-0.6B、seed=1234、greedy、3 个 warmup 与 2×2 并发请求。比较门禁已从“仅 content mismatch 失败”收紧为模型名、请求配置、content、完整 usage、phase/wave/prompt metadata 与 finish reason 任一不一致均失败；设备存在进程时脚本在启动模型前以退出码 75 安全停止。</li>
+          <li>阶段 6 新增独立 <code>BlockSpecPreparedTaskPlan</code>/<code>BlockSpecPreparedTaskAdapter</code>：DFlash Decode 固定为 continuation→block draft→target validate→rejection→Context-KV publish/write；DSpark 在同一拓扑中按静态宽度展开固定 N 轮 Markov sample/broadcast，Prefill 的可变长度 prompt 保持 Target→Context-KV 直接写入。</li>
+          <li>新增 <code>BlockSpecDeviceStepState</code> 与固定 <code>BlockSpecContextKvPatchWorkspace</code>：accepted token/length、Context hidden、position、cache slot 和 valid mask 均按 Slot 预分配；Patch 仅用 out/in-place Device 操作从 <code>-1</code> 后缀生成固定宽度 Context-KV metadata，无效行重定向 padding slot 0，不做 D2H 或 Host 压缩扫描。</li>
+          <li>新增 <code>BlockSpecPreparedTaskBackendBase</code>：按 Slot 统一持有固定 Arena、Context-KV State/Patch workspace 和 publish source，集中处理 primary/invocation staging、Context-KV state publication、predecessor reuse fence、Task completion Event 与 Consume；派生 DFlash/DSpark Worker Backend 只需绑定固定输入、应用 continuation 并提交模型/collective invocation。</li>
+          <li>Block-Spec 跨 Task State 新增 tail token、tail Context hidden、next position 与 valid row 发布；固定 predecessor Patch 按 <code>predecessor_rows</code> gather 到下一 Task 的 anchor token/hidden/position，<code>-1</code> 新请求保留 Worker 初始值，并在读取后记录 reuse fence，不经过 Host embedding-cache 扫描。</li>
+          <li>新增 DFlash/DSpark 共用的 Worker 派生 Backend 与 factory：Prefill、Block Draft、Target Validate、EMPTY、greedy rejection 和 Context-KV write 均绑定 Slot-local 固定资源；DFlash Query/Target 同为 N+1，DSpark Query=N、Target=N+1，cache-slot view 由统一契约校验并保持原存储地址。</li>
+          <li>DSpark Prepared 为每个 Slot 预分配低秩 Markov hidden/bias/logit、sample token 和 broadcast workspace，按计划固定展开 N 轮 sample/broadcast；Markov 权重在加载期转置为 contiguous，<code>DSparkMarkovHead::bias_out()</code> 贯通 model traits、CausalLM 与 Worker，热路径输出地址固定且数值与旧 <code>F::linear</code> 等价。</li>
+          <li>DFlash/DSpark Prepared rejection 后直接以 Device position/cache-slot metadata 写入 Context KV；当前明确只支持 greedy，并拒绝 adaptive、JSON、PD transfer、DP&gt;1 和 CP&gt;1。DeepSeek-V4 multi-manager table 已由固定 Host/Device staging 支持，但仍受最多 3 个 manager 与 SWA/C4/C128 注册顺序合同约束。</li>
+          <li>DeepSeek-V4 manager 角色现已显式统一：Scheduler export、Engine manager options、模型 <code>group_infos</code> 和 Prepared Device staging 均使用存在角色的 <code>SWA → C4 → C128</code> 规范顺序，不再依赖 <code>compress_ratios</code> 的首次出现次序。metadata builder 对类型、ratio、正序和 block size fail-fast，Prepared Block-Spec 对 Target 模型角色数做精确校验；CPU-only canonical subset、C128-before-C4 拒绝及 <code>{128,4,1}</code> 反序配置 group-id 合同已纳入 Prepared 67/67。</li>
+          <li>MTP 与 Block-Spec Backend 的完整 Launch 均使用显式 <code>task_stream()</code> guard；模型 invocation 之间的 continuation、rejection、state publication、Context-KV patch/write 以及完成 Event 不再落到线程默认流，CPU 契约测试同时校验 invocation 进入时的当前流就是 Task stream。</li>
+          <li>Worker 新增 dormant DFlash/DSpark AdapterKind，并在 cache allocation 成功后构造 <code>BlockSpecPreparedTaskAdapter</code>；Engine 的 <code>predecessor_rows</code> 分类统一覆盖 MTP、Eagle3、DFlash 与 DSpark，继续排除 Suffix。Block-Spec Adapter 的双 Slot 契约已覆盖三个连续 Decode Task 的 0→1→0 复用，以及 Slot 0→Slot 1、Slot 1→Slot 0 的即时前驱读取；该接线仍仅完成编译与离线契约验证，<code>kSpeculativePreparedPipelineE2EValidated</code> 保持 false。</li>
+        </ul>
+
+        <p>阶段 1 同步模式的典型启用参数如下；其余兼容性限制仍需同时满足：</p>
+        <pre><code>--enable_prepared_task_pipeline=true
+--prepared_task_input_buffer_size=64
+--enable_schedule_overlap=false
+--enable_json_object_output=false</code></pre>
+
+        <p>阶段 2 异步双 Slot 在上述配置基础上使用：</p>
+        <pre><code>--enable_schedule_overlap=true</code></pre>
+
+        <h3>构建与测试记录</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>验证项</th><th>结果</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><code>python setup.py build</code></td>
+                <td><span class="tag green">通过</span></td>
+                <td>Graph tiling、双 Slot warmup、Graph-local forward metadata、Device-authoritative DSA、expanded/hybrid Target Verify、plan-headroom、Device-authoritative runtime KV、accepted-token fixed-width、multi-manager role-order、Python teardown GIL 修复、hybrid accepted-length 全变体 warmup 与 Kimi Eagle3 runtime alias 接入后均持续完成 gated 构建。最新源码在四个生产/E2E 门禁全部为 false 时运行标准 <code>python setup.py build</code>，准确退出码为 0，main server、export module 与 all-tests 三个 Ninja 阶段均完成；本轮 alias 变更触发的增量 all-tests 进度为 48/48。稳定 server 于 06:40:56 staged（515,623,768 字节），Python export module 于 06:41:06 生成（528,162,400 字节）；日志 <code>20260826-prepared-mtp-eagle3-checkpoint-final-build.log</code> 未命中 <code>FAILED:</code>、fatal error、Ninja stopped、Build failed 或 traceback 标记。该命令编译测试目标但未执行全部注册测试；新增 <code>model_registry_test</code> 已单独实际执行 2/2。</td>
+              </tr>
+              <tr>
+                <td><code>prepared_task_pipeline_test</code></td>
+                <td><span class="tag green">67 / 67 通过</span></td>
+                <td>在原 Pipeline/MTP/Activator 契约基础上，覆盖 Host attention 与 Worker-generated supplemental metadata 直达固定 Arena、DP/EP padding/EPLB/expanded verify/MTP shifted token staging、Host sampling control、Arena H2D/D2D 统计、Graph token source alias/stability 校验、外部 KV 状态保留、Block-Spec DeviceStepState、Context-KV patch、predecessor continuation、DFlash/DSpark 固定拓扑、Task stream 顺序、四类算法双 Slot 复用及固定地址输出。<code>StagesExpandedSpecVerifyMetadataAtStableArenaAddresses</code> 验证两轮 tokenwise expanded KV/block/paged Tensor 的底层地址和 layout signature 稳定，并对错误 <code>query_start_loc</code>、逐 token KV 值、headroom 与 paged last-page shape 分别拒绝；direct-bind metadata 不构造静态 Host runtime KV，第二轮模型 metadata 直接看到 continuation 更新后的 Arena KV。accepted-token fixed-width 合同加入后为 64/64；DeepSeek-V4 manager canonical subset、C128-before-C4 death test，以及公共 <code>canonical_dsa_token_manager_ratios()</code> 合同使目标增至 67/67。最新 hybrid accepted-length warmup 传播接入后同一 22 个 suite 仍为 67/67，命令退出码为 0；日志 <code>20260826-prepared-hybrid-accepted-warmup-pipeline-test.log</code> 未命中失败标记。新增项为离线合同，不计作真实模型 Graph E2E。</td>
+              </tr>
+              <tr>
+                <td><code>mtp_async_input_builder_test</code></td>
+                <td><span class="tag green">8 / 8 通过</span></td>
+                <td>2026-08-26 02:37:43–02:37:52 实际执行 8/8，退出码为 0；<code>KeepsGenericPagedMetadataSeparate</code> 新增非 direct-bind 对照，确认普通 expanded metadata 仍从 Host vector 构造既有 CPU tensor/vector，Device-authoritative 修复不会改变 Legacy/非 Prepared 语义。日志 <code>20260826-prepared-device-authoritative-expanded-kv-builder-test.log</code> 未命中失败标记。</td>
+              </tr>
+              <tr>
+                <td><code>profile_graph_warmup_test</code></td>
+                <td><span class="tag green">29 / 29 通过</span></td>
+                <td>Prepared Graph warmup invocation 数量合同保持：普通 schedule-overlap 双 Slot每个 bucket 执行 2 次完整 warmup，单 Slot、Legacy 与未启用 Prepared 时保持 1 次。static hybrid MTP Target Verify 现在按 accepted length 外层、Slot 内层枚举全部 key 变体；verify width=4 时单/双 Slot顺序分别为 <code>1,2,3,4</code> 与 <code>1,1,2,2,3,3,4,4</code>，非 hybrid 路径不扩增。最新实际执行 29/29，命令退出码为 0；日志 <code>20260826-prepared-hybrid-accepted-warmup-profile-test.log</code> 未命中失败标记。</td>
+              </tr>
+              <tr>
+                <td><code>embedding_cache_test</code></td>
+                <td><span class="tag green">8 / 8 通过</span></td>
+                <td>caller-owned storage 契约保持：调用方预留固定容量后，<code>read_decode_states_out()</code> 可重复写入 DecodeState 内容而不替换 vector allocation，并保持既有 cache hit/miss、更新与容量语义。最新增加 MTP synthetic warmup accepted length 对 bootstrap cache 的 position/correction offset、previous-row topology 与 <code>all_draft_accepted</code> 状态校验；实际执行 8/8，命令退出码为 0，日志 <code>20260826-prepared-hybrid-accepted-warmup-embedding-cache-test.log</code>。</td>
+              </tr>
+              <tr>
+                <td><code>dspark_confidence_head_test</code></td>
+                <td><span class="tag green">6 / 6 通过</span></td>
+                <td>覆盖 DSpark Confidence Head 多组 batch/gamma parity，并验证固定输出地址的 Markov <code>bias_out</code> 与旧 <code>F::linear</code> 数值等价。最新日志为 <code>20260821-prepared-task-pipeline-phase6-worker-wiring-markov-test.log</code>。</td>
+              </tr>
+              <tr>
+                <td>Phase 6 分阶段 Block-Spec 回归</td>
+                <td><span class="tag green">DFlash 28 / 28；DSpark 30 / 30</span></td>
+                <td>DFlash Worker Backend 初版日志为 <code>20260821-prepared-task-pipeline-phase6-dflash-backend-test-rerun.log</code>；加入 DSpark 固定 sampling/broadcast workspace 后的日志为 <code>20260821-prepared-task-pipeline-phase6-dspark-backend-test.log</code>。随后统一 task stream、Worker 接线、双 Slot 契约、固定 Prefill selected hidden 与 Host sampling control 已由最新 39/39 覆盖。</td>
+              </tr>
+              <tr>
+                <td><code>mtp_async_state_test</code></td>
+                <td><span class="tag green">24 / 24 通过</span></td>
+                <td>覆盖 predecessor_row 新增/删除/重排和重复 id 拒绝、固定地址状态发布、从 rejection 原始输出直接 Publish、tail/previous token/embedding gather、新请求和未发布行保护、Eagle3 draft→target token mapping，以及固定宽度 Context/KV metadata 与跨 cache block 的 Device position mapping。<code>PatchesChunkedTargetVerifyExpandedMetadataWithoutReplacingStorage</code> 验证 chunked 主 KV 为 sequence-scoped，expanded KV 为 tokenwise，paged indptr/compact indices/last-page-len 数值正确且所有目标存储地址不被替换；最新新增 MTP Publish 短宽度 fail-fast。2026-08-26 02:59:04 完成 24/24，退出码为 0；日志 <code>20260826-prepared-accepted-headroom-mtp-state-test.log</code> 未命中失败标记。</td>
+              </tr>
+              <tr>
+                <td><code>spec_input_builder_test</code></td>
+                <td><span class="tag green">31 / 31 通过</span></td>
+                <td>覆盖 multi-block query/target rows、SWA ring slots 与 wrap、固定 workspace、跨 block position mapping、Draft/Validate/MTP top-k 输入构造。authoritative row/scatter 合同接入后于 2026-08-25 20:21:08 完成，退出码为 0；日志 <code>20260825-prepared-dsa-cache-scatter-spec-input-builder.log</code> 未命中失败标记。</td>
+              </tr>
+              <tr>
+                <td><code>npu_deepseek_v4_indexer_test</code></td>
+                <td><span class="tag green">真实 NPU 11 / 11 通过</span></td>
+                <td>覆盖 stale Host KV=8 / Device KV=13 的 C4 boundary 场景，以及真实 NPU KV/query、positions、manager tables 与 workspace 下同时跨 C4/C128 boundary 的场景；C4 manager 使用父 storage 的窄列 view 验证列连续但行 stride=3 的物理读取，C128 与 SWA 的 2 个 request rows 分别固定扩展为 8 个 tokenwise rows。除 Device cu-seqlens/max geometry、C4/C128 positions/slots、SWA circular logical rows 与固定 SWA slot storage 外，还校验 patch 前不构造 stale Host geometry，并验证 global <code>start_pos</code> 与 C128 expanded table 指向对应 Slot workspace。最新新增 authoritative compressed row/slot 严格合同及 padding-safe cache scatter；真实 NPU 用例验证有效 slot 0 不会被后续负 padding 覆盖，index/scale cache 数值及辅助 cache 与主 cache 的 Device 一致性均正确。重复 patch 的 live block/current bytes 不增长但 geometry-only/C4-only/C128-only/SWA-only/all-manager 分别有 8/17/19/15/35 次累计 allocation request；重复 scatter 同样保持 live/current 稳定但有 24 次请求。2026-08-25 20:33:03 命令退出码为 0、11/11 通过；日志 <code>20260825-prepared-dsa-fixed-shape-cache-scatter-npu-test-r2.log</code> 未命中失败构建标记。2026-08-26 又以 <code>GTEST_FILTER=DeepseekV4IndexerTest.PreparedDsaGeometryUsesDeviceLengthsAcrossCompressionBoundary</code> 执行 CPU-only Graph builder 合同，1/1 通过且退出码为 0；日志 <code>20260826-prepared-dsa-graph-builder-cpu-focused-test.log</code>。该 1/1 不增加既有真实 NPU 11/11 计数。</td>
+              </tr>
+              <tr>
+                <td>Prepared DSA patch / cache-scatter MSTX trace</td>
+                <td><span class="tag green">定向 warmed CANN allocation 为 0</span></td>
+                <td>Patch trace 目录 <code>20260825-prepared-dsa-patch-allocation-trace-mstx-r2</code>：all-manager、geometry-only、C4-only、C128-only、SWA-only 五个 marker 内 allocation API 均为 0；全测试 2 次 <code>aclrtMallocPhysical</code> 均在首个 marker 前。五个 marker 内部 D2D 分别为 26/1696 B、4/256 B、12/768 B、13/832 B、9/608 B，最大单次 96 B。Cache-scatter trace 目录 <code>20260825-prepared-dsa-cache-scatter-trace-mstx-r3</code>：warmed marker 630.9 μs，24 个 Device task，CANN allocation 为 0，内部 D2D 4 次/12 B、最大 4 B；全测试 2 次物理 malloc 也都在 marker 前。两次 msprof application 命令和对应 1/1 测试均退出 0；这是 metadata/cache-write 定向证据，不是完整 DeepSeek-V4 模型 trace。</td>
+              </tr>
+              <tr>
+                <td><code>sampler_test</code></td>
+                <td><span class="tag green">19 通过 / 3 跳过</span></td>
+                <td>覆盖固定 greedy token-id rejection workspace，以及 Sampler <code>argmax_out</code> 直接写入调用方固定输出且地址保持；最新新增首个 draft token 即拒绝时 accepted length 精确为 1、全接受时精确为 verify width 的边界合同。2026-08-26 02:57:28 完成 19 个通过项，命令退出码为 0；3 个跳过项均为既有 MLU-only 用例。日志 <code>20260826-prepared-accepted-headroom-sampler-test.log</code>。</td>
+              </tr>
+              <tr>
+                <td><code>batch_test</code></td>
+                <td><span class="tag green">56 / 56 通过</span></td>
+                <td>Packed ForwardInput round-trip 已覆盖 <code>predecessor_rows</code>；最新继续覆盖 accepted length 从 <code>Sequence</code> 经 Batch/ForwardInput 与 shared-memory serialization 的往返传播，既有 Batch 契约保持通过。实际执行 56/56，命令退出码为 0；日志 <code>20260826-prepared-hybrid-accepted-warmup-batch-test.log</code>。</td>
+              </tr>
+              <tr>
+                <td><code>acl_graph_bucket_policy_test</code></td>
+                <td><span class="tag green">5 / 5 通过</span></td>
+                <td>在既有 Graph warmup/capture bucket 策略基础上，新增 speculative predecessor KV headroom 的 block endpoint、同 bucket 上下界、跨 bucket 及非法参数合同。2026-08-26 实际执行 5/5，退出码为 0；日志 <code>20260826-prepared-spec-verify-plan-headroom-bucket-test.log</code> 未命中失败标记。</td>
+              </tr>
+              <tr>
+                <td><code>config_json_test</code></td>
+                <td><span class="tag green">20 / 20 通过</span></td>
+                <td>包含 Prepared 默认关闭与默认 Arena 容量检查。</td>
+              </tr>
+              <tr>
+                <td><code>python setup.py test --device npu</code>（阶段 1 基线）</td>
+                <td><span class="tag orange">未全绿</span></td>
+                <td>1390 个注册测试中 29 个 disabled；其余 1361 个目标为 1354 passed、6 skipped、1 failed。唯一失败是未修改的 <code>python_executor_test</code>，其中 GLM5.2 EP 的 2 个断言单独重跑仍复现，与本分支 C++ Prepared 改动无代码交集。</td>
+              </tr>
+              <tr>
+                <td><code>scheduler_test</code></td>
+                <td><span class="tag green">57 / 57 通过</span></td>
+                <td>阶段 2 接入后，现有 schedule-overlap、fake token、last-batch 与暂停/drain 调度契约保持通过。</td>
+              </tr>
+              <tr>
+                <td>Prepared ACL Graph 绑定 / capture / replay</td>
+                <td><span class="tag green">真实 NPU 35 / 35 通过</span></td>
+                <td><code>acl_graph_executor_test</code> 在 authoritative row/scatter 合同接入后于 2026-08-25 20:25:39 完成既有 34/34 回归；2026-08-26 又执行完整目标，13 个 suite 的 35/35 用例通过。Prepared 专项实际执行显式 Slot 1 的 runtime miss Prepared Eager、warmup-only startup capture、同一 Arena replay，确认 capture 后 prepared graph 数量由 0 增至 1、replay 命中相同 graph key/native handle，且 capture/replay hidden states 通过 <code>torch::allclose</code>；<code>PreparedBindingRefreshesGraphForwardMetadataAtStableAddresses</code> 验证 capture/replay Prepare 次数、Graph-local metadata 持久地址稳定及 replay/eager 输出一致，static causal-conv signature helper 继续覆盖 capture/signal 相同签名。plan-headroom 合同接入后再次实际执行 35/35，命令退出码为 0，日志 <code>20260826-prepared-spec-verify-plan-headroom-acl-graph-test.log</code>。这仍是底层 capability 测试，不是 Qwen Worker 或 hybrid speculative Graph E2E，生产启动门禁保持关闭。</td>
+              </tr>
+              <tr>
+                <td>Qwen3-0.6B Legacy E2E 基线</td>
+                <td><span class="tag green">7 / 7 通过</span></td>
+                <td>固定随机种子 1234、greedy、3 个 warmup（含长 Prefill）与 2×2 并发请求全部成功；非流式与流式 API 通过。无效请求返回 HTTP 500，记录为既有接口语义告警。</td>
+              </tr>
+              <tr>
+                <td>Prepared E2E runner 与精确对照门禁</td>
+                <td><span class="tag green">真实运行通过</span></td>
+                <td><code>run_prepared_task_pipeline_e2e.sh</code> 已实际串联 Legacy、单 Slot、双 Slot 三个独立服务进程及最终精确比较；模型名、请求配置、content、完整 usage、phase/wave/prompt metadata 与 finish reason 全部门禁生效。流程于 2026-08-25 14:06:53–14:09:11 完成，顶层退出码为 0，日志 <code>20260825-prepared-task-pipeline-e2e-arena-reuse-fix.log</code>。</td>
+              </tr>
+              <tr>
+                <td>Prepared 真实 NPU E2E</td>
+                <td><span class="tag green">普通 LLM Eager 通过</span></td>
+                <td>Qwen3-0.6B、seed=1234、greedy、3 个 warmup（含长 Prefill）与 2×2 并发请求：Legacy 7/7、Prepared 单 Slot 7/7、Prepared 双 Slot 7/7 均 PASS，三组 total_tokens 均为 11,222，fatal marker 均为空。精确比较共 14 个可比请求，content 14/14、usage 14/14、metadata 14/14 匹配，零 mismatch，<code>passed=true</code>。结果目录 <code>20260825-prepared-task-pipeline-e2e-arena-reuse-fix</code>；结束后 NPU 无残留进程。该结果不覆盖 Graph、speculative 或性能 trace。</td>
+              </tr>
+              <tr>
+                <td>MTP 逐 step trace 与精确比较器</td>
+                <td><span class="tag green">MTP/Eagle3 5 / 5；8-rank MTP 聚合自检通过</span></td>
+                <td><code>tests.scripts.test_compare_mtp_step_trace</code> 在最终 gated 源码状态下执行 5/5 通过，命令退出码为 0；在既有逐 request 精确相等、token/base-state mismatch、非后缀 padding 与多 rank 失败归属基础上，新增 Eagle3/MTP 算法字段不一致检测。最新 Legacy MTP 的 8 个 rank trace 共含 632 条 <code>event=mtp_step_state</code>，request/base-state 字段完整；<code>--pair</code> CLI 对 8 个对应 rank 做自对照，8 组、632/632 step 精确匹配且失败文件为空，旧日志及 <code>--baseline/--candidate</code> 调用保持兼容。<code>run_prepared_eagle3_e2e.sh</code> 已按 Kimi-K2.5 Target/Eagle3 Draft、seed=1234、greedy、单/双 Slot与每 rank trace 对照接线，但仍未执行真实候选。</td>
+              </tr>
+              <tr>
+                <td>DFlash/DSpark 通用逐 step trace 与精确比较器</td>
+                <td><span class="tag green">5 / 5；多 rank runner 就绪</span></td>
+                <td><code>tests.scripts.test_compare_speculative_step_trace</code> 执行 5/5 通过；与 MTP/Eagle3 suite 合并为 10/10，独立临时 bytecode 缓存的 <code>py_compile</code> 及四个 runner 的 <code>bash -n</code> 均退出 0。比较器要求显式 <code>--algorithm DFlash|DSpark</code>，逐 request 比较 algorithm、embedding/base state、token、committed/accepted length，并聚合单/双 Slot全部对应 rank。当前只有格式、解析和 runner 静态验证，没有真实 DFlash/DSpark checkpoint 与候选 trace，不能计作阶段 6 E2E。</td>
+              </tr>
+              <tr>
+                <td>普通 LLM 逐 step trace 与精确比较器</td>
+                <td><span class="tag green">4 / 4；Graph E2E 441 / 441</span></td>
+                <td><code>tests.scripts.test_compare_llm_step_trace</code> 执行 4/4 通过；与 MTP/Eagle3、DFlash/DSpark suite 合计 14/14。比较器按 request 比较完整 greedy Decode 顺序、embedding、base position/KV 和 token，并拒绝缺失 request/base state、synthetic Graph warmup fake token 及重复 step。<code>run_prepared_graph_e2e.sh</code> 已实际串联最终响应与同调度单/双 Slot逐 step 对照；最新真实 Qwen Graph 候选分别通过 217/217 与 224/224、合计 441/441 step。</td>
+              </tr>
+              <tr>
+                <td>Prepared Graph 指标 validator / runner 预检</td>
+                <td><span class="tag green">离线门禁通过</span></td>
+                <td><code>validate_prepared_graph_metrics.sh</code> 的正向 mock 在 capture/replay 均大于 0且 address mismatch 为 0时退出 0，<code>capture=0</code> 负向 mock 按预期退出 1；runtime miss 仅记录诊断，暂不直接判失败。runner 已为单/双 Slot分别使用同 schedule-overlap 语义的 Legacy 基线并显式设置 <code>ENABLE_PREFIX_CACHE=false</code>。普通 Graph 门禁临时开启的验证产物构建成功后，runner 在 2026-08-26 启动前发现外部 PID 539652、539655、539657–539669、539671 占用全部 16 张卡，因而全空闲预检正确返回 75；未创建 <code>20260826-prepared-graph-e2e-double-slot-warmup-fix</code> 结果目录，也未启动或终止任何服务。控制台日志为 <code>20260826-prepared-graph-e2e-double-slot-warmup-fix-console.log</code>；门禁已恢复为 false 并完成最终 gated 重建。</td>
+              </tr>
+              <tr>
+                <td>Hybrid speculative Graph accepted-length / Slot trace 门禁</td>
+                <td><span class="tag green">10 / 10；完整脚本 48 / 48</span></td>
+                <td><code>validate_prepared_speculative_graph_trace.py</code> 覆盖全部变体正向、缺失/重复变体、verify-width/Slot/accepted-length 越界、static-task 未预提交、运行期 capture/缺失 replay、warmup replay、replay Graph key 与 warmup capture 不同、同 Slot不同 accepted length 复用 Graph key 及 malformed event；要求每个 rank 的每个 <code>(Slot, accepted length)</code> 恰好 warmup capture 一次、不同 accepted length 的 key 唯一，且 runtime replay 以相同 Graph key 可追溯。<code>run_prepared_speculative_graph_e2e.sh</code> 已以 <code>VALIDATE_HYBRID_ACCEPTED_GRAPH_VARIANTS=true</code> 接入单/双 Slot全部 rank。初版专项 5/5、完整脚本 43/43 后逐步补齐 Graph-key provenance 与 key-space/边界合同；标准 Python 3.11 构建容器内最终专项于 05:56:17 完成 10/10，完整 <code>tests/scripts</code> discovery 完成 48/48，退出码均为 0。宿主 Python 3.9 运行的 40 项中 37 项通过、3 项因既有 <code>str | None</code> 语法版本和 root-owned <code>xllm.egg-info</code> 权限失败，属于宿主环境不匹配，不作为标准验证结果。真实 hybrid trace 尚因设备占用未采集。</td>
+              </tr>
+              <tr>
+                <td>Qwen3-0.6B Prepared Graph 严格真实 E2E</td>
+                <td><span class="tag">推理 / Graph 通过；clean lifecycle 待复验</span></td>
+                <td>首轮真实运行发现并修复 synthetic warmup KV=16 tiling replay、双 Slot warmup 只覆盖一个 Slot以及错误对照非 overlap Legacy 三个问题。<code>20260826-prepared-graph-e2e-strict-r1</code> 使用 seed=1234、greedy、3 个 warmup 与 2×2 并发请求；Legacy 单/双 Slot和 Prepared Graph 单/双 Slot均为 7/7 请求、11,334 tokens。最终响应比较为 content 14/14、usage 14/14、metadata 14/14，零 mismatch；逐 step 对照单 Slot 217/217、双 Slot 224/224，合计 441/441。单 Slot为 capture=4、replay=31、runtime miss=186，双 Slot为 capture=8、replay=32、runtime miss=192，address mismatch 均为 0。事后复核发现旧 runner 在 cleanup 前扫描 fatal 且忽略 wait 状态，四个 case 均在 teardown 出现 pybind GIL abort，故旧 runner 退出 0 和空 fatal marker 不成立。GIL 修复后的 r2 首个 Legacy case 已无 pybind fatal，但被 10 秒窗口强杀并以 <code>shutdown_exit=137</code> 正确失败；runner 已改为默认 60 秒、zombie-aware 回收并通过离线模拟。readiness 轮询也已从裸 <code>kill -0</code> 改为 zombie-aware 检测，14 个相关脚本通过语法检查，真实 zombie/live fixture 的离线判定均符合预期。r3 因构建后 NPU 再次被 16 个上下文占用，在服务启动前停止。下一空闲窗口必须重跑四个 case 并同时满足 <code>shutdown_exit=0</code> 与 cleanup 后无 fatal marker，才能宣告完整 E2E 生命周期通过。</td>
+              </tr>
+              <tr>
+                <td>Prepared allocation / D2D / overlap trace 验收器</td>
+                <td><span class="tag green">7 / 7；真实 R8 回放通过</span></td>
+                <td><code>tests.scripts.test_validate_prepared_task_trace</code> 的 7/7 用例覆盖完整 Graph trace、marker mismatch、warmed allocation、整份 Arena D2D、Graph replay/address mismatch、overlap 可选门禁及输入不变性。对既有真实 R8 <code>trace-analysis.json</code> 回放时，Prepare/Launch/Consume 均为 447，metrics/H2D 全部一致，warmed CANN allocation=0，Prepared staging D2D=0，最大内部 D2D 373,248 字节，小于 64 MiB Arena，且 Prepare 与前一 Task Device work 有重叠，正向退出 0；将 Arena 阈值收紧到 373,248 字节时按预期以 <code>no_full_arena_d2d</code> 退出 1。Graph trace runner 资源预检退出 75，实际 Graph trace 尚未执行。</td>
+              </tr>
+              <tr>
+                <td>Prepared speculative 多 rank trace 后处理</td>
+                <td><span class="tag green">4 / 4；R8 精确兼容</span></td>
+                <td><code>tests.scripts.test_aggregate_prepared_task_trace_validation</code> 的 4/4 用例覆盖两 rank 聚合、失败 rank 保留、重复/不连续 rank 拒绝和 malformed report；两 rank CLI mock 汇总为 894/894/894 markers，最大 D2D 373,248 字节。分析器对真实 R8 分别以旧默认模式和显式 <code>pid=736844</code>、显式 rank metrics 执行，除新增 <code>profiled_pid</code> 字段外均与原 <code>trace-analysis.json</code> 逐字段精确相等；将 R8 DB 与另一真实 DSA DB 放入同一输入目录后仍精确选择包含 PID 736844 的 DB并得到 447 个 Prepare marker，不存在的 PID则按预期退出 1。8-rank MTP trace runner 在外部设备占用下于采集前退出 75 且未创建结果目录；完整 <code>tests/scripts</code> discovery 为 38/38，日志 <code>20260825-prepared-multirank-trace-python-tests.log</code>。</td>
+              </tr>
+              <tr>
+                <td>普通 LLM 无 profiler 性能 A/B 门禁</td>
+                <td><span class="tag green">7 / 7；runner 就绪</span></td>
+                <td><code>tests.scripts.test_compare_e2e_performance</code> 的 7/7 用例覆盖收益、四指标回退、三轮成对中位数抗单次异常、展示精度不得掩盖阈值失败、模型/配置不一致、请求失败和 token 计数不一致；比较器在计算吞吐前强制 baseline/candidate total 与 completion tokens 相等。与 trace validator 和三个 step comparator suite 合计 28/28；加入多 rank trace aggregation 后完整 <code>tests/scripts</code> discovery 为 38/38。runner 默认执行 3 轮且交替 Legacy/Prepared 启动顺序，正确性门禁通过后再比较 total/completion token throughput 与 p50/p95 latency；资源预检退出 75 且未创建结果目录。比较器也已读取既有单轮正确性 E2E 的真实 schema：该短负载中两侧均为 11,222 total / 112 completion tokens，Prepared/Legacy total 与 completion throughput ratio 均为 0.730615，p50/p95 latency ratio 为 1.909441/1.117647，四个默认非回退门禁均按预期失败。该历史运行不是交替顺序、多轮性能实验，不能单独定性性能回退或收益，但明确说明仍须执行正式 A/B。默认 0.95 throughput、1.10 latency 阈值只用于明显回退保护，不构成收益标准。</td>
+              </tr>
+              <tr>
+                <td>DeepSeek-V4 MTP Prepared E2E 尝试</td>
+                <td><span class="tag orange">Legacy 通过；Prepared 受资源阻塞</span></td>
+                <td>早先 R1/R2 与最新 step-audit 轮次的 Legacy MTP 基线均为 5/5 请求成功、3960 tokens；最新结果目录 <code>20260825-prepared-mtp-step-audit-e2e-r2</code> 的 fatal marker 为空。最新 Prepared 单 Slot 在 <code>worker.cpp:113</code> 被仍为 false 的 <code>kSpeculativePreparedPipelineE2EValidated</code> 按预期 fail-fast，未进入模型请求。为验证可执行产物曾临时开启门禁并于 21:04:45–21:07:09 完成 server/export/all-tests 构建，但执行 E2E 前外部 PID 3978848–3978865 重新占用 16 张卡约 57 GiB/卡；未干预外部任务，并立即恢复门禁为 false 后完成最终 gated 重构建。该结果证明门禁生效及 Legacy 审计链路可用，不能计作 Prepared MTP E2E 或逐 step 一致性通过。</td>
+              </tr>
+              <tr>
+                <td>Qwen DFlash / DSpark checkpoint 与 runner 预检</td>
+                <td><span class="tag green">DFlash 28 / 28；DSpark 32 / 32；四类 runner fail-fast</span></td>
+                <td>公共 <code>safetensors_manifest.py</code> 只读取 index/shard header、不加载 payload；<code>validate_block_spec_checkpoint_pair.py</code> 除原有路径/config 合同外，现按真实 Qwen DFlash/DSpark loader 验证 Target 前缀、embedding/final norm/首末层 norm/LM head，Draft 根/<code>model.</code> 双前缀、5H <code>fc</code>、hidden/final norm、五层 attention/MLP/norm 全部键与 shape，以及所有 index shard；DSpark 额外验证 <code>Qwen3DSparkModel</code> alias、Markov 两矩阵、confidence projection/可选 bias，并支持 4B tied embedding LM head。DeepSeek-V4 DSpark 另按 runtime 把 43 层 config 主干映射为 3 层 <code>mtp.0/1/2</code>，验证 main projection、dedicated embedding/head、4H HC、Markov/confidence 和 46/74 个 shard。专项 22/22、完整脚本 89/89、Prepared C++ 67/67、registry 3/3。两组真实 DFlash 配置均为 28/28，Target/Draft shard 数为 5/1 与 11/1；Qwen3-4B/8B/14B 三组与 DeepSeek-V4 一组 DSpark 均为 32/32，Qwen shard 数为 3/1、5/1、8/1。三轮四类 runner 共二十四次复验均为错误算法配对退出 1、正确配对通过合同后因 PID 1286019–1286034 占卡退出 75，二十四个结果目录均不存在。DFlash 报告为 <code>20260826-qwen3-8b-dflash-checkpoint-pair.json</code> 与 <code>20260826-qwen35-27b-dflash-checkpoint-pair.json</code>，DSpark 报告为 <code>20260826-qwen3-{4b,8b,14b}-dspark-checkpoint-pair.json</code> 与 <code>20260826-deepseek-v4-dspark-checkpoint-pair.json</code>；最终标准构建日志为 <code>20260826-prepared-deepseek-dspark-weight-contract-build.log</code>。尚未加载完整权重或执行真实请求，不能计作 E2E。</td>
+              </tr>
+              <tr>
+                <td>Block-Spec runner / runtime 配置完成性审计</td>
+                <td><span class="tag green">前置参数闭环；C++ 105 / 105；标准构建通过</span></td>
+                <td>逐项复核 Eager、speculative Graph、profiler trace 与 Eager/Graph trace-matrix runner：四类路径均经公共 <code>run_standalone_case.sh</code> 固定传入 <code>--enable_chunked_prefill=true</code>，并统一下发 Draft 路径、算法、speculative width；DFlash/DSpark 默认使用 TORCH NPU kernel，DeepSeek-V4 DSpark 不需要额外 Target <code>--backend</code> override。审计发现 DeepSeek-V4 DSpark Draft 原先在解析 checkpoint block size 时误读 <code>options.model_path()</code> 的 Target 配置；显式 width 虽会覆盖成功，但日志会把 Target 的 0 误作 Draft checkpoint 值，未显式覆盖时的语义也不可靠。现由 DeepSeek-V4 loader 把真实 Draft <code>dspark_block_size=5</code> 保留在 <code>ModelArgs</code>，Target Worker 在进入共享模型前显式清零，DSpark Draft 再应用 <code>--num_speculative_tokens</code> override 并对最终值 fail-fast，避免重新打开错误路径的 config。CPU-only 回归为 HF loader 9/9、配置 20/20、DSpark Confidence/Markov 6/6、Prepared 核心 67/67、registry 3/3，总计 105/105；定向日志 <code>20260826-prepared-dspark-block-size-hf-test.log</code> 与 <code>20260826-prepared-dspark-block-size-cpp-tests.log</code>。最终 <code>python setup.py build</code> 退出 0，server、export 与 all-tests 均构建成功，日志 <code>20260826-prepared-dspark-block-size-final-build.log</code>；server mtime 为 08:39:28、大小 515,631,912 字节。四个生产门禁仍为 false；该轮没有加载完整权重或执行请求，不能计作 DSpark E2E。</td>
+              </tr>
+              <tr>
+                <td>DeepSeek-V4 MTP / Kimi-K2.5 Eagle3 checkpoint 与 runner 预检</td>
+                <td><span class="tag green">MTP 25 / 25；Eagle3 24 / 24；registry 3 / 3；五类 runner 接入</span></td>
+                <td>新增 <code>validate_mtp_eagle3_checkpoint_pair.py</code> 并接入 MTP Eager、Eagle3 Eager、speculative Graph、profiler trace 与 trace-matrix，在设备检查前验证 target/draft runtime 类型、architecture、权重、hidden/vocab、MTP family/层数、特殊 token 和 Eagle3 单层/3H capture/vocab 子集。除 <code>kimi_k25_eagle3</code> Draft alias 与 ATB 默认外，又新增保留 VLM 自动后端的 Kimi text-only CausalLM Target factory、<code>language_model.*</code> 权重前缀加载、DeepSeek-V2 3H aux capture，并由 Eagle3 runner 显式选择 <code>--backend=llm</code>。validator 会读取真实 safetensors index/shard header且不加载 payload；除 Kimi Target/Draft 前缀、模块和 3H/output shape 外，现又强制 DeepSeek-V4 Target 的根前缀、首末层、embedding/norm/lm_head 与 4H HC head shape，并强制 MTP Draft 的 <code>model.layers.0.*</code>、norm/projection/attention/FFN/4H HC head shape，同时显式记录 embedding 与 LM head 来自 Target 共享、拒绝两侧 <code>hc_mult</code> 不一致，并要求所有 index 引用 shard 存在。最新专项 20/20、<code>model_registry_test</code> 3/3、完整脚本 discovery 90/90、Prepared 核心 67/67 通过。DeepSeek-V4 MTP 25 项与 Kimi Eagle3 24 项真实配置检查全绿，shard 数量分别为 70/1 与 126/2，前者的 target/draft inspected 均为 true。五类 runner 共 10 次复验全部满足错误配对退出 1、正确配对通过合同后因 PID 1286019–1286034 退出 75、结果目录不存在；最终标准构建和两个 C++ 测试入口均退出 0。JSON 报告为 <code>20260826-deepseek-v4-mtp-checkpoint-pair.json</code> 与 <code>20260826-kimi-k25-eagle3-checkpoint-pair.json</code>，最新构建日志为 <code>20260826-prepared-eagle3-options-token-map-final-build.log</code>。尚未加载完整权重或执行真实请求，不能计作 MTP/Eagle3 E2E。</td>
+              </tr>
+              <tr>
+                <td>Eagle3 Target/Draft Options 与 token mapping 合同</td>
+                <td><span class="tag green">Options 透传修复；真实 24 / 24；脚本 90 / 90</span></td>
+                <td>完成性审计发现 Eagle3 已把 Target 的 Graph aux hidden capture 设为 true、Draft 设为 false，但 MTP 共享构造函数在创建 Draft Worker 前再次套用 MTP 默认值，导致 Eagle3 Draft 被错误改回 true。共享构造函数现把派生算法提供的 Target/Draft Options 作为最终配置，并对 Target 非 Draft、Draft engine 与单 token invocation 做启动期 fail-fast；Eagle3 Graph 因而只在 Target 保留所需 3H aux output，不再给 Draft 建立无用的 Graph aux persistent state。另将 vocab 子集合同收紧为：Draft/Target vocab 相等时可省略根级 <code>d2t</code> 并采用 identity；严格子集必须存在 shape 精确为 <code>[draft_vocab]</code> 的 <code>d2t</code>。runtime 在 Draft 加载后还校验映射维数、完整覆盖和 Target token 范围。真实 Kimi checkpoint 两侧均为 163,840 vocab且无 <code>d2t</code>，按 identity 合同 24/24 通过；新增负向/正向 fake checkpoint 分别验证“子集无映射失败”和“补齐完整映射通过”。专项 20/20、完整 <code>tests/scripts</code> 90/90，Prepared 67/67、registry 3/3、HF loader 9/9；C++ 汇总日志 <code>20260826-prepared-eagle3-options-token-map-cpp-tests.log</code>。标准构建日志 <code>20260826-prepared-eagle3-options-token-map-final-build.log</code> 退出 0，server mtime 为 08:54:47、大小 515,631,960 字节。当前无空闲 NPU，未执行 Eagle3 Graph capture/replay 或请求 E2E，生产门禁保持关闭。</td>
+              </tr>
+              <tr>
+                <td>MTP Backend 跨 Slot 状态发布 / 消费合同</td>
+                <td><span class="tag green">Prepared 68 / 68；随机复用压力 1,800 / 1,800；新增合同 100 / 100</span></td>
+                <td>完成性审计发现 Block-Spec Backend 已贯通测试“发布前驱 DeviceStepState → 按当前 batch 重排映射修补下一 Slot → 记录并等待 reuse fence”，而 MTP Backend 仅分别覆盖 staging 与底层状态函数。新增对称的 Backend 集成合同，以三行完整/部分接受结果发布固定 token、embedding、position 与 KV 状态，再由下一 Slot 使用 <code>{1,-1,0}</code> 映射读取重排前驱；验证命中行同时更新 tail/previous token、embedding、position、KV，未命中行保留 Worker 初始值，published/continuation storage 地址不变，且前驱 reuse fence 被记录并等待。标准 <code>python setup.py test --test-name prepared_task_pipeline_test --device npu</code> 实际编译并执行 68/68；既有 Pipeline、MTP/Block-Spec Adapter/Backend 18 项以随机顺序重复 100 轮为 1,800/1,800，新增 MTP 合同单独重复 100 轮为 100/100，均退出 0。最终 <code>python setup.py build</code> 顶层退出 0，server、export、all-tests 三阶段成功，稳定 server 于 09:19:39 staged；日志 <code>20260826-prepared-mtp-backend-contract-final-build.log</code> 未命中失败标记。该证据覆盖 CPU fixed-buffer 协议和次序稳定性，不替代真实 NPU stream/Event、模型数值或 E2E。</td>
+              </tr>
+              <tr>
+                <td>MTP Publish Device / dtype fail-fast 合同</td>
+                <td><span class="tag green">MTP Async 26 / 26；Prepared 70 / 70；正向重复 200 / 200</span></td>
+                <td>继续审计发现 <code>publish_mtp_device_step_state_from_outputs()</code> 原先主要校验 shape，MTP Backend 也只显式覆盖 accepted token、publish workspace 与 accepted embedding 的部分 Device 关系；<code>embedding_placeholder</code>、base position/KV、全部固定 destination/workspace 以及 dtype 仍可能等到真正算子提交时才失败。现于任何 <code>zero_</code>、<code>copy_</code>、<code>index_select_out</code> 或 <code>where_out</code> 之前，对五类 source、九类 DeviceStepState storage 和九类 publish workspace storage 统一校验 defined、Device 与 dtype；Backend Launch 边界同时显式校验 placeholder、position/KV 的 Device 及五类 source dtype。检查只读取 Tensor 元数据，不触发 Device 同步。新增 CPU/Meta Device 错配与 float/double、int/long dtype 错配 death test，并保留固定地址发布、tail/previous gather 与跨 Slot continuation 正向合同。标准入口实际执行 <code>mtp_async_state_test</code> 26/26、<code>prepared_task_pipeline_test</code> 70/70；底层发布和 Backend 跨 Slot正向合同又各重复 100 轮，合计 200/200。最终 <code>python setup.py build</code> 顶层退出 0，server、export、all-tests 三阶段完成且无失败标记；稳定 server 于 09:39:33 staged（515,632,104 字节），export module 于 09:39:43 生成（528,236,264 字节），日志 <code>20260826-mtp-publish-contract-final-build.log</code>。该证据验证 CPU/Meta 边界合同和 NPU 条件编译，不替代真实模型 NPU E2E。</td>
+              </tr>
+              <tr>
+                <td>MTP Continuation Device / dtype fail-fast 合同</td>
+                <td><span class="tag green">MTP Async 27 / 27；Prepared 71 / 71；正向重复 200 / 200</span></td>
+                <td>继续沿跨 Slot 边界审计，发现 <code>patch_mtp_continuation_rows()</code> 在 predecessor gather、valid-mask <code>where_out</code> 和 continuation <code>copy_</code> 前仍主要依赖 shape 合同，Backend 的 <code>bind_continuation_state()</code> 也未完整覆盖 predecessor、continuation 与固定 workspace 的 Device/dtype。现于任何 continuation 算子提交前统一校验 predecessor state、continuation state 和全部固定 workspace 均 defined、位于同一 Device，并逐类要求 token/index/mask 使用 long/bool、embedding 使用对应浮点 dtype、position/KV 使用 long；Backend binding 边界同步 fail-fast。新增 CPU/Meta Device 与 int/long dtype 错配 death test，并通过窄 Backend 测试入口避免在多线程 death child 中执行整个 <code>prepare()</code>。标准入口实际执行 <code>mtp_async_state_test</code> 27/27、<code>prepared_task_pipeline_test</code> 71/71；底层 publish/patch 与 Backend 跨 Slot正向合同各重复 100 轮，合计 200/200。最终 <code>python setup.py build</code> 顶层退出 0，server、export、all-tests 三阶段均完成，all-tests 增量 48/48 且日志无失败标记；稳定 server 于 10:19:40 staged（515,632,000 字节），export module 于 10:19:50 生成（528,236,168 字节），日志 <code>20260826-mtp-continuation-contract-final-build.log</code>。该证据覆盖 CPU/Meta 元数据合同与 NPU 条件编译，不替代真实 NPU stream/Event、模型数值或 E2E。</td>
+              </tr>
+              <tr>
+                <td>Block-Spec Publish / Continuation Device / dtype 合同</td>
+                <td><span class="tag green">Prepared 75 / 75；正向重复 200 / 200；标准构建通过</span></td>
+                <td>阶段 6 的对称审计发现 <code>publish_block_spec_context_kv_state()</code> 原先只校验少量 source Device，固定 DeviceStepState/Context-KV workspace 的定义、Device 和 dtype 可能到 <code>fill_</code>、<code>copy_</code>、<code>index_select_out</code> 或 cache-slot gather 时才失败；<code>patch_block_spec_continuation_rows()</code> 在 predecessor gather、<code>where_out</code> 和 destination copy 前也几乎只有 shape 合同。现于任何写操作前统一校验 publish 的四类 source、十类 DeviceStepState storage、九类 Context-KV workspace，以及 continuation 的 predecessor/目标和九类固定 workspace 均 defined、位于同一 Device，并逐类匹配 long/bool、hidden、position 与 cache-slot dtype。Backend 的 publish source binding/Launch 边界也显式比较 source 与固定 DeviceStepState 的 Device/dtype。新增 CPU/Meta Device、int/long dtype 以及 Backend binding death test；标准入口实际编译并执行 <code>prepared_task_pipeline_test</code> 75/75。底层固定地址 Context-KV publish 与 Backend 跨 Slot publish→continuation/reuse-fence 两个正向合同各重复 100 轮，合计 200/200。最终 <code>python setup.py build</code> 顶层退出 0，server、export、all-tests 三阶段完成，all-tests 48/48 且日志无失败标记；稳定 server 于 10:35:44 staged（515,632,360 字节），export module 于 10:35:54 生成（528,236,520 字节），日志 <code>20260826-block-spec-state-contract-final-build.log</code>。该证据覆盖 CPU/Meta 边界合同和 NPU 条件编译，不替代真实 DFlash/DSpark 模型 E2E、stream/Event 或数值验收。</td>
+              </tr>
+              <tr>
+                <td>Block-Spec Decode Geometry / Target Token Device / dtype 合同</td>
+                <td><span class="tag green">Prepared 77 / 77；正向重复 200 / 200；标准构建通过</span></td>
+                <td>继续沿阶段 6 的 Decode 写入边界审计，发现 <code>patch_block_spec_decode_input_geometry()</code> 在 token、position、KV length 与 cache-slot 原位写入前仍可能依赖底层算子报告 Device/dtype 错配，<code>patch_block_spec_target_token_ids()</code> 也未在 copy 前显式约束 source/destination。现于任何 geometry 写操作前统一校验 continuation token/position、Query/Target 全部固定 tensor、source block table 与两侧全部 geometry workspace 均 defined、位于同一 Device，并逐类要求 token、position、KV length、cache slot、block table 与索引 storage 使用 long；target-token patch 在 copy 前同样要求两侧 Device 一致且 dtype 为 long。新增 geometry CPU/Meta Device 与 cache-slot int/long 错配、target-token CPU/Meta Device 与 long/int 错配 death test。标准入口实际编译并执行 <code>prepared_task_pipeline_test</code> 77/77；<code>PatchesTokenwiseQueryAndTargetGeometryInPlace</code> 与 <code>SupportsDSparkQueryAndTargetWidthsWithoutReplacingStorage</code> 两个固定地址正向合同各重复 100 轮，合计 200/200，日志 <code>20260826-block-spec-geometry-contract-positive-repeat.log</code>。最终 <code>python setup.py build</code> 顶层退出 0，server 1/1、export 2/2、all-tests 48/48 三阶段完成且无失败标记；稳定 server 于 10:48:25 staged（515,632,360 字节），export module 于 10:48:36 生成（528,236,520 字节），日志 <code>20260826-block-spec-geometry-contract-final-build.log</code>。该证据覆盖 CPU/Meta 元数据合同与 NPU 条件编译，不替代真实 DFlash/DSpark 模型 E2E、stream/Event 或数值验收。</td>
+              </tr>
+              <tr>
+                <td>MTP Next-Draft / Target-Verify Device / dtype 合同</td>
+                <td><span class="tag green">MTP Async 29 / 29；Prepared 77 / 77；正向重复 500 / 500</span></td>
+                <td>阶段 4/5 的后续对称审计发现 <code>patch_mtp_next_draft_input()</code> 与 <code>patch_mtp_target_verify_input()</code> 在首次 token/embedding/position/KV/cache-slot <code>copy_</code> 或 geometry 算子提交前仍主要依赖 shape；不同 Device 或 int/long、float/double 错配可能延迟到热路算子才失败。现于任何写操作前统一校验 next-draft 的 token/embedding/position/KV source、全部固定 destination、block table 与四类 geometry workspace，以及 target-verify 的 continuation/draft token sources、position/KV base、全部固定 destination、可选 expanded paged metadata 与完整固定 workspace，要求同一 Device 并按 token、embedding、position/KV、cache-slot/block-table、bool 与 long index 逐类匹配 dtype；expanded paged metadata 缺少任一成员也在首次写入前 fail-fast。新增 next-draft 与 target-verify 的 CPU/Meta Device、int/long workspace/source dtype 错配 death test。标准入口实际执行 <code>mtp_async_state_test</code> 29/29 与 <code>prepared_task_pipeline_test</code> 77/77；普通/模型管理 next-draft、普通/模型管理 target-verify 及 expanded chunked target-verify 五条固定地址正向路径各重复 100 轮，合计 500/500，日志 <code>20260826-mtp-next-draft-target-contract-positive-repeat.log</code>。最终 <code>python setup.py build</code> 顶层退出 0，server 1/1、export 2/2、all-tests 48/48 三阶段完成且无失败标记；稳定 server 于 11:07:35 staged（515,632,360 字节），export module 于 11:07:45 生成（528,236,520 字节），日志 <code>20260826-mtp-next-draft-target-contract-final-build.log</code>。该证据覆盖 CPU/Meta 元数据合同与 NPU 条件编译，不替代真实 MTP/Eagle3 模型 E2E、stream/Event、Graph replay 或数值验收。</td>
+              </tr>
+              <tr>
+                <td>DSpark Prepared Sampling Device / dtype 合同</td>
+                <td><span class="tag green">Prepared 78 / 78；正向重复 100 / 100；标准构建通过</span></td>
+                <td>阶段 6 的 DSpark 固定 Markov sampling 审计发现 reset、previous-token chain 与 commit 原先只检查少量 defined/device 条件；完整 workspace、逐 step view、logit/probability dtype 以及 Worker 的 base-logits/broadcast token 关系可能到 <code>fill_</code>、<code>copy_</code>、Markov head、sampler 或 collective 才失败。现由公共合同在任何 workspace 写入前校验 token matrix、previous/greedy outputs、proposal probability、Markov embedding/bias/logits 与当前/前一 step view 均 defined、位于同一 Device，并逐类要求 long token、float32 probability 与一致 logit dtype；reset 在首个 <code>fill_</code> 前验证全部 step。Worker 在采样准备前显式校验 base logits 与固定 step logits 的 Device/dtype，broadcast 前校验固定 greedy token 的 Device 与 long dtype。新增 anchor CPU/Meta、step logits float/double、proposal probability float/double 与 broadcast/commit token CPU/Meta 错配 death test。标准入口实际编译并执行 <code>prepared_task_pipeline_test</code> 78/78；三步 Markov previous-token chain、greedy output、token matrix 与 proposal probability 固定地址正向合同重复 100 轮为 100/100，日志 <code>20260826-dspark-sampling-contract-positive-repeat.log</code>。最终 <code>python setup.py build</code> 顶层退出 0，server 1/1、export 2/2、all-tests 48/48 三阶段完成且无失败标记；稳定 server 于 11:24:34 staged（515,632,776 字节），export module 于 11:24:49 生成（528,236,936 字节），日志 <code>20260826-dspark-sampling-contract-final-build.log</code>。该证据覆盖 CPU/Meta 元数据合同与 NPU 条件编译，不替代真实 DSpark Markov head、collective、模型数值或 E2E。</td>
+              </tr>
+              <tr>
+                <td>Block-Spec Context-KV Write Device / dtype 合同</td>
+                <td><span class="tag green">Prepared 80 / 80；聚焦 2 / 2；正向重复 100 / 100</span></td>
+                <td>阶段 6 的 Draft Context-KV cache scatter 边界审计发现，<code>write_context_kv()</code> 进入模型 scatter 前未集中验证 hidden、position 与 cache-slot Tensor 的完整 Device/dtype/shape 关系，错误输入可能延迟到底层 cache 写算子后才失败。现新增 <code>check_context_kv_write_tensor_contract()</code>，并在设置 compute stream guard、创建 PD-PUSH completion 状态或提交任何 Draft cache scatter 前调用：三类 Tensor 必须 defined，hidden 必须为二维且列宽匹配 Worker context hidden size，position/cache slot 必须为一维，三者行数相同、全部位于 Worker Device，hidden dtype 匹配 Worker dtype，position/cache slot 固定为 int32。CPU/Meta Device、float/double、int/long 与行数不一致负向聚焦合同 1/1，固定写入 Tensor 正向聚焦合同 1/1，后者在相同 storage 合同下重复 100 轮为 100/100；日志分别为 <code>20260826-block-spec-context-kv-contract-focused-test.log</code>、<code>20260826-block-spec-context-kv-contract-positive-focused-test.log</code> 与 <code>20260826-block-spec-context-kv-contract-positive-repeat.log</code>。标准入口实际编译并执行 <code>prepared_task_pipeline_test</code> 80/80，退出码 0；日志 <code>20260826-block-spec-context-kv-contract-prepared-test.log</code>。随后四个生产/Graph 门禁保持 false 的源码完成标准 <code>python setup.py build</code>，顶层退出码 0，server、export 与 all-tests 三阶段完成，本轮 all-tests 进度 49/49，日志未命中 <code>FAILED:</code>、fatal error、Ninja stopped、Build failed 或 traceback；稳定 server 于 11:43:36 staged（515,632,960 字节），export module 于 11:43:47 生成（528,237,128 字节），日志 <code>20260826-block-spec-context-kv-contract-final-build.log</code>。该证据覆盖写入前 CPU/Meta 元数据合同与 NPU 条件编译，不替代真实 DFlash/DSpark cache scatter 数值、PD-PUSH、stream/Event、Graph replay 或模型 E2E。</td>
+              </tr>
+              <tr>
+                <td>Prepared Rejection / Block-Spec Fixed Output Binding 合同</td>
+                <td><span class="tag green">Sampler 20 / 20；Prepared 82 / 82；正向重复 200 / 200</span></td>
+                <td>继续审计阶段 4–6 共用的固定输出 greedy rejection 与 Block-Spec Worker binding，发现 <code>greedy_masked_sample_from_token_ids_out()</code> 在首次 <code>copy_</code>/<code>eq_out</code> 前虽检查 shape/dtype，但未先验证三类 source 和五块 workspace 均 defined 且位于同一 Device；DFlash Draft 广播与 Target rejection 也未显式证明模型返回 Tensor 仍绑定 Slot 预分配输出，<code>broadcast_spec_tokens()</code> 中的 <code>contiguous()</code> 理论上可替换 handle。现由共享 rejection 合同于任何 workspace 写入前完成 defined、shape、Device 与 long/bool dtype 全量校验，因而同时覆盖 MTP 和 Block-Spec。Worker 侧新增 <code>check_fixed_prepared_output_binding()</code>，在 Draft 广播前后以及 Target rejection 写入前验证实际输出与固定 storage 的元素数、Worker Device、dtype、contiguous 和 <code>data_ptr</code> 身份；Target context hidden 也必须匹配 Worker dtype 与固定地址，错误 binding 不会先污染 rejection workspace。CPU/Meta、int/long、未定义 workspace 和独立 storage 地址负向合同均通过；标准 <code>sampler_test</code> 实际运行 23 项，其中 20/20 通过、3 项 MLU-only fused 用例明确跳过，日志 <code>20260826-prepared-rejection-contract-sampler-test.log</code>；<code>prepared_task_pipeline_test</code> 82/82，日志 <code>20260826-prepared-rejection-output-binding-prepared-test.log</code>。共享 rejection 五块 workspace 地址与 Worker fixed-view 地址两条正向合同各重复 100 轮，合计 200/200；日志为 <code>20260826-prepared-rejection-contract-positive-repeat.log</code> 与 <code>20260826-block-spec-output-binding-positive-repeat.log</code>。四个生产/Graph 门禁保持 false 的源码随后完成标准 <code>python setup.py build</code>，顶层退出码 0，server、export 与 all-tests 三阶段完成，本轮 all-tests 进度 50/50且日志无失败标记；稳定 server 于 12:11:12 staged（515,698,680 字节），export module 于 12:11:22 生成（528,237,304 字节），日志 <code>20260826-prepared-rejection-output-binding-final-build.log</code>。该证据覆盖 CPU/Meta 合同、固定地址和 NPU 条件编译，不替代真实 MTP/Eagle3/DFlash/DSpark rejection 数值、collective、stream/Event 或模型 E2E。</td>
+              </tr>
+              <tr>
+                <td>MTP / Eagle3 非连续固定输出列写回合同</td>
+                <td><span class="tag green">Sampler 21 / 21（3 跳过）；MTP Async 31 / 31；Prepared 84 / 84；正向重复 100 / 100</span></td>
+                <td>Eagle3 的 <code>draft_token_matrix.select(dim=1, ...)</code> 是非连续固定列 view；旧 mapping helper 对输出执行 <code>flatten()</code> 后可能只写入临时 Tensor，而没有更新 Slot storage。现由 Eagle3 直接把固定列 view 传给 <code>index_select_out</code>，MTP/Eagle3 共用固定列 copy helper，并在映射、Sampler <code>argmax_out</code>、Prepared 模型 token/embedding 输出及 selected embedding gather 边界统一验证 shape、Device、dtype、连续性与 <code>data_ptr</code> 身份。<code>sampler_test</code> 24 项中的 21/21 通过、3 项 MLU-only 明确跳过；<code>mtp_async_state_test</code> 31/31、<code>prepared_task_pipeline_test</code> 84/84 均通过，退出码均为 0；非连续 mapping 固定地址正向合同重复 100 轮为 100/100。日志为 <code>20260826-mtp-eagle3-fixed-output-sampler-test.log</code>、<code>20260826-mtp-eagle3-fixed-output-state-test.log</code> 与 <code>20260826-mtp-eagle3-fixed-output-prepared-test.log</code>。本轮聚焦入口编译 27 个目标并执行 Prepared 24 个 suite，不替代最新标准完整构建；最新完整构建仍为上一行 all-tests 50/50 轮次。四个生产/Graph 门禁保持 false，真实 Eagle3 NPU 模型数值、stream/Event、Graph replay 与 E2E 仍未因此完成。</td>
+              </tr>
+              <tr>
+                <td>Prepared E2E NPU 资源预检 fail-closed</td>
+                <td><span class="tag green">9 条工作流接入；三次探测重试与隔离验证产物合同通过</span></td>
+                <td>设备占用期间进一步观察到 <code>npu-smi info</code> 可能因 DCMI 初始化失败而不产生可解析进程表；公共 <code>prepared_npu_preflight.sh</code> 现默认最多探测 3 次、失败间隔 2 秒：任一次完整成功且无活动进程返回 0，明确 busy 立即返回 75，连续探测失败也 fail-closed 返回 75；<code>PREPARED_NPU_PREFLIGHT_PROBE_ATTEMPTS</code> 与 <code>PREPARED_NPU_PREFLIGHT_RETRY_SECONDS</code> 可覆盖默认值，非法配置返回 2。离线 mock 验证 idle=0、busy=75、连续三次 failure=75 且确实执行 3 次、非法 attempts/delay=2。普通 Eager/Graph、MTP、Eagle3、Block-Spec、speculative Graph、trace matrix、profiler trace 与性能 A/B 共 9 条工作流接入；普通 Eager 四 case 还补齐 case 间空闲复核。<code>run_standalone_case.sh</code> 另支持通过 <code>XLLM_BIN</code> 指定隔离验证 server，并在创建 case 目录前验证可执行文件；无效路径返回 2 且不创建目录。仅开启普通 <code>kPreparedGraphE2EValidated</code> 生成的隔离产物为 <code>build/xllm/core/server/xllm-prepared-graph-validation</code>（515,632,080 字节，SHA-256 <code>853ac025f5363297dda4018be7f9dfd2649a7117bc1720bfc2db4933dcba8246</code>），源码与稳定 server 随后恢复四门禁全 false。r4/r5 在 runner 启动前遇到 DCMI <code>-8005</code>，r6/r7 均连续三次探测失败；r8–r11 的外层公共预检均短暂返回 0，但 runner 启动前二次预检又各自连续三次 <code>-8005</code>；r12 外层预检则连续三次直接遇到 <code>-8005</code>。r4–r12 九轮均按合同退出 75，未创建对应结果目录、未启动服务、未干预外部任务；最近保存的 r11 console 日志为 <code>20260826-prepared-graph-e2e-clean-lifecycle-r11-console.log</code>。最新标准完整构建仍由 Prepared Rejection / Block-Spec Fixed Output Binding 合同轮次覆盖；其后的 MTP/Eagle3 固定输出修复只执行聚焦编译与测试。公共 helper 与 14 个 runner 共 15 个 shell 文件均纳入语法门禁；当前环境无 <code>shellcheck</code>，未宣称其通过。</td>
+              </tr>
+              <tr>
+                <td>Prepared Eager 双 Slot 稳态 trace</td>
+                <td><span class="tag green">真实 NPU 稳态 allocation / D2D / overlap 通过</span></td>
+                <td>R7 冷形状窗口完成 25/25 请求并记录 Prepare/Launch/Consume 各 446 条，但同时捕获 <code>aclrtMallocPhysical</code> 11 次与 Host allocation 5 次，因此明确未作为稳态通过。R8 在同一服务内先执行 batch=4、max_tokens=32、6 轮同形状预热，再以 msprof <code>host/start_info</code> 精确开窗；预热与采集均为 25/25 PASS，采集负载 51,897 tokens。窗口内三类 MSTX marker 各 447 条，全部与 metrics 增量一致；H2D 447 次、285,840 字节也与 Arena 指标精确一致。CANN allocation 计数为空，Prepared Arena D2D 为 0；msprof 的 50 次内部 D2D 共 6,363,268 字节、最大 373,248 字节，未出现 64 MiB Arena 整份复制。447/447 个 Prepare 与真实 Device Task 相交，按最近 Launch 起点归属为 446/446；双 Slot launch-end READY 为空 7/447（1.57%）。全局 Device busy gap 为 p50 232.905 μs、p95 1,090.181 μs、p99 2,397.048 μs、max 364,307.759 μs；这些值包含 task-time profiler 扰动，只作为诊断基线，不宣称性能收益。TCMalloc growth 仅新增 1 个 115,351,552-byte 采样估值栈，符号化归属 brpc HTTP response，Prepared 相关栈为 0；采样证据不等同于进程全局 Host 零分配。粗粒度 <code>npu-smi</code> 为 HBM +3 MiB、进程显存 +4 MiB。结果目录 <code>20260825-prepared-task-pipeline-trace-mstx-r8</code>，<code>trace-analysis.json</code> 与 <code>tcmalloc-growth-analysis.json</code> 权限均为 0644；msprof application 模式退出码 0，结束后 NPU 无残留进程。服务 SIGTERM 清理后仍出现既有 pybind GIL/core-dump teardown 告警，发生在请求、快照与 profiler 采集完成之后，未误报为“日志完全无异常”。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>尚未完成 / 不得误报</h3>
+        <ul class="no-list">
+          <li>阶段 2 普通 LLM 的 fake-token 调度结果及 Legacy/Prepared 固定随机种子逐请求 content/usage/metadata 精确一致已由单/双 Slot 真实 E2E 通过；稳态 trace 已确认 Prepare(N+1) 与真实 Device Task 重叠，并记录 device inter-task gap、allocation 与 Copy 基线。无 profiler 扰动的交替顺序三轮 A/B runner 和成对中位数门禁已完成，但尚未获得真实吞吐、时延和 gap A/B 数据；不能仅依据诊断 trace 或默认非回退阈值宣称性能收益。</li>
+          <li>阶段 3 的普通 Qwen Graph 推理与 Graph 正确性证据已闭环：14/14 最终响应、441/441 Decode step精确一致，两个 Slot均完成 capture/replay且 address mismatch=0；但 r1 四个服务在 teardown 出现 pybind GIL abort，旧 runner 曾漏报。GIL 修复后的 r2 已消除首个 case 的 pybind fatal，但该进程被旧 10 秒窗口强杀为 137；runner 的 shutdown 与 readiness 现都使用 zombie-aware 进程状态，后者不再把 ready 前的 zombie 误当存活并等待 900 秒。14 个相关 shell runner 通过语法检查，真实 zombie/live fixture 离线合同通过；完整四 case clean-lifecycle 仍因 NPU 占用未复验。因此 Graph 专项 allocation/D2D/overlap profiler trace 与无 profiler 扰动的性能 A/B仍未完成；这些证据完成前不得宣称阶段 3 完整生命周期或 Graph 性能收益，Worker 中的生产门禁继续保持关闭。</li>
+          <li>阶段 4 剩余：cache allocation 后延迟构造、销毁顺序和 exactly-once Activator 已接线并通过离线/NPU 编译验证，MTP/Eagle3 共用 Adapter 的双 Slot 0→1→0 与即时前驱读取契约也已覆盖；DeepSeek-V4 MTP 的 Legacy 基线已在三个验收轮次保持 5/5，最新 8-rank trace 已记录 632 个可逐 request 对照的 step。当前 Prepared consume trace、稳定 request key、16 组对应 rank runner，以及逐 rank allocation/D2D/overlap/Graph trace 分析与聚合门禁均已接线并完成离线验证。DeepSeek-V4 Target/Draft 要求的 graph-forward metadata 已建立每个 Slot/key 独立的持久 state 与 Prepare-stream逐 step更新协议；真实 NPU 地址稳定/输出一致性用例已在完整 ACL Graph 35/35 中执行通过。generic 与 expanded/hybrid chunked-prefill Target Verify 的固定 Arena direct-bind、sequence/tokenwise KV、paged metadata 原位 patch、plan-headroom、Device-authoritative runtime KV、graph-local tiling plan identity、static causal-conv signature/task-ready Event 顺序均已实现。static hybrid Graph key 的 accepted-length 启动预热现已离线闭环：每个固定 Slot覆盖 <code>[1, verify_width]</code> 的全部变体，并完成 29/29、8/8、56/56、67/67 聚焦回归；逐 rank trace 门禁也已能够验证所有 Slot/accepted-length capture 的唯一性、同 Slot不同 accepted length 的 key 唯一性、运行期无 capture、replay static-task 预提交和同 Graph-key warmup provenance，并完成 10/10 与完整脚本 48/48 离线回归。但真实 hybrid capture/replay 数值、地址与 runtime Graph 命中证据仍未闭环。尤其需要真实验证动态 accepted length 下 graph-local tiling/workspace 与 Legacy 数值一致；Device DSA 的真实 capture/replay同样未完成，相关子能力门禁均不能移除。普通 Qwen Graph 已完成推理/Graph 正确性严格复验，但 clean lifecycle 尚待加固 runner 下的完整四 case 重跑；下一资源窗口应先完成该复验，再以严格 variant trace 开关执行真实 Prepared MTP/hybrid E2E、逐 step 确定性对照及 Graph binding/replay/trace。production speculative Prepared gate 与三个 Graph 门禁继续保持关闭。</li>
+          <li>最新资源状态：03:55 前后曾获得全空闲窗口并完成 Qwen Graph 推理与 Graph 正确性采样；生命周期复核后进行 r2，首个服务被 cleanup 强杀后 NPU 一度恢复空闲。08:30 后外部 PID 1286019–1286034 占用全部 16 张 NPU；09:20 复核时原 16 个 Kimi-K3 xLLM 进程仍存活，并出现另 16 个同作业重启 worker，共 32 个外部进程。09:41 公共预检曾完整返回空闲，故仅临时开启普通 Graph 验证门禁并生成隔离验证 server；源码和稳定 server 随后恢复四门禁全 false。09:44–10:20 的 r4–r7 均在创建结果目录和启动服务前 fail-closed：r4/r5 的 DCMI 初始化直接返回 <code>-8005</code>，启用三次重试后的 r6/r7 连续三次失败。10:28 起的 r8–r11 外层预检均短暂返回 0，但立即执行 runner 时的二次预检又各自连续三次 <code>-8005</code>；r12 外层预检连续三次直接遇到 <code>-8005</code>，r4–r12 均退出 75。最新 r12 再次确认没有创建运行结果、没有启动验证服务；所有轮次均未终止或干预任何外部任务。下一完整空闲窗口仍优先通过 <code>XLLM_BIN</code> 使用隔离产物执行加固 runner 的四 case clean-lifecycle 复验。</li>
+          <li>阶段 5 剩余：Eagle3 的 3H 布局与固定地址 draft→target mapping 已接线，继承的 MTP trace 已新增显式 <code>algorithm=Eagle3</code> 且比较器会拒绝算法错配；Kimi-K2.5 Target 与本地 Eagle3 Draft 的 Legacy/Prepared 单/双 Slot多 rank runner及逐 rank allocation/D2D/overlap/Graph trace 后处理已准备。本轮进一步修复了非连续固定列 view 经 <code>flatten()</code> 产生临时 Tensor、mapping 结果可能未写回 Slot storage 的问题，改为直接 <code>index_select_out</code> 写入原列并统一固定输出绑定合同；Sampler 21/21（3 项 MLU-only 跳过）、MTP Async 31/31、Prepared 84/84 和非连续 mapping 重复 100/100 已通过。本轮还补齐 <code>kimi_k25_eagle3</code> Draft runtime alias、ATB kernel 后端、保留 VLM 自动服务语义的 text-only CausalLM Target factory、<code>language_model.*</code> 权重前缀加载、DeepSeek-V2 3H aux capture 和 runner 显式 <code>--backend=llm</code>；真实合同现为 MTP 25 项、Kimi Eagle3 24 项，两者都已把 safetensors loader 前缀、必需模块、关键 shape 和全部 index shard 存在性固化为 fail-fast。Eagle3 额外要求等 vocab 时缺失根级 <code>d2t</code> 采用 identity、严格子集时必须提供完整映射；MTP 还显式验证 4H HC head、两侧 <code>hc_mult</code> 一致及 Target 共享 embedding/LM head 的合同，错误/正确配对顺序与占卡行为均已验证。但仍需真实模型权重加载、请求 E2E、逐 step 对照和 Graph binding/replay/trace 验证，不得将其表述为端到端验收通过。</li>
+          <li>阶段 6 剩余：DFlash/DSpark Worker Backend/factory、固定模型输入输出、Device Context-KV write、DSpark 固定 sampling workspace/broadcast、dormant Worker 接线、multi-manager staging、Device-native DSA geometry、几何最终输出及显式 row expansion/boundary/token lookup/SWA gather scratch 的 Slot workspace 化与离线双 Slot 交替契约均已完成；C4/C128 padded slot/position 长度已在 patch 时严格相等，Prepared compressor/index-cache 写入也已接入运行时精确行数门禁，padding-safe cache scatter 由真实 NPU 数值用例和定向 trace 覆盖。本轮已接入不依赖 MTP 的 DFlash/DSpark Legacy/Prepared 逐 step trace、算法强校验比较器、单/双 Slot多 rank runner及允许必要小 D2D但禁止整份 Arena D2D 的逐 rank trace 门禁。Block-Spec checkpoint validator 现已在 Eager、Graph、profiler trace 与 trace-matrix 四类 runner 的 NPU 检查前 fail-fast；Qwen DFlash/DSpark 与 DeepSeek-V4 DSpark 两套真实 safetensors loader 合同均已覆盖，包含 Target/Draft 前缀、关键 shape、5H/main projection、全部 Draft 层、shared/tied/dedicated vocabulary basis、HC/Markov/confidence 和所有 shard，并以专项 22/22、完整脚本 89/89、两组 DFlash 28/28 与四组 DSpark 32/32 全绿报告验证。三轮四类顺序测试均为错误算法配对退出 1、正确配对随后因资源退出 75，且真实运行后会在结果目录保留合同 JSON。因此“无 checkpoint/未核对配对”不再是当前 DFlash/DSpark 阻塞项，真实执行阻塞收敛为 NPU 占用。最多 3 个 manager 的下标语义已从隐式首次出现顺序收紧为显式 <code>SWA → C4 → C128</code> 角色合同，metadata 与 Prepared 边界均 fail-fast；accepted-token capacity/headroom 也已通过完整宽度、首 token 拒绝与全接受的离线合同闭环。仍需完成真实模型 E2E，以真实 compressor 和动态接受长度执行触发这些门禁，并完成固定随机种子逐 step 确定性对照、真实 NPU 双 Slot 交替与 overlap trace、Graph binding/replay，以及完整 Torch/NPU model/backend allocation/D2D trace。完成这些验收前不得启用生产门禁。</li>
+          <li>普通 LLM 已完成固定随机种子的逐请求最终输出精确对比及真实 Graph 单/双 Slot候选 trace，441/441 个 Legacy/Prepared Decode step精确一致；MTP/Eagle3 与 DFlash/DSpark 均已具备显式算法、稳定跨运行 request id、严格多 pair 聚合比较器和单/双 Slot runner 接线，但四种 speculative 算法仍无真实 Prepared 候选 trace，尚缺实际逐 step token、接受长度及状态确定性对比。</li>
+          <li>Prepare 阶段的 attention Host mirror、supplemental Worker metadata 与 greedy sampling control 已改为直接 H2D 到固定 Arena，Prepared speculative helper 也不再提前 materialize 临时 attention Device buffer；逐字段 Device source 契约当前仅允许外部 input/bootstrap embedding，外部历史 KV 状态保持 Arena 外部并按需保留 owner。需要通过真实 allocation/D2D trace 验证该白名单与模型/backend 内部没有额外可消除的中间存储。</li>
+          <li>默认 greedy 的 <code>do_sample</code>、token/position 与 selected/sample indices，以及 greedy-with-penalty 的 frequency/presence/repetition penalty、temperature/top-p/top-k、unique-token ids/counts/lens 与 filter mask/bitmask 已收敛为 Slot-local 固定 Host staging；Prepared 路径不再为这些字段调用 <code>repeat_interleave()</code>。仍需通过真实 Host allocation trace 验证 Torch/model/backend 内部和 Host vector 没有额外可消除的热路分配。</li>
+          <li>普通 LLM Prepared Eager 已完成 <code>device_inter_task_gap</code>、稳态 CANN allocation、粗粒度 HBM 增量、固定 Arena H2D/D2D 和 Prepare/Device overlap trace；同形状预热后的窗口内 CANN allocation 为零且无 Prepared Arena D2D。该结论只覆盖 Qwen3-0.6B 普通 LLM Eager；Graph、MTP、Eagle3、DFlash 与 DSpark 仍须分别执行相同验收，Host TCMalloc 采样也不能替代完整 allocator 级零分配证明。</li>
+          <li>DeepSeek-V4 Device-native DSA 的 prefix/max/global <code>start_pos</code>、C4/C128 compact 输出、SWA table，以及显式 row expansion、boundary rank/mask、token lookup 与 SWA gather scratch 已写入固定 Slot Device workspace；authoritative 路径不再预先创建 stale Host DSA geometry，indices 在当前 Task stream 上通过 <code>arange_out</code> 更新，token manager 支持列连续但行有 padding stride 的二维表。真实 NPU 11/11 定向测试证明当前几何数值、padded-stride 读取、主要输出/expanded table 地址、padding-safe cache row 0 语义以及同步后的 live block/current bytes 稳定；完整 patch 和 cache scatter 分别仍有 35 与 24 次短生命周期 caching-allocator 请求。MSTX 定向 trace 已进一步证明 warmed patch 五个子路径与 warmed scatter marker 内 CANN 物理 allocation 均为 0，并量化小粒度内部 D2D。当前 Graph 实现会在 capture 内记录相同 fixed out/in-place patch，并在 bind/replay 对 manager/workspace 全量 layout/address 做身份校验，但 <code>kPreparedDeviceDsaGraphE2EValidated</code> 仍为 false；CPU builder 1/1 和完整编译不能替代真实 DeepSeek-V4 Graph capture/replay。完成真实模型 allocation/D2D/Graph trace、逐 step headroom 与 compressor 行数运行时验收前，Device 动态 DSA 必须保持 capability fail-fast。</li>
+        </ul>
+      </section>
+
+      <section id="validation">
+        <h2>20. 验证、指标与验收标准</h2>
+
+        <h3>20.1 正确性</h3>
+        <ul class="checklist">
+          <li>相同模型、请求序列、配置和随机种子下，Task 顺序与 RNG 调用顺序一致。</li>
+          <li>Greedy token、MTP/Eagle3 Draft token、接受长度和结束位置逐 step 一致。</li>
+          <li>position、kv_seq_len、block table 和 KV 写入位置一致。</li>
+          <li>浮点 logits/logprobs 按 dtype 使用既有容差。</li>
+          <li>请求新增、删除、重排、取消和结束覆盖 predecessor_row 边界。</li>
+          <li>同步/异步、Graph/Prepared Eager、Graph mixed fallback 交叉覆盖。</li>
+          <li>TP/DP/EP 下 EMPTY rank collective 顺序一致，无死锁。</li>
+        </ul>
+
+        <h3>20.2 内存与生命周期</h3>
+        <ul class="checklist">
+          <li>服务期 Task 热路径无输入输出 Device allocation。</li>
+          <li>Slot 复用前 reuse_fence 已建立；ASAN/调试模式无 Host source 生命周期问题。</li>
+          <li>已提交 Task 引用的 KV Block 不会提前释放。</li>
+          <li>同步 1 Slot、异步 2 Slot 的 HBM 增量与启动日志一致。</li>
+          <li>pause/resume 后复用同一 Arena 与 Graph 绑定。</li>
+        </ul>
+
+        <h3>20.3 性能指标</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>指标</th><th>用途</th><th>问题定位</th></tr></thead>
+            <tbody>
+              <tr><td><code>device_inter_task_gap</code></td><td>直接衡量两个完整 Task 的 Device 间隔</td><td>总体验收</td></tr>
+              <tr><td><code>prepared_task_prepare_cpu_latency_microseconds</code></td><td>Worker/Adapter CPU Prepare 时间</td><td>生产者是否跟得上</td></tr>
+              <tr><td><code>h2d_ready_latency</code></td><td>H2D 提交到 Event 完成</td><td>Copy/带宽竞争</td></tr>
+              <tr><td><code>prepared_task_launch_submission_latency_microseconds</code></td><td>continuation 与 Launch Host 提交耗时</td><td>提交线程、collective 或 backend Host 阻塞</td></tr>
+              <tr><td><code>prepared_task_consume_latency_microseconds</code></td><td>Device completion 等待与 Consume 耗时</td><td>输出等待、D2H 与退休延迟</td></tr>
+              <tr><td><code>prepared_task_staging_h2d_bytes_total</code> / <code>prepared_task_staging_h2d_copies_total</code></td><td>累计固定 Arena Host-only H2D 提交量与次数</td><td>Arena 容量、Device source 跳过与小 Copy 合并</td></tr>
+              <tr><td><code>prepared_task_staging_d2d_bytes_total</code> / <code>prepared_task_staging_d2d_copies_total</code></td><td>累计必要 Device source 搬运量与次数</td><td>定位仍未 Host 化的输入或模型状态</td></tr>
+              <tr><td><code>prepared_task_ready_queue_empty_at_launch_end_total</code> / <code>prepared_task_launch_submissions_total</code></td><td>双 Slot 在 Launch 提交结束时下一 Slot 尚未 READY 的比例</td><td>Host Prepare/提交 starvation；Device Task 结束边界另由 trace 验证</td></tr>
+              <tr><td><code>patch_latency</code></td><td>跨 Task 与 MTP Patch Device 时间</td><td>Patch Kernel 优化</td></tr>
+              <tr><td><code>prepared_task_execution_total_eager</code> / <code>prepared_task_execution_total_graph_capture</code> / <code>prepared_task_execution_total_graph_replay</code></td><td>统计每个 Prepared 模型 invocation 的实际执行模式并计算 Graph hit / Prepared Eager 比例</td><td>Graph key、启动期 warmup 覆盖与 fallback 占比</td></tr>
+              <tr><td><code>prepared_task_graph_runtime_misses_total</code> / <code>prepared_task_graph_address_mismatches_total</code></td><td>区分运行期 cache miss 与固定 Arena 地址失配</td><td>缺失 bucket/warmup 或 Slot/布局地址稳定性问题；unsupported Eager 不进入 miss</td></tr>
+              <tr><td>D2H / Consume latency</td><td>输出阶段 CPU 与 Copy 开销</td><td>是否影响下一轮生产</td></tr>
+              <tr><td>Slot starvation count</td><td>生产者慢于消费者的频次</td><td>CPU 输入构造后续重构依据</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>20.4 性能验收定义</h3>
+        <div class="callout success">
+          Task N 与 Task N+1 之间不再存在必须由 CPU 串行完成的输入构造、输出读取或调度判断。
+          当 Prepare + H2D 能在 Execute(N) 窗口内完成时，NPU trace 中不应出现由 Host 数据准备造成的 Task 间空泡。
+        </div>
+
+        <p>
+          若仍有空泡，必须能通过上述指标区分：ready queue 为空、H2D Event 未完成、Launch/Graph replay 延迟，或 backend/collective 等待。
+        </p>
+      </section>
+
+      <section id="risks">
+        <h2>21. 主要风险与缓解</h2>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>风险</th><th>后果</th><th>缓解方式</th></tr></thead>
+            <tbody>
+              <tr>
+                <td>CPU Prepare 仍过重</td>
+                <td>双 Slot 经常 starvation，Device 仍有空泡</td>
+                <td>先度量；复用 Host staging；后续让 Scheduler 直接产生紧凑 TaskDescriptor</td>
+              </tr>
+              <tr>
+                <td>H2D 与计算竞争</td>
+                <td>Task 开始时仍等待 h2d_ready_event</td>
+                <td>统计 Event 延迟；合并小 Copy；预布局连续 Arena；评估 Stream 优先级</td>
+              </tr>
+              <tr>
+                <td>Graph 地址绑定不彻底</td>
+                <td>产生隐含整份 D2D 或运行期 Tensor 替换</td>
+                <td>启动时记录每字段 DIRECT_BIND/PATCH/PACK；trace 验证 Copy</td>
+              </tr>
+              <tr>
+                <td>跨 Task 状态覆盖</td>
+                <td>MTP token/embedding 或 KV 状态损坏</td>
+                <td>显式 predecessor_row + reuse_fence + Debug task_seq_no</td>
+              </tr>
+              <tr>
+                <td>非 Driver Rank 输出生命周期</td>
+                <td>临时 Tensor 提前释放，backend 仍持有地址</td>
+                <td>Slot 生命周期覆盖完整 Device Event；非 Driver 也必须安全退休</td>
+              </tr>
+              <tr>
+                <td>算法过早一起重构</td>
+                <td>Pipeline、Graph、算法错误难以定位</td>
+                <td>纵向阶段；普通 LLM → Graph → MTP → Eagle3 → Block-Spec</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="future">
+        <h2>22. 后续：MTP 大 Graph</h2>
+
+        <p>首版仍使用独立 Draft/Target Graph，以降低一次性重构风险。当前接口需要保证未来可以把固定 Launch 序列替换为：</p>
+
+        <pre><code>mtp_big_graph[slot_id].replay();</code></pre>
+
+        <p>未来大 Graph 可覆盖：</p>
+
+        <pre><code>Draft × N
+→ Target Validate
+→ Rejection Sampling
+→ DeviceStepState publish</code></pre>
+
+        <p>
+          异步双 Slot 对应同一逻辑大 Graph 的两个固定地址实例。Prefill 与 Decode 仍建议保持双 Graph，避免把不同形状和控制语义强行捕获到一个 Graph 中。
+        </p>
+
+        <div class="callout teal">
+          当前 PreparedInputArena、显式 slot_id、Adapter 固定 Task 函数和算法专属 DeviceStepState，都是为未来大 Graph 保留的必要接口，而不是首版直接实现大 Graph。
+        </div>
+      </section>
+
+      <section id="conclusion">
+        <h2>23. 最终结论</h2>
+        <p class="lead">
+          PreparedTaskPipeline 与当前异步 Scheduler 的底层语义一致：同步模式是单 Slot 的 CPU/Device 交替，
+          异步模式通过额外准备一个完整 Task，用最多一个额外 Task 的代价把 CPU Prepare 移出 Device Task 间隙。
+        </p>
+        <p>
+          方案的关键不是简单增加线程，而是同时建立固定输入 Arena、显式 Slot、DeviceStepState、前驱行映射和 launch-only Executor 边界。
+          只有这些条件共同满足，MTP 的下一步输入才能真正提前准备，Graph/Eager 才能共用数据链路，Device 空泡也才能被可靠定位和消除。
+        </p>
+        <div class="callout success">
+          <strong>实施起点：</strong>
+          NPU 普通 LLM + Prepared Eager + 单 Slot。默认保持 Legacy；每阶段通过确定性、内存与 NPU trace 验收后再推进。
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <footer>
+    xLLM PreparedTaskPipeline Design · Consensus baseline · Updated 2026-08-26
+  </footer>
+
+  <script>
+    (() => {
+      const links = Array.from(document.querySelectorAll('.toc a'));
+      const sections = links
+        .map((link) => document.querySelector(link.getAttribute('href')))
+        .filter(Boolean);
+      if (!('IntersectionObserver' in window) || sections.length === 0) return;
+
+      const byId = new Map(links.map((link) => [link.getAttribute('href').slice(1), link]));
+      const observer = new IntersectionObserver((entries) => {
+        const visible = entries
+          .filter((entry) => entry.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+        if (visible.length === 0) return;
+        links.forEach((link) => link.classList.remove('active'));
+        const active = byId.get(visible[0].target.id);
+        if (active) active.classList.add('active');
+      }, { rootMargin: '-8% 0px -78% 0px', threshold: 0 });
+
+      sections.forEach((section) => observer.observe(section));
+    })();
+  </script>
+</body>
+</html>

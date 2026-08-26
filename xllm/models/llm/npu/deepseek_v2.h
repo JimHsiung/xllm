@@ -16,6 +16,8 @@ limitations under the License.
 #pragma once
 
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/scheduler_config.h"
+#include "core/framework/model/aux_hidden_capture.h"
 #include "core/framework/model/model_output.h"
 #include "core/layers/npu/npu_deepseek_v2_decoder_layer_impl.h"
 #include "llm_model_base.h"
@@ -95,7 +97,11 @@ TORCH_MODULE(DeepseekV2DecoderLayer);
 class DeepseekV2ModelImpl : public torch::nn::Module {
  public:
   DeepseekV2ModelImpl(const ModelContext& context)
-      : device_(context.get_tensor_options().device()) {
+      : device_(context.get_tensor_options().device()),
+        aux_capture_(
+            context.get_model_args(),
+            context.get_tensor_options(),
+            ::xllm::SchedulerConfig::get_instance().max_tokens_per_batch()) {
     auto options = context.get_tensor_options();
     auto model_args = context.get_model_args();
     auto parallel_args = context.get_parallel_args();
@@ -198,6 +204,10 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
 
       auto& layer = layers_[i];
       const int32_t layer_index = i;
+      // ATB keeps `h` as the full residual stream. Capture before layer i so
+      // configured id i denotes the output of the preceding layer, matching
+      // the existing Qwen3/Eagle3 hook convention.
+      aux_capture_.capture_layer(layer_index, h, std::nullopt);
       rolling_guard.before_layer(layer_index);
       layer(h,
             cos_pos,
@@ -210,7 +220,7 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
       rolling_guard.after_layer(layer_index);
     }
     auto hidden_states = norm_(h, 0);
-    return ModelOutput(hidden_states);
+    return aux_capture_.finalize(hidden_states);
   }
 
   // load the weight from the checkpoint
@@ -323,6 +333,7 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
   int32_t num_speculative_tokens_ = 0;
   at::Device device_;
   torch::Dtype dtype_;
+  AuxHiddenCapture aux_capture_;
   layer::NpuWordEmbedding npu_embed_tokens_{nullptr};
   torch::Tensor cos_sin_;
   layer::NpuPosEmbedding atb_pos_emb_{nullptr};

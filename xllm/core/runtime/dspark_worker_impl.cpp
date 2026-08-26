@@ -36,6 +36,100 @@ DSparkWorkerImpl::DSparkWorkerImpl(const ParallelArgs& parallel_args,
                                   ? parallel_args.tp_group_
                                   : parallel_args.process_group_) {}
 
+int64_t DSparkWorkerImpl::prepared_dspark_markov_rank() const {
+  CHECK(draft_impl_ != nullptr);
+  return draft_impl_->context_.get_model_args().markov_rank();
+}
+
+int64_t DSparkWorkerImpl::prepared_dspark_vocab_size() const {
+  CHECK(draft_impl_ != nullptr);
+  return draft_impl_->context_.get_model_args().vocab_size();
+}
+
+void DSparkWorkerImpl::launch_prepared_dspark_markov_sample(
+    const torch::Tensor& base_logits,
+    const torch::Tensor& anchor_token_ids,
+    const SamplingParameters& sampling_params,
+    int64_t row_count,
+    int32_t block_step,
+    dspark_detail::PreparedSamplingWorkspace& workspace) const {
+  CHECK(base_logits.defined());
+  CHECK_EQ(base_logits.dim(), 3);
+  CHECK_EQ(base_logits.size(0), row_count);
+  CHECK_EQ(base_logits.size(1), static_cast<int64_t>(workspace.steps.size()));
+  CHECK_EQ(base_logits.size(2), workspace.step_logits.size(1));
+  CHECK(sampling_params.all_greedy_sample)
+      << "Prepared DSpark Markov sampling requires greedy sampling";
+  CHECK(!sampling_params.return_probs);
+  CHECK(!sampling_params.logprobs);
+  CHECK_EQ(sampling_params.max_top_logprobs, 0);
+  CHECK_GE(block_step, 0);
+  CHECK_LT(static_cast<size_t>(block_step), workspace.steps.size());
+  const dspark_detail::PreparedSamplingStepWorkspace& bound_step =
+      workspace.steps[static_cast<size_t>(block_step)];
+  CHECK(bound_step.step_logits.defined());
+  CHECK_EQ(base_logits.device(), bound_step.step_logits.device())
+      << "Prepared DSpark base logits and fixed step logits must share a "
+         "device";
+  CHECK_EQ(base_logits.scalar_type(), bound_step.step_logits.scalar_type())
+      << "Prepared DSpark base logits and fixed step logits must share a "
+         "dtype";
+
+  dspark_detail::prepare_sampling_step(
+      anchor_token_ids, row_count, block_step, workspace);
+  dspark_detail::PreparedSamplingStepWorkspace& step =
+      workspace.steps[static_cast<size_t>(block_step)];
+  torch::Tensor previous_token_ids = step.previous_token_ids.narrow(
+      /*dim=*/0, /*start=*/0, row_count);
+  torch::Tensor markov_embeddings = step.markov_embeddings.narrow(
+      /*dim=*/0, /*start=*/0, row_count);
+  torch::Tensor markov_bias = step.markov_bias.narrow(
+      /*dim=*/0, /*start=*/0, row_count);
+  draft_impl_->dspark_markov_bias_out(
+      previous_token_ids, markov_embeddings, markov_bias);
+
+  torch::Tensor step_logits = step.step_logits.narrow(
+      /*dim=*/0, /*start=*/0, row_count);
+  step_logits.copy_(base_logits.select(/*dim=*/1, block_step),
+                    /*non_blocking=*/true);
+  step_logits.add_(markov_bias);
+  torch::Tensor greedy_output = step.greedy_token_output.narrow(
+      /*dim=*/0, /*start=*/0, row_count);
+  const void* greedy_output_address = greedy_output.data_ptr();
+  Sampler sampler;
+  SampleOutput sample_output = sampler.forward(step_logits,
+                                               sampling_params,
+                                               /*filter_mask=*/torch::Tensor(),
+                                               greedy_output);
+  CHECK(sample_output.next_tokens.defined());
+  CHECK_EQ(sample_output.next_tokens.data_ptr(), greedy_output_address)
+      << "Prepared DSpark sampler replaced the fixed greedy output";
+}
+
+void DSparkWorkerImpl::launch_prepared_dspark_token_broadcast(
+    const SamplingParameters& sampling_params,
+    int64_t row_count,
+    int32_t block_step,
+    dspark_detail::PreparedSamplingWorkspace& workspace) const {
+  CHECK_GE(block_step, 0);
+  CHECK_LT(static_cast<size_t>(block_step), workspace.steps.size());
+  dspark_detail::PreparedSamplingStepWorkspace& step =
+      workspace.steps[static_cast<size_t>(block_step)];
+  CHECK(workspace.token_ids.defined());
+  CHECK(step.greedy_token_output.defined());
+  CHECK_EQ(step.greedy_token_output.device(), workspace.token_ids.device())
+      << "Prepared DSpark broadcast token must share the workspace device";
+  CHECK_EQ(step.greedy_token_output.scalar_type(), torch::kLong)
+      << "Prepared DSpark broadcast token must use long dtype";
+  torch::Tensor greedy_output = step.greedy_token_output.narrow(
+      /*dim=*/0, /*start=*/0, row_count);
+  const void* greedy_output_address = greedy_output.data_ptr();
+  synchronize_sampled_token_ids(greedy_output, sampling_params);
+  CHECK_EQ(greedy_output.data_ptr(), greedy_output_address)
+      << "Prepared DSpark broadcast replaced the fixed token output";
+  dspark_detail::commit_sampling_step(row_count, block_step, workspace);
+}
+
 DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft(
     const ForwardInput& input,
     ForwardInput& validate_input) {

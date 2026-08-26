@@ -286,6 +286,13 @@ TEST(ExecutionConfigTest, GraphWarmupIsEnabledByDefault) {
   EXPECT_FALSE(execution_config.disable_graph_warmup());
 }
 
+TEST(ExecutionConfigTest, PreparedTaskPipelineIsDisabledByDefault) {
+  const ExecutionConfig execution_config;
+
+  EXPECT_FALSE(execution_config.enable_prepared_task_pipeline());
+  EXPECT_EQ(execution_config.prepared_task_input_buffer_size(), 64);
+}
+
 TEST(KVCacheConfigValidationTest, AcceptsSupportedIndexerCacheDtypes) {
   KVCacheConfig config;
 

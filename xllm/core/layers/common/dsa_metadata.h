@@ -45,6 +45,25 @@ struct DSAGroupInfo {
   int32_t block_size;
 };
 
+inline std::vector<int32_t> canonical_dsa_token_manager_ratios(
+    const std::vector<int32_t>& compress_ratios) {
+  bool uses_c4 = false;
+  bool uses_c128 = false;
+  for (const int32_t ratio : compress_ratios) {
+    uses_c4 = uses_c4 || ratio == 4;
+    uses_c128 = uses_c128 || ratio == 128;
+  }
+  std::vector<int32_t> manager_ratios;
+  manager_ratios.reserve(2);
+  if (uses_c4) {
+    manager_ratios.emplace_back(4);
+  }
+  if (uses_c128) {
+    manager_ratios.emplace_back(128);
+  }
+  return manager_ratios;
+}
+
 namespace layer {
 
 namespace v4_cp {
@@ -84,6 +103,11 @@ struct DSAMetadata {
   // True when the metadata is consumed by ACL graph forward. Debug paths must
   // not perform host/device copies in this mode.
   bool is_acl_graph = false;
+  // True when sequence lengths, compressed rows, and manager tables are
+  // patched from the fixed Prepared Device workspace immediately before
+  // model execution. Consumers use this to enforce fixed-width padded cache
+  // write contracts without changing Legacy variable-width semantics.
+  bool device_geometry_authoritative = false;
 
   // cp_input_dict: context-parallel inputs placeholder (reserved, optional)
   std::unordered_map<std::string, torch::Tensor> cp_input_dict;

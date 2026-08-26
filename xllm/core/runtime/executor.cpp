@@ -38,6 +38,7 @@ Executor::Executor(CausalLM* model,
   }
   impl_ = ExecutorImplFactory::get_instance().create_executor_impl(
       model, args, device, options, backend);
+  prepared_impl_ = dynamic_cast<PreparedExecutor*>(impl_.get());
 }
 
 ForwardInput Executor::prepare_inputs(Batch& batch) {
@@ -49,6 +50,30 @@ ModelOutput Executor::forward(const torch::Tensor& tokens,
                               std::vector<KVCache>& kv_caches,
                               const ModelInputParams& params) {
   return impl_->run(tokens, positions, kv_caches, params);
+}
+
+void Executor::prepare_prepared_graph_input(int32_t slot_id,
+                                            ForwardInput& input,
+                                            std::vector<KVCache>& kv_caches) {
+  CHECK(prepared_impl_ != nullptr)
+      << "The selected executor does not support Prepared execution";
+  prepared_impl_->prepare_prepared_graph_input(slot_id, input, kv_caches);
+}
+
+PreparedSlotBinding Executor::bind_prepared(int32_t slot_id,
+                                            const ForwardInput& input,
+                                            std::vector<KVCache>& kv_caches) {
+  CHECK(prepared_impl_ != nullptr)
+      << "The selected executor does not support Prepared execution";
+  return prepared_impl_->bind_prepared(slot_id, input, kv_caches);
+}
+
+ModelOutput Executor::forward_prepared(const PreparedSlotBinding& binding,
+                                       const ForwardInput& input,
+                                       std::vector<KVCache>& kv_caches) {
+  CHECK(prepared_impl_ != nullptr)
+      << "The selected executor does not support Prepared execution";
+  return prepared_impl_->launch_prepared(binding, input, kv_caches);
 }
 
 void Executor::prepare_graph_input(const torch::Tensor& tokens,

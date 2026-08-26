@@ -29,7 +29,8 @@ namespace xllm {
 
 SampleOutput Sampler::forward(torch::Tensor& logits,
                               const SamplingParameters& params,
-                              const torch::Tensor& filter_mask) const {
+                              const torch::Tensor& filter_mask,
+                              torch::Tensor fixed_greedy_output) const {
   const torch::Tensor& effective_filter_mask =
       filter_mask.defined() ? filter_mask : params.filter_mask;
   SampleOutput output;
@@ -91,9 +92,33 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
 
   if (params.all_greedy_sample && !params.logprobs && !params.return_probs &&
       !use_sample_indices && !filter_mask.defined()) {
-    output.next_tokens = greedy_sample(sample_logits).to(torch::kLong);
+    if (fixed_greedy_output.defined()) {
+      CHECK_EQ(fixed_greedy_output.dim(), 1)
+          << "Fixed greedy output must be one-dimensional";
+      CHECK_EQ(fixed_greedy_output.size(0), sample_logits.size(0))
+          << "Fixed greedy output must have one element per sampled row";
+      CHECK_EQ(fixed_greedy_output.device(), sample_logits.device())
+          << "Fixed greedy output must be on the logits device";
+      CHECK_EQ(fixed_greedy_output.scalar_type(), torch::kLong)
+          << "Fixed greedy output must use int64 dtype";
+      CHECK(fixed_greedy_output.is_contiguous())
+          << "Fixed greedy output must be contiguous";
+      const void* fixed_output_address = fixed_greedy_output.data_ptr();
+      torch::argmax_out(fixed_greedy_output,
+                        sample_logits,
+                        /*dim=*/-1,
+                        /*keepdim=*/false);
+      CHECK_EQ(fixed_greedy_output.data_ptr(), fixed_output_address)
+          << "argmax_out replaced the fixed greedy output storage";
+      output.next_tokens = fixed_greedy_output;
+    } else {
+      output.next_tokens = greedy_sample(sample_logits).to(torch::kLong);
+    }
     return output;
   }
+
+  CHECK(!fixed_greedy_output.defined())
+      << "Fixed greedy output requires the allocation-free greedy path";
 
   if (params.all_greedy_sample && !params.logprobs && params.return_probs &&
       !use_sample_indices && !filter_mask.defined()) {

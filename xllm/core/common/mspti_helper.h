@@ -36,10 +36,23 @@ class MstxRange {
   aclrtStream stream_ = nullptr;
 };
 
+class MstxHostRange final {
+ public:
+  explicit MstxHostRange(const char* name);
+
+  ~MstxHostRange();
+
+ private:
+  uint64_t mstx_id_;
+};
+
 #define CONCATENATE(x, y) x##y
 
 #define LLM_MSTX_RANGE() \
   MstxRange CONCATENATE(llm_mstx_range_, __LINE__) { __PRETTY_FUNCTION__ }
+
+#define LLM_MSTX_HOST_RANGE(name) \
+  MstxHostRange CONCATENATE(llm_mstx_host_range_, __LINE__) { name }
 
 #ifdef USE_MSPTI
 class MsptiMetrics {

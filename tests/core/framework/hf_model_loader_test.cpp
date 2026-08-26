@@ -269,9 +269,9 @@ TEST(HFModelLoaderTest, DeepseekV4DSparkModelArgsFrom0731Config) {
   ASSERT_TRUE(loader(reader, &args));
   EXPECT_EQ(args.model_type(), "deepseek_v4");
   EXPECT_EQ(args.dspark_num_layers(), 3);
-  // Base loader leaves this 0; applied later in
-  // configure_deepseek_v4_dspark_args.
-  EXPECT_EQ(args.dspark_block_size(), 0);
+  // The loader retains draft checkpoint metadata. WorkerImpl clears this on
+  // the shared target and applies the CLI override only on the DSpark draft.
+  EXPECT_EQ(args.dspark_block_size(), 5);
   EXPECT_EQ(args.markov_rank(), 256);
   ASSERT_EQ(args.compress_ratios().size(), 43);
 }

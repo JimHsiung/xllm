@@ -21,8 +21,10 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <utility>
 
 #include "common/device_monitor.h"
@@ -39,6 +41,9 @@ limitations under the License.
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
+#if defined(USE_NPU)
+#include "kernels/npu/xllm_ops/xllm_ops_api.h"
+#endif
 #if defined(USE_CUDA) || defined(USE_ILU) || defined(USE_MUSA)
 #include "layers/cuda/flashinfer_workspace.h"
 #endif
@@ -46,6 +51,7 @@ limitations under the License.
 #include "util/env_var.h"
 #include "util/threadpool.h"
 #include "util/timer.h"
+#include "util/verbose_trace_logger.h"
 
 namespace xllm {
 
@@ -61,7 +67,130 @@ StreamEventPtr record_current_stream_event(const Device& device) {
   return stream->record_event_or_sync();
 }
 
+void trace_llm_decode_step_state(const ForwardInput& input,
+                                 const torch::Tensor& next_tokens) {
+  if (!VerboseTraceLogger::get_instance().enabled() ||
+      input.input_params.meta.is_graph_warmup ||
+      !input.input_params.meta.batch_forward_type.is_decode() ||
+      !input.sampling_params.all_greedy_sample || !next_tokens.defined()) {
+    return;
+  }
+
+  const std::vector<int32_t>& embedding_ids =
+      input.input_params.embedding.embedding_ids;
+  const std::vector<std::string>& request_ids =
+      input.input_params.embedding.request_ids;
+  const int64_t batch_size = static_cast<int64_t>(embedding_ids.size());
+  CHECK_GT(batch_size, 0);
+  CHECK(request_ids.empty() ||
+        request_ids.size() == static_cast<size_t>(batch_size));
+  CHECK_EQ(next_tokens.numel(), batch_size)
+      << "greedy LLM decode must produce one token per sequence";
+  CHECK(input.positions.defined());
+  CHECK_EQ(input.positions.numel(), batch_size);
+  const torch::Tensor& kv_seq_lens =
+      input.input_params.attention.device.kv_seq_lens;
+  CHECK(kv_seq_lens.defined());
+  CHECK_EQ(kv_seq_lens.numel(), batch_size);
+
+  const torch::Tensor next_tokens_cpu =
+      next_tokens.to(torch::kCPU, torch::kInt64).contiguous().view({-1});
+  const torch::Tensor positions_cpu =
+      input.positions.to(torch::kCPU, torch::kInt64).contiguous().view({-1});
+  const torch::Tensor kv_seq_lens_cpu =
+      kv_seq_lens.to(torch::kCPU, torch::kInt64).contiguous().view({-1});
+  const int64_t* token_data = next_tokens_cpu.const_data_ptr<int64_t>();
+  const int64_t* position_data = positions_cpu.const_data_ptr<int64_t>();
+  const int64_t* kv_seq_len_data = kv_seq_lens_cpu.const_data_ptr<int64_t>();
+  for (int64_t row = 0; row < batch_size; ++row) {
+    const std::string_view request_id =
+        request_ids.empty()
+            ? std::string_view()
+            : std::string_view(request_ids[static_cast<size_t>(row)]);
+    XLLM_VERBOSE_TRACE() << "event=llm_step_state request_id="
+                         << (request_id.empty() ? std::string_view("-")
+                                                : request_id)
+                         << " embedding_id="
+                         << embedding_ids[static_cast<size_t>(row)]
+                         << " base_position=" << position_data[row]
+                         << " base_kv_seq_len=" << kv_seq_len_data[row]
+                         << " token=" << token_data[row];
+  }
+}
+
+void check_fixed_prepared_output_tensor(const torch::Tensor& actual,
+                                        const torch::Tensor& fixed_storage,
+                                        const char* tensor_name) {
+  CHECK(actual.defined()) << "Prepared model " << tensor_name
+                          << " must be defined";
+  CHECK(actual.sizes() == fixed_storage.sizes())
+      << "Prepared model " << tensor_name << " shape does not match the "
+      << "fixed output workspace";
+  CHECK_EQ(actual.device(), fixed_storage.device())
+      << "Prepared model " << tensor_name << " changed Device";
+  CHECK_EQ(actual.scalar_type(), fixed_storage.scalar_type())
+      << "Prepared model " << tensor_name << " changed dtype";
+  CHECK(fixed_storage.is_contiguous())
+      << "Prepared model fixed " << tensor_name << " must be contiguous";
+  CHECK(actual.is_contiguous())
+      << "Prepared model " << tensor_name << " must be contiguous";
+  CHECK_EQ(actual.data_ptr(), fixed_storage.data_ptr())
+      << "Prepared model " << tensor_name
+      << " replaced the fixed output storage";
+}
+
 }  // namespace
+
+void check_prepared_model_output_binding(
+    const SampleOutput& sample_output,
+    const PreparedModelOutputWorkspace& output_workspace) {
+  if (output_workspace.next_tokens.defined()) {
+    check_fixed_prepared_output_tensor(sample_output.next_tokens,
+                                       output_workspace.next_tokens,
+                                       "token output");
+  }
+  if (output_workspace.selected_embeddings.defined()) {
+    const torch::Tensor& actual_embeddings =
+        sample_output.selected_embeddings.defined()
+            ? sample_output.selected_embeddings
+            : sample_output.embeddings;
+    check_fixed_prepared_output_tensor(actual_embeddings,
+                                       output_workspace.selected_embeddings,
+                                       "selected embedding output");
+  }
+}
+
+torch::Tensor gather_prepared_selected_embeddings(
+    const torch::Tensor& embeddings,
+    const torch::Tensor& selected_token_idxes,
+    const torch::Tensor& destination) {
+  CHECK(embeddings.defined());
+  CHECK(selected_token_idxes.defined());
+  CHECK(destination.defined());
+  CHECK_EQ(embeddings.dim(), 2);
+  CHECK_EQ(selected_token_idxes.dim(), 1);
+  CHECK_EQ(destination.dim(), 2);
+  CHECK_EQ(destination.size(0), selected_token_idxes.numel());
+  CHECK_EQ(destination.size(1), embeddings.size(1));
+  CHECK(destination.device() == embeddings.device());
+  CHECK(selected_token_idxes.device() == embeddings.device());
+  CHECK_EQ(destination.scalar_type(), embeddings.scalar_type())
+      << "Prepared selected embedding destination must match source dtype";
+  CHECK(destination.is_contiguous())
+      << "Prepared selected embedding destination must be contiguous";
+  CHECK(selected_token_idxes.scalar_type() == torch::kInt ||
+        selected_token_idxes.scalar_type() == torch::kLong)
+      << "Prepared selected embedding indices must be int32 or int64";
+  const void* destination_address = destination.data_ptr();
+  torch::Tensor selected_embeddings = destination;
+  torch::index_select_out(selected_embeddings,
+                          embeddings,
+                          /*dim=*/0,
+                          selected_token_idxes);
+  CHECK_EQ(selected_embeddings.data_ptr(), destination_address)
+      << "Prepared selected embedding gather replaced fixed output storage";
+  return selected_embeddings;
+}
 
 LLMWorkerImpl::LLMWorkerImpl(const ParallelArgs& parallel_args,
                              const torch::Device& device,
@@ -165,6 +294,17 @@ std::optional<ForwardOutput> LLMWorkerImpl::execute_no_sync_on_stream(
     const ForwardInput& input,
     Stream& compute_stream,
     bool record_ready_event) {
+  return execute_on_stream(
+      input, compute_stream, record_ready_event, /*prepared_binding=*/nullptr);
+}
+
+std::optional<ForwardOutput> LLMWorkerImpl::execute_on_stream(
+    const ForwardInput& input,
+    Stream& compute_stream,
+    bool record_ready_event,
+    const PreparedSlotBinding* prepared_binding,
+    const PreparedModelOutputWorkspace* output_workspace,
+    bool retain_input_for_async_output) {
   const ForwardSyncPolicy sync_policy = ForwardSyncPolicy::NO_SYNC;
   c10::StreamGuard stream_guard = compute_stream.set_stream_guard();
   if (::xllm::LoadConfig::get_instance().enable_manual_loader()) {
@@ -176,19 +316,134 @@ std::optional<ForwardOutput> LLMWorkerImpl::execute_no_sync_on_stream(
           const_cast<atb::Context*>(context_.get_atb_context());
       atb_context->SetExecuteStream(current_acl_stream);
       wait_input_ready_events(input, compute_stream);
-      return step_internal(input, sync_policy, record_ready_event);
+      return step_internal(input,
+                           sync_policy,
+                           record_ready_event,
+                           prepared_binding,
+                           output_workspace,
+                           retain_input_for_async_output);
     } else {
       SET_ATB_EXECUTE_STREAM((&compute_stream), device_, context_);
       wait_input_ready_events(input, compute_stream);
-      return step_internal(input, sync_policy, record_ready_event);
+      return step_internal(input,
+                           sync_policy,
+                           record_ready_event,
+                           prepared_binding,
+                           output_workspace,
+                           retain_input_for_async_output);
     }
 #else
     wait_input_ready_events(input, compute_stream);
-    return step_internal(input, sync_policy, record_ready_event);
+    return step_internal(input,
+                         sync_policy,
+                         record_ready_event,
+                         prepared_binding,
+                         output_workspace,
+                         retain_input_for_async_output);
 #endif
   }
   wait_input_ready_events(input, compute_stream);
-  return step_internal(input, sync_policy, record_ready_event);
+  return step_internal(input,
+                       sync_policy,
+                       record_ready_event,
+                       prepared_binding,
+                       output_workspace,
+                       retain_input_for_async_output);
+}
+
+std::optional<ForwardOutput> LLMWorkerImpl::execute_prepared_task(
+    const ForwardInput& input,
+    const std::optional<PreparedSlotBinding>& binding) {
+  CHECK(compute_stream_ != nullptr);
+  if (enable_schedule_overlap() &&
+      has_linear_attention_layers(context_.get_model_args())) {
+    c10::StreamGuard restore_guard = compute_stream_->set_stream_guard();
+    ModelInputParams& mutable_params =
+        const_cast<ModelInputParams&>(input.input_params);
+    restore_linear_state_slots(kv_caches_,
+                               mutable_params.linear_state_cache_ops,
+                               mutable_params.linear_state_validity_mask);
+  }
+  return execute_prepared_on_stream(input, *compute_stream_, binding);
+}
+
+std::optional<ForwardOutput> LLMWorkerImpl::execute_prepared_on_stream(
+    const ForwardInput& input,
+    Stream& compute_stream,
+    const std::optional<PreparedSlotBinding>& binding,
+    const PreparedModelOutputWorkspace* output_workspace) {
+  if (!binding.has_value()) {
+    COUNTER_INC(prepared_task_execution_total_eager);
+  }
+  const PreparedSlotBinding* binding_ptr =
+      binding.has_value() ? &binding.value() : nullptr;
+  return execute_on_stream(input,
+                           compute_stream,
+                           /*record_ready_event=*/false,
+                           binding_ptr,
+                           output_workspace,
+                           /*retain_input_for_async_output=*/false);
+}
+
+PreparedSlotBinding LLMWorkerImpl::bind_prepared_task(
+    int32_t slot_id,
+    const ForwardInput& input) {
+  CHECK(prepared_graph_enabled());
+  CHECK(model_executor_ != nullptr);
+  return model_executor_->bind_prepared(slot_id, input, kv_caches_);
+}
+
+void LLMWorkerImpl::prepare_prepared_graph_input(int32_t slot_id,
+                                                 ForwardInput& input) {
+  CHECK(prepared_graph_enabled());
+  CHECK(model_executor_ != nullptr);
+  model_executor_->prepare_prepared_graph_input(slot_id, input, kv_caches_);
+}
+
+bool LLMWorkerImpl::prepared_graph_enabled() const {
+  return ::xllm::ExecutionConfig::get_instance().enable_graph();
+}
+
+void LLMWorkerImpl::patch_prepared_task_input_for_schedule_overlap(
+    ForwardInput& input) {
+  CHECK(enable_schedule_overlap());
+  CHECK(input.json_object_states.empty() &&
+        input.json_object_state_snapshots.empty())
+      << "JSON grammar is not supported by PreparedTaskPipeline phase 2";
+  if (input.token_ids.numel() == 0 ||
+      !input.input_params.meta.batch_forward_type.has_decode() ||
+      !can_use_last_step_output_for_schedule_overlap(input)) {
+    return;
+  }
+#if defined(USE_NPU)
+  CHECK(compute_stream_ != nullptr);
+  c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+  if (last_step_output_.ready_event != nullptr) {
+    CHECK(compute_stream_->wait_event(last_step_output_.ready_event))
+        << "Failed to wait for the preceding Prepared task output";
+  }
+  xllm::kernel::npu::replace_token(input.token_ids,
+                                   last_step_output_.sample_output.next_tokens,
+                                   /*synchronize_stream=*/false);
+#else
+  LOG(FATAL) << "Prepared schedule overlap only supports NPU";
+#endif
+}
+
+void LLMWorkerImpl::publish_prepared_task_output(
+    const ForwardInput& input,
+    const std::optional<ForwardOutput>& output) {
+  CHECK(enable_schedule_overlap());
+  if (output.has_value()) {
+    update_last_step_output(output,
+                            input.input_params.embedding.request_ids,
+                            input.sample_sequence_ids);
+    return;
+  }
+  last_step_output_valid_ = false;
+  last_step_output_ = ForwardOutput();
+  last_step_request_ids_.clear();
+  last_step_sample_sequence_ids_.clear();
 }
 
 std::optional<ForwardOutput> LLMWorkerImpl::step(const ForwardInput& input) {
@@ -269,7 +524,10 @@ LLMWorkerImpl::update_input_by_last_step_output_for_schedule_overlap(
 std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     const ForwardInput& input,
     ForwardSyncPolicy sync_policy,
-    bool record_ready_event) {
+    bool record_ready_event,
+    const PreparedSlotBinding* prepared_binding,
+    const PreparedModelOutputWorkspace* output_workspace,
+    bool retain_input_for_async_output) {
   MULTI_MODEL_STEP_LOCK(::xllm::KVCacheConfig::get_instance().enable_xtensor());
 
   Timer timer;
@@ -311,8 +569,14 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   }
 
   // call model executor forward to get hidden states
-  auto model_output = model_executor_->forward(
-      input.token_ids, input.positions, kv_caches_, input.input_params);
+  ModelOutput model_output;
+  if (prepared_binding != nullptr) {
+    model_output =
+        model_executor_->forward_prepared(*prepared_binding, input, kv_caches_);
+  } else {
+    model_output = model_executor_->forward(
+        input.token_ids, input.positions, kv_caches_, input.input_params);
+  }
   if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
     eplb_executor_->finish_eplb_step();
   }
@@ -387,7 +651,14 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     output.logprobs = sampling_params.logprobs;
     output.max_top_logprobs = sampling_params.max_top_logprobs;
     if (!input.skip_sampling_for_logits_only) {
-      auto sample_output = sampler_->forward(logits, sampling_params);
+      torch::Tensor fixed_greedy_output;
+      if (output_workspace != nullptr) {
+        fixed_greedy_output = output_workspace->next_tokens;
+      }
+      auto sample_output = sampler_->forward(logits,
+                                             sampling_params,
+                                             /*filter_mask=*/torch::Tensor(),
+                                             fixed_greedy_output);
       output.filter_bitmask_applied_to_logits =
           sampling_params.filter_bitmask.defined();
 
@@ -404,6 +675,9 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
 
       // set sample output to output
       output.sample_output = sample_output;
+      if (!options_.enable_speculative_decode()) {
+        trace_llm_decode_step_state(input, sample_output.next_tokens);
+      }
       // set beam search output to output
       output.beam_search_output = beam_search_output;
     }
@@ -420,10 +694,32 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
         !is_spec_draft_) {
       // Target prefill: keep full embeddings (global-real under model-side CP).
       output.sample_output.embeddings = embeddings;
+      if (sampling_params.selected_token_idxes.defined() &&
+          output_workspace != nullptr &&
+          output_workspace->selected_embeddings.defined()) {
+        output.sample_output.selected_embeddings =
+            gather_prepared_selected_embeddings(
+                embeddings,
+                sampling_params.selected_token_idxes,
+                output_workspace->selected_embeddings);
+      }
     } else if (sampling_params.selected_token_idxes.defined()) {
-      output.sample_output.embeddings = embeddings.index_select(
-          /*dim=*/0, sampling_params.selected_token_idxes);
+      if (output_workspace != nullptr &&
+          output_workspace->selected_embeddings.defined()) {
+        output.sample_output.embeddings = gather_prepared_selected_embeddings(
+            embeddings,
+            sampling_params.selected_token_idxes,
+            output_workspace->selected_embeddings);
+      } else {
+        output.sample_output.embeddings = embeddings.index_select(
+            /*dim=*/0, sampling_params.selected_token_idxes);
+      }
     }
+  }
+
+  if (output_workspace != nullptr) {
+    check_prepared_model_output_binding(output.sample_output,
+                                        *output_workspace);
   }
 
   MULTI_MODEL_STEP_UNLOCK();
@@ -434,7 +730,10 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
 #endif
   if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
     wait_kv_push();
-    output.retained_inputs.emplace_back(std::make_shared<ForwardInput>(input));
+    if (retain_input_for_async_output) {
+      output.retained_inputs.emplace_back(
+          std::make_shared<ForwardInput>(input));
+    }
     if (enable_schedule_overlap() && record_ready_event) {
       output.ready_event = record_current_stream_event(device_);
     }

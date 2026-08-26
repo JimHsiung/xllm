@@ -29,6 +29,20 @@ limitations under the License.
 namespace xllm {
 namespace layer {
 
+namespace deepseek_v4_indexer_detail {
+
+// Prepared DSA emits fixed-width cache-write rows with negative padding slots.
+// Neutralize those rows during the NPU scatter so padding never aliases cache
+// row zero, and require compressor/index-cache row counts to match exactly.
+void scatter_prepared_dsa_cache_rows(
+    torch::Tensor& cache,
+    torch::Tensor* auxiliary_cache,
+    const torch::Tensor& slot_mapping,
+    const torch::Tensor& value,
+    const torch::Tensor& auxiliary_value = torch::Tensor());
+
+}  // namespace deepseek_v4_indexer_detail
+
 class DeepseekV4IndexerImpl : public torch::nn::Module {
  public:
   DeepseekV4IndexerImpl() = default;

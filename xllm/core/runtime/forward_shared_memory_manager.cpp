@@ -2400,6 +2400,8 @@ inline void deserialize_forward_input_payload(
   read_data(context, input_params.meta.q_max_seq_len);
   read_data(context, input_params.meta.batch_id);
   read_data(context, input_params.meta.is_graph_warmup);
+  read_data(context,
+            input_params.meta.graph_warmup_speculative_accepted_length);
   read_tensor_and_vector(context,
                          input_params.attention.device.q_seq_lens,
                          input_params.attention.host.q_seq_lens,
@@ -2465,6 +2467,7 @@ inline void deserialize_forward_input_payload(
             .to(device, /*non_blocking=*/true);
   }
   read_string_vector(context, input_params.embedding.request_ids);
+  read_tensor(context, input_params.embedding.predecessor_rows, stream);
   read_vector(context, input_params.embedding.extra_token_ids);
   // Keep upstream's root mtp_shifted_token_ids serialization (consumed by
   // non-CP MTP paths + minimax / qwen3-next models). The CP path additionally
@@ -2860,6 +2863,8 @@ inline void serialize_forward_input_sections(
   write_data(context.descriptor, input_params.meta.q_max_seq_len);
   write_data(context.descriptor, input_params.meta.batch_id);
   write_data(context.descriptor, input_params.meta.is_graph_warmup);
+  write_data(context.descriptor,
+             input_params.meta.graph_warmup_speculative_accepted_length);
 
   write_host_vector_or_tensor(context,
                               input_params.attention.host.q_seq_lens,
@@ -2916,6 +2921,7 @@ inline void serialize_forward_input_sections(
   write_vector(context.descriptor, input_params.embedding.linear_state_ids);
   write_linear_state_cache_ops(context, input_params.linear_state_cache_ops);
   write_string_vector(context.descriptor, input_params.embedding.request_ids);
+  write_tensor(context, input_params.embedding.predecessor_rows);
   write_vector(context.descriptor, input_params.embedding.extra_token_ids);
   // Mirror the read_* layout: write root + embedding mtp paths so the
   // deserializer sees both fields. Order MUST match the read_* sequence.

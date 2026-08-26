@@ -37,7 +37,8 @@ class Sampler final {
   SampleOutput forward(
       torch::Tensor& logits,
       const SamplingParameters& params,
-      const torch::Tensor& filter_mask = torch::Tensor()) const;
+      const torch::Tensor& filter_mask = torch::Tensor(),
+      torch::Tensor fixed_greedy_output = torch::Tensor()) const;
 
   // helper functions
   // probs: [..., vocab_size]

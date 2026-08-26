@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "common/types.h"
 
@@ -31,6 +32,24 @@ enum class GraphWarmupPlan : int8_t {
 };
 
 GraphWarmupPlan graph_warmup_plan(InstanceRole role);
+
+// Prepared Graph caches are keyed by an explicit fixed-address Slot. Schedule
+// overlap owns two Slots, so every decode bucket must execute once per Slot
+// during startup. Legacy Graph and single-Slot Prepared Graph keep one warmup
+// invocation per bucket.
+int32_t graph_warmup_invocations_per_bucket(bool enable_prepared_task_pipeline,
+                                            bool enable_schedule_overlap);
+
+// Returns the accepted-prefix length for every invocation of one decode
+// bucket. Hybrid MTP target-verify Graph keys specialize on the real accepted
+// length, so every value in [1, num_speculative_tokens + 1] must be captured.
+// Each value is repeated consecutively for every fixed-address Prepared Slot
+// so alternating Slot assignment covers the full variant set on both Slots.
+// Non-hybrid and non-speculative Graphs keep the single length-1 variant.
+std::vector<int32_t> graph_warmup_accepted_length_schedule(
+    int32_t num_speculative_tokens,
+    bool enable_hybrid_mtp_variants,
+    int32_t invocations_per_variant);
 
 std::string graph_warmup_progress(int32_t completed,
                                   int32_t total,
@@ -52,6 +71,7 @@ std::string next_warmup_request_id();
 // Does nothing when speculative decoding is disabled.
 void prepare_warmup_decode_sequence(Sequence* sequence,
                                     int64_t embedding_width,
-                                    int32_t num_speculative_tokens);
+                                    int32_t num_speculative_tokens,
+                                    int32_t accepted_prefix_length = 1);
 
 }  // namespace xllm

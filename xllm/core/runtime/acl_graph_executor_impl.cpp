@@ -24,6 +24,8 @@ limitations under the License.
 #include <torch_npu/torch_npu.h>
 
 #include <algorithm>
+#include <string_view>
+#include <utility>
 
 #include "core/common/global_flags.h"
 #include "core/framework/config/execution_config.h"
@@ -40,7 +42,9 @@ limitations under the License.
 #include "core/platform/device.h"
 #include "core/platform/npu/acl_graph_task_update_context.h"
 #include "core/util/utils.h"
+#include "core/util/verbose_trace_logger.h"
 #include "platform/npu/device_capture_lock.h"
+#include "runtime/prepared_task/prepared_input_arena.h"
 
 namespace xllm::npu {
 
@@ -54,6 +58,112 @@ constexpr uint64_t kStaticGraphTaskHashSeed = 0x6a09e667f3bcc909ull;
 constexpr size_t kMaxStaticMtpGraphVariantsPerSlot = 16;
 constexpr uint64_t kMlaGraphKeyMask = 1ull << 62;
 constexpr uint64_t kMlaGraphKeyPayloadMask = (1ull << 62) - 1;
+constexpr uint64_t kPreparedGraphKeySeed = 0x510e527fade682d1ull;
+constexpr uint64_t kPreparedExternalGraphInputSeed = 0x1f83d9abfb41bd6bull;
+// Keep direct-bound speculative Target Verify dormant until a real-model
+// capture/replay run validates its fixed Arena and numerical contracts.
+constexpr bool kPreparedSpecVerifyGraphE2EValidated = false;
+// Keep authoritative DSA Graph dormant until its capture/replay address and
+// numerical contracts run on a real model. The implementation is compiled and
+// its fixed-workspace builder is covered independently.
+constexpr bool kPreparedDeviceDsaGraphE2EValidated = false;
+
+std::string_view prepared_invocation_mode_name(PreparedInvocationMode mode) {
+  switch (mode) {
+    case PreparedInvocationMode::EAGER:
+      return "eager";
+    case PreparedInvocationMode::GRAPH_REPLAY:
+      return "replay";
+    case PreparedInvocationMode::GRAPH_CAPTURE:
+      return "capture";
+  }
+  LOG(FATAL) << "Unknown Prepared invocation mode";
+  return "unknown";
+}
+
+void trace_prepared_speculative_graph_execution(
+    const PreparedSlotBinding& binding,
+    const ForwardInput& input) {
+  const ModelInputParams& params = input.input_params;
+  if (!params.is_spec_verify ||
+      !params.meta.batch_forward_type.is_chunked_prefill() ||
+      !params.graph.use_expanded_decode_for_spec_verify_attention ||
+      params.num_accepted_tokens_host.size() != 1) {
+    return;
+  }
+  XLLM_VERBOSE_TRACE()
+      << "event=prepared_speculative_graph_execution mode="
+      << prepared_invocation_mode_name(binding.mode)
+      << " slot_id=" << binding.slot_id << " graph_key=" << binding.graph_key
+      << " graph_warmup=" << static_cast<int32_t>(params.meta.is_graph_warmup)
+      << " accepted_length=" << params.num_accepted_tokens_host.front()
+      << " verify_width=" << params.meta.q_max_seq_len
+      << " static_graph_tasks_prepared="
+      << static_cast<int32_t>(binding.static_graph_tasks_prepared);
+}
+
+bool tensor_is_within_buffer(const torch::Tensor& tensor,
+                             const torch::Tensor& buffer) {
+  if (!tensor.defined() || !buffer.defined() || tensor.numel() == 0) {
+    return false;
+  }
+  const uintptr_t buffer_begin = reinterpret_cast<uintptr_t>(buffer.data_ptr());
+  const uint64_t buffer_bytes =
+      static_cast<uint64_t>(buffer.numel() * buffer.element_size());
+  const uintptr_t buffer_end = buffer_begin + buffer_bytes;
+  const uintptr_t tensor_begin = reinterpret_cast<uintptr_t>(tensor.data_ptr());
+  const uint64_t tensor_bytes =
+      static_cast<uint64_t>(tensor.numel() * tensor.element_size());
+  const uintptr_t tensor_end = tensor_begin + tensor_bytes;
+  return tensor_begin >= buffer_begin && tensor_end <= buffer_end;
+}
+
+bool tensor_is_undefined_or_within_buffer(const torch::Tensor& tensor,
+                                          const torch::Tensor& buffer) {
+  return !tensor.defined() || tensor.numel() == 0 ||
+         tensor_is_within_buffer(tensor, buffer);
+}
+
+bool prepared_graph_inputs_are_arena_backed(const ForwardInput& input) {
+  const torch::Tensor& buffer = input.device_input_buffer;
+  const AttentionInput& attention = input.input_params.attention;
+  const std::array<const torch::Tensor*, 28> graph_inputs = {
+      &input.token_ids,
+      &input.positions,
+      &attention.device.q_seq_lens,
+      &attention.device.kv_seq_lens,
+      &attention.device.q_cu_seq_lens,
+      &attention.device.new_cache_slots,
+      &attention.device.block_tables,
+      &attention.device.paged_kv_indptr,
+      &attention.device.paged_kv_indices,
+      &attention.device.paged_kv_last_page_len,
+      &attention.device.new_cache_slot_offsets,
+      &attention.device.kv_cache_start_offsets,
+      &attention.device.kv_cache_tokens_nums,
+      &attention.device.history_compressed_kv,
+      &attention.device.history_k_rope,
+      &attention.device.ring_cur_seqlen,
+      &attention.device.ring_cache_seqlen,
+      &input.input_params.embedding.input_embedding,
+      &input.input_params.embedding.linear_state_indices,
+      &input.input_params.embedding.mtp_bootstrap_embeddings,
+      &input.input_params.graph.attn_mask,
+      &input.input_params.graph.tiling_data,
+      &input.input_params.graph.expanded_kv_seq_lens,
+      &input.input_params.graph.expanded_block_tables,
+      &input.input_params.graph.expanded_paged_kv_indptr,
+      &input.input_params.graph.expanded_paged_kv_indices,
+      &input.input_params.graph.expanded_paged_kv_last_page_len,
+      &input.input_params.graph.expanded_tiling_data};
+  return std::all_of(graph_inputs.begin(),
+                     graph_inputs.end(),
+                     [&buffer](const torch::Tensor* tensor) {
+                       return tensor_is_undefined_or_within_buffer(*tensor,
+                                                                   buffer);
+                     });
+}
+
 bool uses_static_mtp_graph_task_variant(const ModelInputParams& params,
                                         uint32_t bucket_num_tokens,
                                         int64_t block_size) {
@@ -62,7 +172,8 @@ bool uses_static_mtp_graph_task_variant(const ModelInputParams& params,
   return params.is_spec_verify &&
          params.meta.batch_forward_type.is_chunked_prefill() &&
          params.graph.use_expanded_decode_for_spec_verify_attention &&
-         params.graph.spec_verify_source_addresses_stable &&
+         (params.graph.spec_verify_source_addresses_stable ||
+          params.graph.prepared_spec_verify_direct_bind) &&
          kernel::npu::tilelang::has_spec_verify_graph_update_specialization(
              spec_width, block_size) &&
          batch_size == 1 && spec_width > 0 &&
@@ -83,29 +194,134 @@ uint64_t mix_graph_key(uint64_t hash, uint64_t value) {
   return hash ^ (value + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2));
 }
 
-constexpr uint64_t paged_attention_plan_bucket_unchecked(int64_t max_kv,
-                                                         int64_t block_size) {
-  const uint64_t block =
-      static_cast<uint64_t>((max_kv + block_size - 1) / block_size);
-  // Keep the exact block endpoint separate. This preserves a conservative
-  // boundary for vendor plans that may switch strategy on aligned lengths,
-  // while reducing cold classifications from every token to at most two per
-  // block.
-  const uint64_t is_block_endpoint = max_kv % block_size == 0 ? 1 : 0;
-  return (block << 1) | is_block_endpoint;
+struct PreparedExternalGraphInputIdentity {
+  uint64_t layout_signature = kPreparedExternalGraphInputSeed;
+  std::vector<const void*> addresses;
+};
+
+std::optional<PreparedExternalGraphInputIdentity>
+prepared_external_graph_input_identity(const ForwardInput& input) {
+  PreparedExternalGraphInputIdentity identity;
+  const ModelInputParams& params = input.input_params;
+  if (!params.dsa_device_geometry_authoritative) {
+    return identity;
+  }
+  if (!input.positions.defined() ||
+      params.dsa_device_geometry_workspace == nullptr ||
+      params.device_multi_block_tables.empty()) {
+    return std::nullopt;
+  }
+
+  const torch::Device expected_device = input.positions.device();
+  identity.addresses.reserve(params.device_multi_block_tables.size() * 2 + 32);
+  auto append_required_tensor = [&identity, &expected_device](
+                                    const torch::Tensor& tensor) {
+    if (!tensor.defined() || tensor.numel() <= 0 ||
+        tensor.device() != expected_device) {
+      return false;
+    }
+    identity.layout_signature = mix_graph_key(
+        identity.layout_signature, static_cast<uint64_t>(tensor.scalar_type()));
+    identity.layout_signature = mix_graph_key(
+        identity.layout_signature, static_cast<uint64_t>(tensor.dim()));
+    for (int64_t dim = 0; dim < tensor.dim(); ++dim) {
+      identity.layout_signature = mix_graph_key(
+          identity.layout_signature, static_cast<uint64_t>(tensor.size(dim)));
+      identity.layout_signature = mix_graph_key(
+          identity.layout_signature, static_cast<uint64_t>(tensor.stride(dim)));
+    }
+    identity.addresses.emplace_back(tensor.data_ptr());
+    return true;
+  };
+
+  for (const torch::Tensor& block_table : params.device_multi_block_tables) {
+    if (!append_required_tensor(block_table)) {
+      return std::nullopt;
+    }
+  }
+
+  const DSADeviceGeometryWorkspace& workspace =
+      *params.dsa_device_geometry_workspace;
+  const std::array<const torch::Tensor*, 30> fixed_tensors = {
+      &workspace.actual_seq_lengths_query,
+      &workspace.kv_cu_seq_lens,
+      &workspace.max_seqlen_q,
+      &workspace.max_seqlen_kv,
+      &workspace.start_pos,
+      &workspace.c4_compact_positions,
+      &workspace.c128_compact_positions,
+      &workspace.c4_compact_slots,
+      &workspace.c128_compact_slots,
+      &workspace.swa_block_table,
+      &workspace.token_indices,
+      &workspace.position_values,
+      &workspace.position_remainders,
+      &workspace.boundary_mask,
+      &workspace.boundary_ranks,
+      &workspace.sentinel_indices,
+      &workspace.destination_indices,
+      &workspace.token_offsets,
+      &workspace.token_candidates,
+      &workspace.mapping_valid,
+      &workspace.mapping_valid_aux,
+      &workspace.swa_logical_column_indices,
+      &workspace.swa_physical_columns,
+      &workspace.swa_gathered,
+      &workspace.swa_valid,
+      &workspace.swa_valid_aux,
+      &workspace.manager_row_indices,
+      &params.attention.device.q_seq_lens,
+      &params.attention.device.kv_seq_lens,
+      &params.attention.device.new_cache_slots};
+  for (const torch::Tensor* tensor : fixed_tensors) {
+    if (!append_required_tensor(*tensor)) {
+      return std::nullopt;
+    }
+  }
+  if (workspace.manager_expanded_block_tables.size() <
+      params.device_multi_block_tables.size()) {
+    return std::nullopt;
+  }
+  for (size_t manager_id = 0;
+       manager_id < params.device_multi_block_tables.size();
+       ++manager_id) {
+    if (!append_required_tensor(
+            workspace.manager_expanded_block_tables[manager_id])) {
+      return std::nullopt;
+    }
+  }
+  return identity;
 }
 
-static_assert(paged_attention_plan_bucket_unchecked(127, 128) == 2);
-static_assert(paged_attention_plan_bucket_unchecked(128, 128) == 3);
-static_assert(paged_attention_plan_bucket_unchecked(129, 128) == 4);
-static_assert(paged_attention_plan_bucket_unchecked(255, 128) == 4);
-static_assert(paged_attention_plan_bucket_unchecked(256, 128) == 5);
-static_assert(paged_attention_plan_bucket_unchecked(257, 128) == 6);
+static_assert(spec_verify_attention_plan_bucket_unchecked(127, 128) == 2);
+static_assert(spec_verify_attention_plan_bucket_unchecked(128, 128) == 3);
+static_assert(spec_verify_attention_plan_bucket_unchecked(129, 128) == 4);
+static_assert(spec_verify_attention_plan_bucket_unchecked(255, 128) == 4);
+static_assert(spec_verify_attention_plan_bucket_unchecked(256, 128) == 5);
+static_assert(spec_verify_attention_plan_bucket_unchecked(257, 128) == 6);
 
 uint64_t paged_attention_plan_bucket(int64_t max_kv, int64_t block_size) {
   CHECK_GT(max_kv, 0);
   CHECK_GT(block_size, 0);
-  return paged_attention_plan_bucket_unchecked(max_kv, block_size);
+  return spec_verify_attention_plan_bucket_unchecked(max_kv, block_size);
+}
+
+std::optional<int64_t> prepared_spec_verify_max_kv_with_headroom(
+    const ModelInputParams& params,
+    int64_t block_size) {
+  if (params.graph.expanded_kv_seq_lens_vec.empty() ||
+      params.graph.spec_verify_kv_seq_len_headroom < 0 || block_size <= 0) {
+    return std::nullopt;
+  }
+  const int64_t template_max_kv =
+      *std::max_element(params.graph.expanded_kv_seq_lens_vec.begin(),
+                        params.graph.expanded_kv_seq_lens_vec.end());
+  const int64_t headroom = params.graph.spec_verify_kv_seq_len_headroom;
+  if (!spec_verify_attention_plan_headroom_is_safe(
+          template_max_kv, headroom, block_size)) {
+    return std::nullopt;
+  }
+  return template_max_kv + headroom;
 }
 
 uint64_t spec_verify_packed_graph_key(uint32_t bucket_num_tokens,
@@ -124,10 +340,13 @@ uint64_t spec_verify_packed_graph_key(uint32_t bucket_num_tokens,
 uint64_t spec_verify_attention_plan_lookup_key(
     uint64_t packed_graph_key,
     const std::vector<int32_t>& expanded_kv_seq_lens,
+    int64_t kv_seq_len_headroom,
     int64_t block_size) {
   CHECK(!expanded_kv_seq_lens.empty());
+  CHECK_GE(kv_seq_len_headroom, 0);
   const int64_t max_kv = *std::max_element(expanded_kv_seq_lens.begin(),
-                                           expanded_kv_seq_lens.end());
+                                           expanded_kv_seq_lens.end()) +
+                         kv_seq_len_headroom;
   return mix_graph_key(packed_graph_key,
                        paged_attention_plan_bucket(max_kv, block_size));
 }
@@ -143,7 +362,10 @@ uint64_t spec_verify_attention_plan_lookup_key(uint32_t bucket_num_tokens,
       static_cast<uint64_t>(params.attention.device.block_tables.size(1)),
       static_cast<uint64_t>(params.graph.expanded_block_tables.size(1)));
   return spec_verify_attention_plan_lookup_key(
-      packed_key, params.graph.expanded_kv_seq_lens_vec, block_size);
+      packed_key,
+      params.graph.expanded_kv_seq_lens_vec,
+      params.graph.spec_verify_kv_seq_len_headroom,
+      block_size);
 }
 
 uint64_t static_mtp_graph_task_key(uint64_t base_key,
@@ -250,6 +472,7 @@ bool AclGraph::capture(CausalLM* model,
                        std::vector<KVCache>& kv_cache,
                        uint32_t bucket_num_tokens,
                        c10_npu::MempoolId_t graph_pool) {
+  CHECK(!is_prepared_graph_);
   // Save bucket num_tokens for this graph instance
   num_tokens_ = bucket_num_tokens;
 
@@ -455,6 +678,257 @@ bool AclGraph::capture(CausalLM* model,
   return true;
 }
 
+ModelOutput AclGraph::capture_prepared(CausalLM* model,
+                                       const runtime::Options& options,
+                                       const ForwardInput& input,
+                                       std::vector<KVCache>& kv_cache,
+                                       c10_npu::MempoolId_t graph_pool) {
+  CHECK(model != nullptr);
+  CHECK(input.token_ids.defined());
+  CHECK(input.positions.defined());
+  CHECK(input.device_input_buffer.defined());
+  CHECK_NE(input.prepared_input_layout_signature, 0);
+
+  const ModelInputParams* graph_params = &input.input_params;
+  if (model->requires_graph_forward_metadata() ||
+      model->is_hybrid_linear_attention()) {
+    CHECK(prepared_model_graph_params_.has_value())
+        << "Prepared ACL graph metadata must be populated during Prepare";
+    if (model->requires_graph_forward_metadata()) {
+      CHECK(prepared_model_graph_params_->attn_metadata != nullptr)
+          << "Prepared model graph metadata is missing attention metadata";
+    }
+    graph_params = &prepared_model_graph_params_.value();
+  }
+
+  is_prepared_graph_ = true;
+  num_tokens_ = static_cast<uint32_t>(input.token_ids.size(/*dim=*/0));
+  prepared_layout_signature_ = input.prepared_input_layout_signature;
+  prepared_input_buffer_address_ = input.device_input_buffer.data_ptr();
+  prepared_tokens_address_ = input.token_ids.data_ptr();
+  prepared_positions_address_ = input.positions.data_ptr();
+  const std::optional<PreparedExternalGraphInputIdentity> external_identity =
+      prepared_external_graph_input_identity(input);
+  CHECK(external_identity.has_value())
+      << "Prepared ACL graph external input contract is incomplete";
+  prepared_external_layout_signature_ = external_identity->layout_signature;
+  prepared_external_input_addresses_ = external_identity->addresses;
+
+  if (graph_paged_attention_tiling_data_.defined()) {
+    CHECK_EQ(graph_paged_attention_tiling_data_.data_ptr(),
+             prepared_graph_tiling_address_)
+        << "Prepared graph-local tiling storage moved before capture";
+    update_spec_verify_attention_tiling(*graph_params);
+  }
+  if (model->is_hybrid_linear_attention()) {
+    graph_task_context_ = std::make_shared<AclGraphTaskUpdateContext>();
+    graph_task_context_->begin_capture();
+    prepared_model_graph_params_->graph.acl_graph_task_update_context =
+        graph_task_context_;
+    graph_params = &prepared_model_graph_params_.value();
+  }
+  const bool capture_static_graph_tasks = uses_static_mtp_graph_task_variant(
+      *graph_params, num_tokens_, options.block_size());
+
+  torch::npu::synchronize();
+  const c10::DeviceIndex device_index = model->options().device().index();
+  aclrtStream current_stream =
+      c10_npu::getCurrentNPUStream(device_index).stream();
+  graph_stream_ = current_stream;
+
+  bool restore_default_stream = false;
+  {
+    auto& capture_lock =
+        ::xllm::npu::DeviceCaptureLock::get_instance().get_lock(device_index);
+    std::lock_guard<std::mutex> lock_guard(capture_lock);
+    if (c10_npu::getCurrentNPUStream(device_index) ==
+        c10_npu::getDefaultNPUStream(device_index)) {
+      c10_npu::setCurrentNPUStream(capture_stream_.value());
+      CHECK_EQ(aclrtSynchronizeStream(capture_stream_.value().stream()),
+               ACL_SUCCESS);
+      graph_stream_ = capture_stream_.value().stream();
+      restore_default_stream = true;
+    }
+
+    bool capture_started = false;
+    try {
+      graph_.capture_begin(
+          graph_pool,
+          aclmdlRICaptureMode::ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
+      capture_started = true;
+      ModelOutput output = model->forward(
+          {input.token_ids}, {input.positions}, kv_cache, {*graph_params});
+      prepared_hidden_states_ = output.hidden_states;
+      if (options.enable_graph_aux_hidden_states()) {
+        prepared_aux_hidden_states_ = output.aux_hidden_states;
+      }
+      graph_.capture_end();
+      capture_started = false;
+    } catch (...) {
+      if (capture_started) {
+        try {
+          graph_.capture_end();
+        } catch (const std::exception& cleanup_error) {
+          LOG(ERROR) << "Prepared ACL graph capture_end cleanup failed: "
+                     << cleanup_error.what();
+        } catch (...) {
+          LOG(ERROR) << "Prepared ACL graph capture_end cleanup failed";
+        }
+        graph_.reset();
+      }
+      if (restore_default_stream) {
+        c10_npu::setCurrentNPUStream(
+            c10_npu::getDefaultNPUStream(device_index));
+      }
+      throw;
+    }
+
+    if (graph_task_context_ != nullptr) {
+      graph_task_context_->end_capture();
+    }
+
+    if (restore_default_stream) {
+      c10_npu::setCurrentNPUStream(c10_npu::getDefaultNPUStream(device_index));
+    }
+  }
+
+  CHECK_EQ(aclrtSynchronizeStream(graph_stream_), ACL_SUCCESS);
+  CHECK_EQ(aclrtSynchronizeStream(current_stream), ACL_SUCCESS);
+  graph_.replay();
+  const bool graph_tasks_updated = update_graph_tasks(*graph_params);
+  if (capture_static_graph_tasks) {
+    CHECK(graph_tasks_updated)
+        << "Prepared hybrid Target Verify captured no causal-conv graph task";
+    capture_static_graph_task_signature(*graph_params);
+  }
+  make_current_stream_wait_for_graph(current_stream);
+  if (prepared_aux_hidden_states_.defined() &&
+      prepared_aux_hidden_states_.numel() > 0) {
+    return ModelOutput(
+        prepared_hidden_states_, torch::Tensor(), prepared_aux_hidden_states_);
+  }
+  return ModelOutput(prepared_hidden_states_);
+}
+
+bool AclGraph::matches_prepared_input(const ForwardInput& input) const {
+  const std::optional<PreparedExternalGraphInputIdentity> external_identity =
+      prepared_external_graph_input_identity(input);
+  return external_identity.has_value() && is_prepared_graph_ &&
+         input.device_input_buffer.defined() && input.token_ids.defined() &&
+         input.positions.defined() &&
+         input.prepared_input_layout_signature == prepared_layout_signature_ &&
+         input.device_input_buffer.data_ptr() ==
+             prepared_input_buffer_address_ &&
+         input.token_ids.data_ptr() == prepared_tokens_address_ &&
+         input.positions.data_ptr() == prepared_positions_address_ &&
+         external_identity->layout_signature ==
+             prepared_external_layout_signature_ &&
+         external_identity->addresses == prepared_external_input_addresses_;
+}
+
+void AclGraph::prepare_prepared_model_graph_metadata(
+    CausalLM* model,
+    const ForwardInput& input,
+    const PagedAttentionPlanDescriptor* attention_plan,
+    int64_t block_size) {
+  CHECK(model != nullptr);
+  const bool needs_prepared_params = model->requires_graph_forward_metadata() ||
+                                     model->is_hybrid_linear_attention() ||
+                                     attention_plan != nullptr;
+  if (!needs_prepared_params) {
+    prepared_model_graph_params_.reset();
+    return;
+  }
+
+  ModelInputParams graph_params = input.input_params;
+  if (attention_plan != nullptr) {
+    CHECK(input.input_params.is_spec_verify);
+    CHECK(input.input_params.meta.batch_forward_type.is_chunked_prefill());
+    CHECK(input.input_params.graph.expanded_kv_seq_lens.defined());
+    CHECK_GT(block_size, 0);
+    if (prepared_attention_plan_descriptor_.has_value()) {
+      CHECK(prepared_attention_plan_descriptor_.value() == *attention_plan)
+          << "Prepared speculative Graph attention plan changed for one key";
+    } else {
+      prepared_attention_plan_descriptor_ = *attention_plan;
+      CHECK(persistent_param_.tiling_data().defined());
+      CHECK_GT(persistent_param_.tiling_data().numel(), 0);
+      CHECK_LE(static_cast<int64_t>(attention_plan->normalized_tiling.size()),
+               persistent_param_.tiling_data().numel());
+      graph_paged_attention_tiling_data_ =
+          torch::zeros_like(persistent_param_.tiling_data());
+      std::vector<int32_t> normalized_tiling;
+      normalized_tiling.reserve(attention_plan->normalized_tiling.size());
+      for (uint32_t value : attention_plan->normalized_tiling) {
+        normalized_tiling.emplace_back(static_cast<int32_t>(value));
+      }
+      torch::Tensor normalized_tiling_host = torch::tensor(
+          normalized_tiling,
+          torch::TensorOptions().dtype(torch::kInt).device(torch::kCPU));
+      graph_paged_attention_tiling_data_
+          .narrow(/*dim=*/0,
+                  /*start=*/0,
+                  /*length=*/normalized_tiling_host.numel())
+          .copy_(normalized_tiling_host, /*non_blocking=*/true);
+      prepared_graph_tiling_address_ =
+          graph_paged_attention_tiling_data_.data_ptr();
+      spec_verify_block_size_ = block_size;
+      spec_verify_paged_attention_tiling_layout_ = attention_plan->layout;
+      const int64_t split_core_offset = static_cast<int64_t>(
+          attention_plan->layout.kv_split_core_count_offset);
+      CHECK_LT(split_core_offset,
+               static_cast<int64_t>(attention_plan->normalized_tiling.size()));
+      spec_verify_kv_split_core_count_ = static_cast<int64_t>(
+          attention_plan
+              ->normalized_tiling[static_cast<size_t>(split_core_offset)]);
+      CHECK_GT(spec_verify_kv_split_core_count_, 0);
+    }
+    CHECK_EQ(graph_paged_attention_tiling_data_.data_ptr(),
+             prepared_graph_tiling_address_);
+    graph_params.graph.tiling_data = graph_paged_attention_tiling_data_;
+    graph_params.graph.expanded_tiling_data =
+        graph_paged_attention_tiling_data_;
+  }
+  prepare_model_graph_metadata(model, input.positions, graph_params);
+  prepared_model_graph_params_ = std::move(graph_params);
+}
+
+bool AclGraph::prepare_static_prepared_graph_tasks(
+    const ModelInputParams& params,
+    const c10_npu::NPUStream& signal_stream) {
+  if (!static_graph_task_signature_matches(params)) {
+    return false;
+  }
+  signal_static_graph_tasks(signal_stream);
+  return true;
+}
+
+ModelOutput AclGraph::replay_prepared(const ForwardInput& input,
+                                      bool static_graph_tasks_prepared) {
+  CHECK(matches_prepared_input(input))
+      << "Prepared ACL graph input address or layout changed after capture";
+  CHECK_EQ(static_cast<uint32_t>(input.token_ids.size(/*dim=*/0)), num_tokens_);
+  CHECK(!static_graph_task_signature_.has_value() ||
+        static_graph_tasks_prepared)
+      << "Prepared static causal-conv tasks were not signaled before replay";
+  aclrtStream current_stream = c10_npu::getCurrentNPUStream().stream();
+  if (graph_paged_attention_tiling_data_.defined()) {
+    CHECK_EQ(graph_paged_attention_tiling_data_.data_ptr(),
+             prepared_graph_tiling_address_)
+        << "Prepared graph-local tiling storage moved after capture";
+    update_spec_verify_attention_tiling(input.input_params);
+  }
+  make_graph_wait_for_current_stream(current_stream);
+  graph_.replay();
+  make_current_stream_wait_for_graph(current_stream);
+  if (prepared_aux_hidden_states_.defined() &&
+      prepared_aux_hidden_states_.numel() > 0) {
+    return ModelOutput(
+        prepared_hidden_states_, torch::Tensor(), prepared_aux_hidden_states_);
+  }
+  return ModelOutput(prepared_hidden_states_);
+}
+
 bool AclGraph::update_graph_tasks(const ModelInputParams& params) {
   if (graph_task_context_ == nullptr ||
       graph_task_context_->causal_conv1d_tasks.empty()) {
@@ -623,13 +1097,18 @@ void AclGraph::update_spec_verify_attention_tiling(
     const ModelInputParams& params) {
   CHECK(graph_paged_attention_tiling_data_.defined());
   CHECK(spec_verify_paged_attention_tiling_layout_.has_value());
+  const std::optional<int64_t> max_kv_with_headroom =
+      prepared_spec_verify_max_kv_with_headroom(params,
+                                                spec_verify_block_size_);
+  CHECK(max_kv_with_headroom.has_value())
+      << "speculative Graph KV headroom crosses an attention-plan bucket";
   kernel::npu::tilelang::spec_verify_attention_tiling_update(
       params.graph.expanded_kv_seq_lens,
       graph_paged_attention_tiling_data_,
       spec_verify_paged_attention_tiling_layout_.value(),
       params.meta.q_max_seq_len,
       spec_verify_block_size_,
-      params.meta.kv_max_seq_len,
+      max_kv_with_headroom.value(),
       spec_verify_kv_split_core_count_);
 }
 
@@ -805,6 +1284,13 @@ size_t AclGraphExecutorImpl::get_graph_count() const {
   return graph_count;
 }
 
+size_t AclGraphExecutorImpl::prepared_graph_count_for_test(
+    int32_t slot_id) const {
+  CHECK_GE(slot_id, 0);
+  CHECK_LT(slot_id, graph_slot_count_);
+  return graph_slots_[slot_id].prepared_graphs.size();
+}
+
 size_t AclGraphExecutorImpl::get_graph_memory_pool_count() {
   std::vector<c10_npu::MempoolId_t> memory_pools;
   memory_pools.reserve(graph_slot_count_);
@@ -841,6 +1327,336 @@ ForwardInput AclGraphExecutorImpl::prepare_inputs(Batch& batch) {
   // Prepare inputs for workers
   return batch.prepare_forward_input(
       options_.num_decoding_tokens(), 0, args_, options_.cp_size());
+}
+
+void AclGraphExecutorImpl::prepare_prepared_graph_input(
+    int32_t slot_id,
+    ForwardInput& input,
+    std::vector<KVCache>& kv_caches) {
+  CHECK_GE(slot_id, 0);
+  CHECK_LT(slot_id, graph_slot_count_)
+      << "Prepared logical Slot does not have a matching ACL Graph Slot";
+  if (!input.input_params.meta.batch_forward_type.is_decode() ||
+      args_.n_layers() == 1 || model_->requires_graph_forward_metadata() ||
+      model_->is_hybrid_linear_attention()) {
+    return;
+  }
+  auto [k_cache, v_cache] = find_attention_plan_kv_cache(kv_caches);
+  torch::Tensor host_tiling =
+      graph_slots_[slot_id]
+          .persistent_param->prepare_paged_attention_tiling_host(
+              input.token_ids,
+              k_cache,
+              v_cache,
+              input.input_params.attention.device.block_tables,
+              input.input_params);
+  if (host_tiling.defined()) {
+    input.input_params.graph.tiling_data = std::move(host_tiling);
+  }
+}
+
+bool AclGraphExecutorImpl::supports_prepared_graph(
+    const ForwardInput& input) const {
+  const ModelInputParams& params = input.input_params;
+  const bool is_decode = params.meta.batch_forward_type.is_decode();
+  const bool is_spec_verify =
+      params.is_spec_verify &&
+      params.meta.batch_forward_type.is_chunked_prefill();
+  if ((!is_decode && !is_spec_verify) ||
+      (params.is_spec_verify && !is_spec_verify) || args_.n_layers() == 1 ||
+      options_.dp_size() != 1 || options_.cp_size() != 1 ||
+      options_.num_decoding_tokens() <= 0 ||
+      (params.graph.input_tokens_override.defined() &&
+       (!is_spec_verify ||
+        !params.graph.input_tokens_override.is_same(input.token_ids))) ||
+      params.meta.kv_max_seq_len > args_.max_position_embeddings() ||
+      !input.device_input_buffer.defined() ||
+      input.prepared_input_layout_signature == 0 ||
+      !prepared_graph_inputs_are_arena_backed(input)) {
+    return false;
+  }
+  if (is_spec_verify &&
+      params.graph.use_expanded_decode_for_spec_verify_attention) {
+    const std::optional<int64_t> max_kv_with_headroom =
+        prepared_spec_verify_max_kv_with_headroom(params,
+                                                  options_.block_size());
+    if (!max_kv_with_headroom.has_value() ||
+        max_kv_with_headroom.value() > args_.max_position_embeddings()) {
+      return false;
+    }
+  }
+  if (is_spec_verify &&
+      (!kPreparedSpecVerifyGraphE2EValidated ||
+       !prepared_spec_verify_graph_contract_is_complete(input))) {
+    return false;
+  }
+  if (model_->is_hybrid_linear_attention() &&
+      (!is_spec_verify ||
+       !params.graph.use_expanded_decode_for_spec_verify_attention ||
+       !make_static_graph_task_signature(params).has_value())) {
+    return false;
+  }
+  if (params.dsa_device_geometry_authoritative &&
+      (!kPreparedDeviceDsaGraphE2EValidated ||
+       !prepared_external_graph_input_identity(input).has_value())) {
+    return false;
+  }
+
+  const uint32_t num_tokens =
+      static_cast<uint32_t>(input.token_ids.size(/*dim=*/0));
+  if (num_tokens == 0) {
+    return false;
+  }
+  const uint32_t invocation_width =
+      static_cast<uint32_t>(is_spec_verify ? params.meta.q_max_seq_len
+                                           : options_.num_decoding_tokens());
+  if (invocation_width == 0 || num_tokens % invocation_width != 0) {
+    return false;
+  }
+  const uint32_t batch_size = num_tokens / invocation_width;
+  const uint32_t batch_size_limit = static_cast<uint32_t>(
+      std::max<int32_t>(1,
+                        ::xllm::ExecutionConfig::get_instance()
+                            .acl_graph_decode_batch_size_limit()));
+  return batch_size > 0 && batch_size <= batch_size_limit;
+}
+
+uint64_t AclGraphExecutorImpl::get_prepared_graph_key(
+    const ForwardInput& input,
+    uint64_t attention_plan_class) const {
+  const uint32_t num_tokens =
+      static_cast<uint32_t>(input.token_ids.size(/*dim=*/0));
+  uint64_t graph_key = mix_graph_key(
+      kPreparedGraphKeySeed,
+      get_graph_key(num_tokens, input.input_params, attention_plan_class));
+  graph_key = mix_graph_key(graph_key, input.prepared_input_layout_signature);
+  graph_key = mix_graph_key(
+      graph_key, static_cast<uint64_t>(input.input_params.meta.num_sequences));
+  const std::optional<PreparedExternalGraphInputIdentity> external_identity =
+      prepared_external_graph_input_identity(input);
+  CHECK(external_identity.has_value())
+      << "Prepared ACL graph external input contract is incomplete";
+  graph_key = mix_graph_key(graph_key, external_identity->layout_signature);
+  return graph_key;
+}
+
+PreparedSlotBinding AclGraphExecutorImpl::bind_prepared(
+    int32_t slot_id,
+    const ForwardInput& input,
+    std::vector<KVCache>& kv_caches) {
+  CHECK_GE(slot_id, 0);
+  CHECK_LT(slot_id, graph_slot_count_)
+      << "Prepared logical Slot does not have a matching ACL Graph Slot";
+
+  PreparedSlotBinding binding;
+  binding.slot_id = slot_id;
+  if (!supports_prepared_graph(input)) {
+    return binding;
+  }
+
+  uint64_t attention_plan_class = 0;
+  std::optional<PagedAttentionPlanDescriptor> attention_plan;
+  const bool needs_attention_plan =
+      input.input_params.graph.use_expanded_decode_for_spec_verify_attention;
+  if (needs_attention_plan) {
+    const uint32_t num_tokens =
+        static_cast<uint32_t>(input.token_ids.size(/*dim=*/0));
+    const uint64_t lookup_key = spec_verify_attention_plan_lookup_key(
+        num_tokens, input.input_params, options_.block_size());
+    std::optional<uint64_t> cached_plan_class =
+        find_spec_verify_attention_plan_class(lookup_key);
+    if (cached_plan_class.has_value()) {
+      attention_plan_class = cached_plan_class.value();
+    } else {
+      if (!input.input_params.meta.is_graph_warmup) {
+        COUNTER_INC(prepared_task_graph_runtime_misses_total);
+        return binding;
+      }
+      auto [k_cache, v_cache] = find_attention_plan_kv_cache(kv_caches);
+      std::optional<PagedAttentionPlanDescriptor> descriptor =
+          graph_slots_[slot_id]
+              .persistent_param->classify_spec_verify_paged_attention_plan(
+                  input.token_ids, k_cache, v_cache, input.input_params);
+      if (!descriptor.has_value()) {
+        return binding;
+      }
+      std::lock_guard<std::mutex> lock(graph_slots_mutex_);
+      auto descriptor_it =
+          std::find(spec_verify_attention_plan_descriptors_.begin(),
+                    spec_verify_attention_plan_descriptors_.end(),
+                    descriptor.value());
+      if (descriptor_it == spec_verify_attention_plan_descriptors_.end()) {
+        spec_verify_attention_plan_descriptors_.emplace_back(
+            std::move(descriptor.value()));
+        attention_plan_class = spec_verify_attention_plan_descriptors_.size();
+      } else {
+        attention_plan_class =
+            static_cast<uint64_t>(
+                std::distance(spec_verify_attention_plan_descriptors_.begin(),
+                              descriptor_it)) +
+            1;
+      }
+      auto [plan_it, inserted] = spec_verify_attention_plan_classes_.emplace(
+          lookup_key, attention_plan_class);
+      CHECK(inserted || plan_it->second == attention_plan_class)
+          << "Prepared paged-attention plan class changed for one KV bucket";
+      attention_plan_class = plan_it->second;
+    }
+    {
+      std::lock_guard<std::mutex> lock(graph_slots_mutex_);
+      CHECK_GT(attention_plan_class, 0);
+      CHECK_LE(attention_plan_class,
+               spec_verify_attention_plan_descriptors_.size());
+      attention_plan =
+          spec_verify_attention_plan_descriptors_[static_cast<size_t>(
+              attention_plan_class - 1)];
+    }
+  }
+
+  binding.graph_key = get_prepared_graph_key(input, attention_plan_class);
+  std::shared_ptr<AclGraph> graph;
+  {
+    std::lock_guard<std::mutex> lock(graph_slots_mutex_);
+    GraphSlot& slot = graph_slots_[slot_id];
+    auto graph_it = slot.prepared_graphs.find(binding.graph_key);
+    if (graph_it != slot.prepared_graphs.end()) {
+      if (!graph_it->second->matches_prepared_input(input)) {
+        COUNTER_INC(prepared_task_graph_address_mismatches_total);
+        LOG_FIRST_N(ERROR, 1)
+            << "Prepared ACL graph input arena address changed; using "
+               "Prepared Eager for this invocation";
+        return binding;
+      }
+      binding.mode = PreparedInvocationMode::GRAPH_REPLAY;
+      graph = graph_it->second;
+    }
+  }
+  if (graph != nullptr) {
+    if (model_->requires_graph_forward_metadata() ||
+        model_->is_hybrid_linear_attention() || needs_attention_plan) {
+      graph->prepare_prepared_model_graph_metadata(
+          model_,
+          input,
+          attention_plan.has_value() ? &attention_plan.value() : nullptr,
+          options_.block_size());
+    }
+    if (model_->is_hybrid_linear_attention()) {
+      binding.static_graph_tasks_prepared =
+          graph->prepare_static_prepared_graph_tasks(
+              input.input_params,
+              c10_npu::getCurrentNPUStream(device_.index()));
+      CHECK(binding.static_graph_tasks_prepared)
+          << "Prepared hybrid Graph key has no matching static task signature";
+    }
+    binding.native_handle = graph;
+    return binding;
+  }
+
+  if (input.input_params.meta.is_graph_warmup) {
+    binding.mode = PreparedInvocationMode::GRAPH_CAPTURE;
+    if (model_->requires_graph_forward_metadata() ||
+        model_->is_hybrid_linear_attention() || needs_attention_plan) {
+      GraphSlot& slot = graph_slots_[slot_id];
+      std::optional<c10_npu::NPUStream> capture_stream;
+      {
+        std::lock_guard<std::mutex> lock(graph_slots_mutex_);
+        if (!slot.graph_capture_stream.has_value()) {
+          slot.graph_capture_stream = c10_npu::getStreamFromPool(
+              /*isHighPriority=*/true, device_.index());
+        }
+        capture_stream = slot.graph_capture_stream;
+      }
+      graph = std::make_shared<AclGraph>(
+          *slot.persistent_param, device_.index(), capture_stream.value());
+      graph->prepare_prepared_model_graph_metadata(
+          model_,
+          input,
+          attention_plan.has_value() ? &attention_plan.value() : nullptr,
+          options_.block_size());
+      binding.native_handle = graph;
+    }
+  } else {
+    COUNTER_INC(prepared_task_graph_runtime_misses_total);
+    LOG_FIRST_N(WARNING, 1)
+        << "Prepared ACL graph miss; using Prepared Eager without runtime "
+           "capture";
+  }
+  return binding;
+}
+
+ModelOutput AclGraphExecutorImpl::launch_prepared(
+    const PreparedSlotBinding& binding,
+    const ForwardInput& input,
+    std::vector<KVCache>& kv_caches) {
+  CHECK_GE(binding.slot_id, 0);
+  CHECK_LT(binding.slot_id, graph_slot_count_);
+  if (binding.mode == PreparedInvocationMode::EAGER) {
+    COUNTER_INC(prepared_task_execution_total_eager);
+    ModelInputParams eager_params = input.input_params;
+    eager_params.enable_graph = false;
+    eager_params.attn_metadata.reset();
+    COUNTER_INC(num_model_execution_total_eager);
+    ModelOutput output = forward_eager(
+        model_, input.token_ids, input.positions, kv_caches, eager_params);
+    if (model_->is_hybrid_linear_attention()) {
+      trace_prepared_speculative_graph_execution(binding, input);
+    }
+    return output;
+  }
+
+  if (binding.mode == PreparedInvocationMode::GRAPH_REPLAY) {
+    COUNTER_INC(prepared_task_execution_total_graph_replay);
+    CHECK(binding.native_handle != nullptr);
+    std::shared_ptr<AclGraph> graph =
+        std::static_pointer_cast<AclGraph>(binding.native_handle);
+    CHECK(graph->matches_prepared_input(input));
+    ModelOutput output =
+        graph->replay_prepared(input, binding.static_graph_tasks_prepared);
+    if (model_->is_hybrid_linear_attention()) {
+      trace_prepared_speculative_graph_execution(binding, input);
+    }
+    return output;
+  }
+
+  CHECK(binding.mode == PreparedInvocationMode::GRAPH_CAPTURE);
+  COUNTER_INC(prepared_task_execution_total_graph_capture);
+  CHECK(input.input_params.meta.is_graph_warmup)
+      << "Prepared ACL graph capture is only allowed during startup warmup";
+  GraphSlot& slot = graph_slots_[binding.slot_id];
+  std::optional<c10_npu::NPUStream> capture_stream;
+  {
+    std::lock_guard<std::mutex> lock(graph_slots_mutex_);
+    CHECK(slot.prepared_graphs.find(binding.graph_key) ==
+          slot.prepared_graphs.end());
+    if (!slot.graph_capture_stream.has_value()) {
+      slot.graph_capture_stream =
+          c10_npu::getStreamFromPool(/*isHighPriority=*/true, device_.index());
+    }
+    capture_stream = slot.graph_capture_stream;
+  }
+  std::shared_ptr<AclGraph> graph;
+  if (binding.native_handle != nullptr) {
+    graph = std::static_pointer_cast<AclGraph>(binding.native_handle);
+  } else {
+    graph = std::make_shared<AclGraph>(
+        *slot.persistent_param, device_.index(), capture_stream.value());
+  }
+  ModelOutput output = graph->capture_prepared(
+      model_, options_, input, kv_caches, slot.graph_pool);
+  {
+    std::lock_guard<std::mutex> lock(graph_slots_mutex_);
+    auto [graph_it, inserted] =
+        slot.prepared_graphs.emplace(binding.graph_key, graph);
+    CHECK(inserted);
+    (void)graph_it;
+  }
+  LOG(INFO) << "Captured startup Prepared ACL graph: slot=" << binding.slot_id
+            << ", key=" << binding.graph_key
+            << ", num_tokens=" << input.token_ids.size(/*dim=*/0);
+  if (model_->is_hybrid_linear_attention()) {
+    trace_prepared_speculative_graph_execution(binding, input);
+  }
+  return output;
 }
 
 // Main execution method with graph optimization for decode phase
@@ -1348,7 +2164,9 @@ uint64_t AclGraphExecutorImpl::get_graph_key(
       params.meta.batch_forward_type.is_chunked_prefill()) {
     const uint64_t q_max_seq_len =
         static_cast<uint64_t>(std::max<int32_t>(params.meta.q_max_seq_len, 1));
-    if (params.graph.spec_verify_source_addresses_stable) {
+    if ((params.graph.spec_verify_source_addresses_stable ||
+         params.graph.prepared_spec_verify_direct_bind) &&
+        params.graph.use_expanded_decode_for_spec_verify_attention) {
       CHECK(params.attention.device.block_tables.defined());
       CHECK(params.graph.expanded_block_tables.defined());
       const uint64_t block_table_width =

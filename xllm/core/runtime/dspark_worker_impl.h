@@ -48,6 +48,21 @@ class DSparkWorkerImpl final : public DFlashWorkerImpl {
   DraftBlock run_decode_draft(const ForwardInput& input,
                               ForwardInput& validate_input) override;
 
+  int64_t prepared_dspark_markov_rank() const override;
+  int64_t prepared_dspark_vocab_size() const override;
+  void launch_prepared_dspark_markov_sample(
+      const torch::Tensor& base_logits,
+      const torch::Tensor& anchor_token_ids,
+      const SamplingParameters& sampling_params,
+      int64_t row_count,
+      int32_t block_step,
+      dspark_detail::PreparedSamplingWorkspace& workspace) const override;
+  void launch_prepared_dspark_token_broadcast(
+      const SamplingParameters& sampling_params,
+      int64_t row_count,
+      int32_t block_step,
+      dspark_detail::PreparedSamplingWorkspace& workspace) const override;
+
  private:
   struct BlockSampleOutput {
     torch::Tensor token_ids;

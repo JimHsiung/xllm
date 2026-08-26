@@ -348,6 +348,55 @@ using RecModelInputParams = std::variant<std::monostate,
                                          OneRecXAttentionParams,
                                          LlmRecMultiRoundParams>;
 
+// Slot-local fixed Device destinations for the continuation-dependent DSA
+// sequence geometry. Prepared Block-Spec reuses these tensors across model
+// invocations so prefix sums, max scalars, compressed positions/cache slots,
+// and the SWA logical table do not allocate replacement outputs in
+// DeepSeek-V4 forward. The compact storage tensors include a discarded tail
+// used by Device scatter, while consumers only receive their active prefix.
+struct DSADeviceGeometryWorkspace {
+  torch::Tensor actual_seq_lengths_query;
+  torch::Tensor kv_cu_seq_lens;
+  torch::Tensor max_seqlen_q;
+  torch::Tensor max_seqlen_kv;
+  torch::Tensor start_pos;
+  torch::Tensor c4_compact_positions;
+  torch::Tensor c128_compact_positions;
+  torch::Tensor c4_compact_slots;
+  torch::Tensor c128_compact_slots;
+  torch::Tensor swa_block_table;
+
+  // Scratch reused serially by C4/C128 position and token-slot construction.
+  torch::Tensor token_indices;
+  torch::Tensor position_values;
+  torch::Tensor position_remainders;
+  torch::Tensor boundary_mask;
+  torch::Tensor boundary_ranks;
+  torch::Tensor sentinel_indices;
+  torch::Tensor destination_indices;
+  torch::Tensor token_offsets;
+  torch::Tensor token_candidates;
+  torch::Tensor mapping_valid;
+  torch::Tensor mapping_valid_aux;
+
+  // Scratch for the SWA logical-table gather. One-dimensional storage is
+  // reshaped to the active [batch, logical_columns] geometry per invocation.
+  torch::Tensor swa_logical_column_indices;
+  torch::Tensor swa_physical_columns;
+  torch::Tensor swa_gathered;
+  torch::Tensor swa_valid;
+  torch::Tensor swa_valid_aux;
+
+  // Scratch for expanding request-shaped manager tables to the logical DSA
+  // batch. Each manager needs distinct storage because the normalized views
+  // remain attached to metadata for the duration of model forward.
+  torch::Tensor manager_row_indices;
+  std::vector<torch::Tensor> manager_expanded_block_tables;
+};
+
+using DSADeviceGeometryWorkspacePtr =
+    std::shared_ptr<DSADeviceGeometryWorkspace>;
+
 struct AttentionHostInput {
   std::vector<int32_t> q_seq_lens;
   std::vector<int32_t> q_cu_seq_lens;
@@ -770,6 +819,9 @@ struct BatchInputMeta {
   int32_t q_max_seq_len = 0;
   uint64_t batch_id = 0;
   bool is_graph_warmup = false;
+  // Synthetic hybrid-MTP Graph warmup variant. Real inputs keep the default
+  // length 1 and derive accepted state exclusively from target output.
+  int32_t graph_warmup_speculative_accepted_length = 1;
 };
 
 struct ModelEmbeddingInput {
@@ -787,6 +839,11 @@ struct ModelEmbeddingInput {
 
   // request ids of each sequence, used by suffix decoding request identity
   std::vector<std::string> request_ids;
+
+  // Int64Tensor: [n_seq]. Each current row maps to the immediately preceding
+  // Task row, or -1 for a new request. Prepared MTP consumes it entirely on
+  // Device and does not scan request_ids in the Worker launch path.
+  torch::Tensor predecessor_rows;
 
   // chunked prefill case of speculative decoding
   // extra token ids for each sequence, and -1 for last chunk
@@ -806,6 +863,7 @@ struct ModelEmbeddingInput {
     out.linear_state_ids = linear_state_ids;
     out.linear_state_indices = safe_to(linear_state_indices, device, true);
     out.request_ids = request_ids;
+    out.predecessor_rows = safe_to(predecessor_rows, device, true);
     out.extra_token_ids = extra_token_ids;
     out.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);
     out.mtp_bootstrap_row_idxes = mtp_bootstrap_row_idxes;
@@ -952,7 +1010,14 @@ struct GraphInput {
   torch::Tensor expanded_paged_kv_indices;
   torch::Tensor expanded_paged_kv_last_page_len;
   torch::Tensor expanded_tiling_data;
+  // Host construction values. For Prepared direct binding this remains the
+  // conservative planning template; runtime attention consumes the Device
+  // expanded_kv_seq_lens tensor patched by predecessor continuation.
   std::vector<int32_t> expanded_kv_seq_lens_vec;
+  // Maximum continuation advance beyond the Host expanded-KV template while
+  // this Prepared Task waits for its predecessor. Graph binding rejects a
+  // template whose full range crosses an attention-plan bucket.
+  int32_t spec_verify_kv_seq_len_headroom = 0;
 #if defined(USE_NPU)
   std::shared_ptr<npu::AclGraphTaskUpdateContext> acl_graph_task_update_context;
 #endif
@@ -969,6 +1034,11 @@ struct GraphInput {
   // already been recorded on the signal stream. Replay can skip cold-path
   // signaling on the final-draft-to-target critical path.
   bool spec_verify_static_graph_tasks_prepared = false;
+  // Prepared Target Verify binds the final Slot Arena directly and patches
+  // its token/attention views before model launch. This marker is set only by
+  // PreparedInputArena after it has removed Legacy graph-update sources and
+  // rebound every mutable input to Slot-owned storage.
+  bool prepared_spec_verify_direct_bind = false;
 
   GraphInput to(const torch::Device& device) const {
     GraphInput out;
@@ -989,6 +1059,7 @@ struct GraphInput {
         safe_to(expanded_paged_kv_last_page_len, device, true);
     out.expanded_tiling_data = safe_to(expanded_tiling_data, device, true);
     out.expanded_kv_seq_lens_vec = expanded_kv_seq_lens_vec;
+    out.spec_verify_kv_seq_len_headroom = spec_verify_kv_seq_len_headroom;
 #if defined(USE_NPU)
     out.acl_graph_task_update_context = acl_graph_task_update_context;
 #endif
@@ -1004,6 +1075,7 @@ struct GraphInput {
         spec_verify_source_addresses_stable;
     out.spec_verify_static_graph_tasks_prepared =
         spec_verify_static_graph_tasks_prepared;
+    out.prepared_spec_verify_direct_bind = prepared_spec_verify_direct_bind;
     return out;
   }
 };
@@ -1034,6 +1106,15 @@ struct ModelInputParams {
       params.multi_block_tables.push_back(
           safe_to(table, table.options().device(torch::kCPU), true));
     }
+    params.device_multi_block_tables.reserve(device_multi_block_tables.size());
+    for (const torch::Tensor& table : device_multi_block_tables) {
+      params.device_multi_block_tables.emplace_back(
+          safe_to(table, device, /*non_blocking=*/true));
+    }
+    params.dsa_device_geometry_authoritative =
+        dsa_device_geometry_authoritative;
+    params.dsa_device_geometry_kv_headroom = dsa_device_geometry_kv_headroom;
+    params.dsa_device_geometry_workspace = dsa_device_geometry_workspace;
     params.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);
     if (!params.embedding.linear_state_indices.defined() &&
         !params.embedding.linear_state_ids.empty()) {
@@ -1146,6 +1227,14 @@ struct ModelInputParams {
   // Multi block manager block tables for DeepSeek V4.
   // Each tensor is [batch_size, max_block_len] for one manager.
   std::vector<torch::Tensor> multi_block_tables;
+  // Prepared speculative continuation patches positions and KV lengths on
+  // Device after Host staging. DeepSeek-V4 uses these fixed-address manager
+  // tables to rebuild SWA read geometry and compressed-cache write slots from
+  // those authoritative Device tensors without a D2H round trip.
+  std::vector<torch::Tensor> device_multi_block_tables;
+  bool dsa_device_geometry_authoritative = false;
+  int32_t dsa_device_geometry_kv_headroom = 0;
+  DSADeviceGeometryWorkspacePtr dsa_device_geometry_workspace;
 
   // Shifted target token ids for MTP training/evaluation paths.
   torch::Tensor mtp_shifted_token_ids;

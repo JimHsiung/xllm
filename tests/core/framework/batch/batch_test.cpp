@@ -1741,6 +1741,7 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
                mm_data,
                std::move(decoder),
                seq_params);
+  seq.set_graph_warmup_speculative_accepted_length(/*accepted_length=*/3);
   seq.add_blocks(BlockType::KV, manager.allocate(1));
 
   TransferKVInfo info;
@@ -1768,6 +1769,8 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
   input.input_params.embedding.mtp_bootstrap_row_idxes = {0};
   input.input_params.embedding.mtp_bootstrap_embeddings =
       torch::tensor({{3.0f, 4.0f}});
+  input.input_params.embedding.predecessor_rows =
+      torch::tensor({-1}, torch::kLong);
   input.sample_sequence_ids = {"req-packed#0"};
   input.sample_prior_output_rows = {3};
   input.sampling_params.filter_bitmask =
@@ -1792,6 +1795,8 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
 
   EXPECT_EQ(round_trip.input_params.meta.batch_id, batch_id);
   EXPECT_TRUE(round_trip.input_params.meta.is_graph_warmup);
+  EXPECT_EQ(
+      round_trip.input_params.meta.graph_warmup_speculative_accepted_length, 3);
   EXPECT_TRUE(equal(round_trip.token_ids, std::vector<int32_t>({1, 2, 3, 4})));
   ASSERT_EQ(round_trip.transfer_kv_infos.size(), 1u);
   const KVTransferMapping& mapping =
@@ -1815,6 +1820,10 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
       round_trip.input_params.embedding.mtp_bootstrap_embeddings.to(
           torch::kCPU),
       torch::tensor({{3.0f, 4.0f}})));
+  ASSERT_TRUE(round_trip.input_params.embedding.predecessor_rows.defined());
+  EXPECT_TRUE(torch::equal(
+      round_trip.input_params.embedding.predecessor_rows.to(torch::kCPU),
+      input.input_params.embedding.predecessor_rows));
 }
 
 TEST(BatchTest, ForwardOutputProtoRoundTripPreservesJsonObjectErrors) {

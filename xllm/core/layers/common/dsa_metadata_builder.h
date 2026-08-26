@@ -29,6 +29,11 @@ namespace layer {
 struct AttentionMetadata;
 struct DSAMetadata;
 
+// Verifies that manager-indexed tensors use the scheduler's canonical
+// SWA/C4/C128 export order. Missing compression groups are allowed, but the
+// remaining roles must preserve that order.
+void validate_dsa_group_order(const std::vector<DSAGroupInfo>& group_infos);
+
 // Builder class for DSAMetadata.
 // Builds a complete AttentionMetadata (with dsa_metadata populated) from
 // ModelInputParams and model-specific data.  This replaces the need for a
@@ -53,6 +58,15 @@ class DSAMetadataBuilder {
       const std::vector<DSAGroupInfo>& group_infos,
       const torch::Tensor& dsa_c4_cos_sin = torch::Tensor(),
       const torch::Tensor& dsa_c128_cos_sin = torch::Tensor());
+
+  // Rebuilds continuation-dependent DeepSeek-V4 geometry after Prepared
+  // speculative execution patches positions and KV lengths on Device. The
+  // caller must invoke this after manager block tables have reached the same
+  // device as the model and before building sparse/indexer metadata.
+  static void patch_device_geometry(
+      const ModelInputParams& params,
+      const std::vector<DSAGroupInfo>& group_infos,
+      DSAMetadata& dsa_metadata);
 
  private:
   // Build DSA-specific fields into dsa_metadata.

@@ -621,5 +621,12 @@ int main(int argc, char** argv) {
   init_npu_python_runtime();
 #endif
 
-  return run();
+  const int32_t exit_code = run();
+  if (Py_IsInitialized() && PyGILState_Check() == 0) {
+    // The embedded interpreter remains alive for process-static torch/pybind
+    // objects. Reacquire and retain the main-thread GIL after all serving
+    // objects are gone so their later static decref operations are valid.
+    (void)PyGILState_Ensure();
+  }
+  return exit_code;
 }

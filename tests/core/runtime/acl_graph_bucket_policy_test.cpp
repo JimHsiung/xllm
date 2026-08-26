@@ -43,5 +43,45 @@ TEST(AclGraphBucketPolicyUnitTest, AppliesWarmupCapacityInLocalDpUnits) {
   EXPECT_TRUE(npu::is_acl_graph_decode_capture_allowed(15, 16, 1, true));
 }
 
+TEST(AclGraphBucketPolicyUnitTest,
+     KeepsSpecVerifyPredecessorHeadroomInsideOnePlanBucket) {
+  EXPECT_TRUE(npu::spec_verify_attention_plan_headroom_is_safe(
+      /*template_max_kv_seq_len=*/124,
+      /*kv_seq_len_headroom=*/3,
+      /*block_size=*/128));
+  EXPECT_TRUE(npu::spec_verify_attention_plan_headroom_is_safe(
+      /*template_max_kv_seq_len=*/129,
+      /*kv_seq_len_headroom=*/126,
+      /*block_size=*/128));
+  EXPECT_FALSE(npu::spec_verify_attention_plan_headroom_is_safe(
+      /*template_max_kv_seq_len=*/127,
+      /*kv_seq_len_headroom=*/1,
+      /*block_size=*/128));
+  EXPECT_FALSE(npu::spec_verify_attention_plan_headroom_is_safe(
+      /*template_max_kv_seq_len=*/128,
+      /*kv_seq_len_headroom=*/1,
+      /*block_size=*/128));
+  EXPECT_FALSE(npu::spec_verify_attention_plan_headroom_is_safe(
+      /*template_max_kv_seq_len=*/255,
+      /*kv_seq_len_headroom=*/1,
+      /*block_size=*/128));
+}
+
+TEST(AclGraphBucketPolicyUnitTest,
+     RejectsInvalidSpecVerifyPredecessorHeadroom) {
+  EXPECT_FALSE(npu::spec_verify_attention_plan_headroom_is_safe(
+      /*template_max_kv_seq_len=*/0,
+      /*kv_seq_len_headroom=*/0,
+      /*block_size=*/128));
+  EXPECT_FALSE(npu::spec_verify_attention_plan_headroom_is_safe(
+      /*template_max_kv_seq_len=*/1,
+      /*kv_seq_len_headroom=*/-1,
+      /*block_size=*/128));
+  EXPECT_FALSE(npu::spec_verify_attention_plan_headroom_is_safe(
+      /*template_max_kv_seq_len=*/1,
+      /*kv_seq_len_headroom=*/0,
+      /*block_size=*/0));
+}
+
 }  // namespace
 }  // namespace xllm

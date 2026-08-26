@@ -43,6 +43,8 @@ class DSparkMarkovHead final {
     }
     if (w2.defined()) {
       markov_w2_ = w2.to(tensor_options_);
+      markov_w2_transposed_ =
+          markov_w2_.transpose(/*dim0=*/0, /*dim1=*/1).contiguous();
     }
   }
 
@@ -73,6 +75,31 @@ class DSparkMarkovHead final {
     return F::linear(markov_embedding, markov_w2_);
   }
 
+  void bias_out(const torch::Tensor& previous_token_ids,
+                torch::Tensor markov_embedding,
+                torch::Tensor output) const {
+    CHECK(markov_w1_.defined() && markov_w2_transposed_.defined())
+        << "DSpark Markov head weights are not initialized.";
+    CHECK_EQ(previous_token_ids.dim(), 1);
+    CHECK_EQ(previous_token_ids.scalar_type(), torch::kLong);
+    CHECK_EQ(markov_embedding.dim(), 2);
+    CHECK_EQ(markov_embedding.size(0), previous_token_ids.numel());
+    CHECK_EQ(markov_embedding.size(1), markov_rank_);
+    CHECK_EQ(output.dim(), 2);
+    CHECK_EQ(output.size(0), previous_token_ids.numel());
+    CHECK_EQ(output.size(1), markov_w2_.size(0));
+    CHECK_EQ(previous_token_ids.device(), markov_embedding.device());
+    CHECK_EQ(previous_token_ids.device(), output.device());
+    CHECK_EQ(markov_embedding.scalar_type(), markov_w1_.scalar_type());
+    CHECK_EQ(output.scalar_type(), markov_w2_.scalar_type());
+
+    torch::index_select_out(markov_embedding,
+                            markov_w1_,
+                            /*dim=*/0,
+                            previous_token_ids);
+    torch::mm_out(output, markov_embedding, markov_w2_transposed_);
+  }
+
   // Expose the shared markov_w1 embedding so a ConfidenceHead can reuse the
   // same low-rank features without a redundant lookup-table copy.
   torch::Tensor markov_embed(const torch::Tensor& previous_token_ids) const {
@@ -85,6 +112,7 @@ class DSparkMarkovHead final {
  private:
   torch::Tensor markov_w1_;
   torch::Tensor markov_w2_;
+  torch::Tensor markov_w2_transposed_;
   torch::TensorOptions tensor_options_;
   int64_t markov_rank_ = 0;
 };

@@ -41,7 +41,10 @@ limitations under the License.
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/eplb/eplb_utils.h"
+#include "core/framework/speculative/mtp_async_state.h"
+#include "core/layers/common/dsa_metadata.h"
 #include "core/platform/platform.h"
 #include "framework/block/block_utils.h"
 #include "framework/block/hierarchy_block_manager_pool.h"
@@ -666,21 +669,10 @@ bool LLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
     std::vector<uint32_t> manager_types{kManagerTypeSlidingWindowBlockManager};
     std::vector<uint32_t> manager_compress_ratios{
         0};  // unused for sliding window manager
-    std::vector<uint32_t> token_manager_ratios;
-    token_manager_ratios.reserve(2);
-    for (const int32_t ratio : args_.compress_ratios()) {
-      if (ratio == 4 || ratio == 128) {
-        const uint32_t ratio_u32 = static_cast<uint32_t>(ratio);
-        if (std::find(token_manager_ratios.begin(),
-                      token_manager_ratios.end(),
-                      ratio_u32) == token_manager_ratios.end()) {
-          token_manager_ratios.push_back(ratio_u32);
-        }
-      }
-    }
-    for (const uint32_t ratio : token_manager_ratios) {
-      manager_types.push_back(kManagerTypeBlockManagerImpl);
-      manager_compress_ratios.push_back(ratio);
+    for (const int32_t ratio :
+         canonical_dsa_token_manager_ratios(args_.compress_ratios())) {
+      manager_types.emplace_back(kManagerTypeBlockManagerImpl);
+      manager_compress_ratios.emplace_back(static_cast<uint32_t>(ratio));
     }
 
     const int64_t semantic_window = std::max(args_.window_size(), 1);
@@ -1193,11 +1185,11 @@ void LLMEngine::update_last_step_result(std::vector<Batch>& last_batch) {
   // under cp_size>1 it lands on cp_rank=1 non-driver workers whose
   // get_last_step_result() blocks forever on cv_.wait(is_recorded_).
   uint32_t stride = dp_local_size_;
-  // If EPLB is enabled, we need to get results from all workers,
-  // because the experts on each worker are different,
-  // and the tokens load of all experts needs to be returned to engine.
-  // so we can not skip any worker.
-  if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
+  // EPLB needs every rank's expert-load data. Prepared schedule overlap also
+  // consumes every rank so its completed Slot can return to the two-Slot FIFO,
+  // even though only DP driver outputs are used below.
+  if (::xllm::EPLBConfig::get_instance().enable_eplb() ||
+      ::xllm::ExecutionConfig::get_instance().enable_prepared_task_pipeline()) {
     stride = 1;
   }
 
@@ -1361,8 +1353,21 @@ std::vector<ForwardInput> LLMEngine::prepare_inputs(std::vector<Batch>& batch) {
         current_batch_forward_type.is_decode() &&
         batched_inputs[dp_rank].input_params.meta.q_max_seq_len == 1;
 
-    const ModelEmbeddingInput& embedding =
+    ModelEmbeddingInput& embedding =
         batched_inputs[dp_rank].input_params.embedding;
+    const bool build_prepared_predecessor_rows =
+        ::xllm::ExecutionConfig::get_instance()
+            .enable_prepared_task_pipeline() &&
+        options_.enable_speculative_decode() &&
+        SpeculativeConfig::requires_prepared_predecessor_rows(
+            options_.speculative_algorithm());
+    if (build_prepared_predecessor_rows) {
+      const std::vector<int64_t> predecessor_rows =
+          mtp_async::build_predecessor_rows(dp_batch_request_ids_[dp_rank],
+                                            embedding.request_ids);
+      embedding.predecessor_rows =
+          torch::tensor(predecessor_rows, torch::kLong);
+    }
     if (dp_batch_embedding_ids_[dp_rank] != embedding.embedding_ids ||
         dp_batch_request_ids_[dp_rank] != embedding.request_ids) {
       dp_batch_embedding_ids_[dp_rank] = embedding.embedding_ids;

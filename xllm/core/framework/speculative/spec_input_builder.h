@@ -54,6 +54,30 @@ struct DecodeBuildBuffers {
   int32_t out_block_table_stride = 0;
 };
 
+// Caller-owned scratch for Prepared decode row construction. The builder
+// vectors are cleared between invocations without releasing their capacity;
+// fields moved into a temporary ForwardInput are reclaimed after Arena staging.
+struct DecodeBuildWorkspace {
+  DecodeBuildBuffers buffers;
+  std::vector<int32_t> auxiliary_kv_seq_lens;
+  std::vector<int32_t> auxiliary_q_seq_lens;
+  std::vector<int32_t> auxiliary_q_cu_seq_lens;
+  std::vector<int32_t> selected_indices;
+  std::vector<torch::Tensor> embedding_rows;
+  bool owns_kv_seq_lens = false;
+  bool owns_q_seq_lens = false;
+  bool owns_q_cu_seq_lens = false;
+  bool uses_auxiliary_kv_seq_lens = false;
+  bool uses_auxiliary_q_seq_lens = false;
+  bool uses_auxiliary_q_cu_seq_lens = false;
+};
+
+void reserve_decode_build_workspace(DecodeBuildWorkspace& workspace,
+                                    int64_t row_capacity);
+void reset_decode_build_workspace(DecodeBuildWorkspace& workspace);
+void reclaim_decode_build_workspace(ModelInputParams& input_params,
+                                    DecodeBuildWorkspace& workspace);
+
 // CPU-side row context shared by decode row builders.
 // It owns the contiguous block table tensor so row slices stay valid.
 struct DecodeRowContext {
@@ -134,6 +158,9 @@ int32_t calc_ring_slot_id(int32_t position,
 // Manager 0 in a grouped-cache input is the DSV4 SWA manager.
 std::vector<int32_t> build_grouped_prefill_swa_slots(const ForwardInput& input,
                                                      int32_t block_size);
+void build_grouped_prefill_swa_slots_out(const ForwardInput& input,
+                                         int32_t block_size,
+                                         std::vector<int32_t>& slots);
 
 // Computes sequence kv length with platform-specific seq-lens layout handling.
 int32_t calc_kv_len(const Slice<int32_t>& kv_seq_lens_slice,
@@ -165,6 +192,24 @@ void update_input_params(ModelInputParams& input_params,
 
 // Packs a host int32 vector into a pinned CPU tensor for async H2D staging.
 torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values);
+
+// Writes int32 values into caller-owned CPU storage and returns an active
+// prefix view without replacing the destination allocation.
+torch::Tensor copy_cpu_int_values_out(const std::vector<int32_t>& values,
+                                      torch::Tensor destination);
+
+// Writes an arithmetic int32 range into caller-owned CPU storage and returns
+// an active prefix view without replacing the destination allocation.
+torch::Tensor fill_cpu_int_range_out(int32_t start,
+                                     int32_t step,
+                                     int64_t count,
+                                     torch::Tensor destination);
+
+// Fills a caller-owned CPU bool tensor and returns an active prefix view
+// without replacing the destination allocation.
+torch::Tensor fill_cpu_bool_out(bool value,
+                                int64_t count,
+                                torch::Tensor destination);
 
 // Stages token_ids/positions into both the host and device tensors of `input`
 // with async H2D copies, toggling device_tensors_ready around the write.

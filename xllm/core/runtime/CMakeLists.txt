@@ -12,6 +12,7 @@ cc_library(
     params_utils.h
     executor.h
     executor_impl.h
+    prepared_executor.h
     executor_impl_factory.h
     vlm_executor_impl.h
     base_executor_impl.h
@@ -44,6 +45,18 @@ cc_library(
     dspark_worker_impl.h
     forward_shared_memory_manager.h
     worker_rendezvous.h
+    prepared_task/prepared_task_types.h
+    prepared_task/prepared_task_adapter.h
+    prepared_task/prepared_input_arena.h
+    prepared_task/prepared_task_pipeline.h
+    prepared_task/llm_prepared_task_adapter.h
+    prepared_task/block_spec_prepared_task_adapter.h
+    prepared_task/block_spec_prepared_task_backend.h
+    prepared_task/block_spec_prepared_task_plan.h
+    prepared_task/dspark_prepared_sampling.h
+    prepared_task/mtp_prepared_task_backend.h
+    prepared_task/mtp_prepared_task_adapter.h
+    prepared_task/mtp_prepared_task_plan.h
   SRCS
     decode_graph_bucket.cpp
     executor.cpp
@@ -62,6 +75,16 @@ cc_library(
     worker.cpp
     worker_impl.cpp
     worker_rendezvous.cpp
+    prepared_task/prepared_input_arena.cpp
+    prepared_task/prepared_task_pipeline.cpp
+    prepared_task/llm_prepared_task_adapter.cpp
+    prepared_task/block_spec_prepared_task_adapter.cpp
+    prepared_task/block_spec_prepared_task_backend.cpp
+    prepared_task/block_spec_prepared_task_plan.cpp
+    prepared_task/dspark_prepared_sampling.cpp
+    prepared_task/mtp_prepared_task_backend.cpp
+    prepared_task/mtp_prepared_task_adapter.cpp
+    prepared_task/mtp_prepared_task_plan.cpp
     llm_worker_impl.cpp
     vlm_worker_impl.cpp
     dit_worker_impl.cpp

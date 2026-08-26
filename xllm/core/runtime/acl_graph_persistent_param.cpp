@@ -1802,7 +1802,8 @@ void GraphPersistentParam::plan_paged_attention_tiling(
     const torch::Tensor& block_tables,
     const ModelInputParams& input_params,
     aclrtStream stream,
-    bool copy_to_device) {
+    bool copy_to_device,
+    torch::Tensor* host_tiling) {
   // Convert torch tensors to atb tensors
   atb::Tensor atb_k_cache = atb_speed::Utils::AtTensor2Tensor(k_cache);
   atb::Tensor atb_v_cache = atb_speed::Utils::AtTensor2Tensor(v_cache);
@@ -1893,6 +1894,17 @@ void GraphPersistentParam::plan_paged_attention_tiling(
     parse_pa_host_tiling_buffer(tiling_buffer_info.tilingBuffer,
                                 tiling_buffer_info.tilingBufferSize);
   }
+  if (host_tiling != nullptr) {
+    CHECK_LE(tiling_buffer_info.tilingBufferSize,
+             static_cast<uint64_t>(tiling_data_.numel()) * sizeof(uint32_t))
+        << "Paged-attention Host tiling exceeds the fixed Graph capacity";
+    *host_tiling = torch::zeros(
+        {tiling_data_.numel()},
+        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
+    std::memcpy(host_tiling->data_ptr(),
+                tiling_buffer_info.tilingBuffer,
+                tiling_buffer_info.tilingBufferSize);
+  }
   if (copy_to_device) {
     aclError acl_status =
         aclrtMemcpyAsync(tiling_data_.data_ptr(),
@@ -1904,6 +1916,28 @@ void GraphPersistentParam::plan_paged_attention_tiling(
     CHECK_EQ(acl_status, ACL_SUCCESS)
         << "Failed to copy tiling buffer to device";
   }
+}
+
+torch::Tensor GraphPersistentParam::prepare_paged_attention_tiling_host(
+    const torch::Tensor& tokens,
+    const torch::Tensor& k_cache,
+    const torch::Tensor& v_cache,
+    const torch::Tensor& block_tables,
+    const ModelInputParams& input_params) {
+  if (!uses_paged_attention_tiling()) {
+    return torch::Tensor();
+  }
+  std::lock_guard<std::mutex> lock(paged_attention_plan_mutex_);
+  torch::Tensor host_tiling;
+  plan_paged_attention_tiling(tokens,
+                              k_cache,
+                              v_cache,
+                              block_tables,
+                              input_params,
+                              stream_for_plan_,
+                              /*copy_to_device=*/false,
+                              &host_tiling);
+  return host_tiling;
 }
 
 void GraphPersistentParam::update_attention_mask(

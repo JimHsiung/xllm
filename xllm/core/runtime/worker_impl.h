@@ -205,6 +205,14 @@ class WorkerImpl {
   virtual folly::SemiFuture<std::optional<ForwardOutput>> step_async(
       const ForwardInput& inputs);
 
+  // Narrow capability used by PreparedTaskAdapter. Pipeline threads must bind
+  // the worker device before touching streams or tensors.
+  void initialize_prepared_task_thread();
+
+  Stream& prepared_prepare_stream() { return *prepare_stream_; }
+
+  StreamEventPtr record_prepared_task_event() const;
+
   virtual folly::SemiFuture<folly::Unit> process_group_test_async();
 
   const torch::Device& device() const { return device_.unwrap(); }

@@ -159,6 +159,12 @@ class DeepseekV4DSparkModelImpl final : public DeepseekV4ModelImpl {
     return markov_head_.bias(previous_token_ids);
   }
 
+  void dspark_markov_bias_out(const torch::Tensor& previous_token_ids,
+                              torch::Tensor markov_embedding,
+                              torch::Tensor output) const {
+    markov_head_.bias_out(previous_token_ids, markov_embedding, output);
+  }
+
   bool has_dspark_confidence_head() const { return confidence_head_.defined(); }
 
   torch::Tensor dspark_confidence_probs(
@@ -239,6 +245,13 @@ class DeepseekV4DSparkForCausalLMImpl final
   torch::Tensor dspark_markov_bias(
       const torch::Tensor& previous_token_ids) const {
     return model_->dspark_markov_bias(previous_token_ids);
+  }
+
+  void dspark_markov_bias_out(const torch::Tensor& previous_token_ids,
+                              torch::Tensor markov_embedding,
+                              torch::Tensor output) const {
+    model_->dspark_markov_bias_out(
+        previous_token_ids, markov_embedding, output);
   }
 
   bool has_dspark_confidence_head() const {

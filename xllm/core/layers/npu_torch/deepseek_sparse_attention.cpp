@@ -770,6 +770,20 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   DsaCacheMapping mapping =
       resolve_cache_mapping(attn_metadata, compress_ratio_i);
 
+  auto scatter_cache_rows = [&attn_metadata](torch::Tensor& cache,
+                                             const torch::Tensor& slot_mapping,
+                                             const torch::Tensor& value) {
+    if (attn_metadata.device_geometry_authoritative) {
+      deepseek_v4_indexer_detail::scatter_prepared_dsa_cache_rows(
+          cache,
+          /*auxiliary_cache=*/nullptr,
+          slot_mapping,
+          value);
+      return;
+    }
+    scatter_by_slot(cache, slot_mapping, value);
+  };
+
   auto cmp_block_table = get_layer_cache_tensor(attn_metadata.block_tables,
                                                 attn_metadata.layer_id,
                                                 mapping.cmp_cache_idx);
@@ -857,7 +871,7 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
     CHECK(ori_kv_for_attn.defined())
         << "Failed to build PA_ND KV for DeepSeek V4 prefill attention.";
   } else {
-    scatter_by_slot(ori_kv, ori_slot, kv);
+    scatter_cache_rows(ori_kv, ori_slot, kv);
     ori_kv_for_attn = ori_kv;
   }
 
@@ -896,7 +910,7 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
         compress_cos,
         cp_enabled ? cp_ctx->global_q_cu_seq_lens
                    : attn_metadata.actual_seq_lengths_query);
-    scatter_by_slot(cmp_kv, cmp_slot, compressed_kv);
+    scatter_cache_rows(cmp_kv, cmp_slot, compressed_kv);
     cmp_kv_for_attn = cmp_kv;
   }
 
@@ -1020,7 +1034,7 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
 
   // 8) Deferred cache write for full prefill.
   if (use_temporary_prefill_kv) {
-    scatter_by_slot(ori_kv, ori_slot, kv);
+    scatter_cache_rows(ori_kv, ori_slot, kv);
   }
 
   // 9) output RoPE + projection

@@ -51,6 +51,7 @@ limitations under the License.
 #include "core/runtime/base_executor_impl.h"
 #include "core/runtime/dflash_worker_impl.h"
 #include "core/runtime/options.h"
+#include "core/runtime/prepared_task/prepared_input_arena.h"
 #include "core/runtime/speculative_worker_impl.h"
 #include "models/llm/deepseek_v4.h"
 #include "models/llm/dspark_weight_source.h"
@@ -162,6 +163,10 @@ const KVCache& first_full_attention_cache(
   LOG(FATAL) << "No full-attention KV cache found";
   std::abort();
 }
+
+struct SimpleGraphMetadataState final : ModelGraphMetadataState {
+  torch::Tensor positions;
+};
 }  // namespace
 
 // Initialize glog for testing - use a function to ensure proper initialization
@@ -303,6 +308,13 @@ class SimpleCausalLM : public CausalLM {
     last_forward_enabled_graph_ = parameters.enable_graph;
     last_forward_had_attn_metadata_ = parameters.attn_metadata != nullptr;
     auto hidden_states = forward_impl(tokens, positions, kv_caches, parameters);
+    if (requires_graph_forward_metadata_) {
+      CHECK(parameters.attn_metadata != nullptr);
+      CHECK(parameters.attn_metadata->kv_seq_lens.defined());
+      hidden_states = hidden_states + parameters.attn_metadata->kv_seq_lens
+                                          .to(hidden_states.scalar_type())
+                                          .unsqueeze(/*dim=*/-1);
+    }
     ModelOutput model_output(hidden_states);
     if (return_aux_hidden_states_) {
       model_output.aux_hidden_states =
@@ -313,6 +325,52 @@ class SimpleCausalLM : public CausalLM {
 
   void set_return_aux_hidden_states(bool value) {
     return_aux_hidden_states_ = value;
+  }
+
+  void set_requires_graph_forward_metadata(bool value) {
+    requires_graph_forward_metadata_ = value;
+    graph_metadata_prepare_count_ = 0;
+    graph_metadata_addresses_.clear();
+  }
+
+  bool requires_graph_forward_metadata() override {
+    return requires_graph_forward_metadata_;
+  }
+
+  std::unique_ptr<ModelGraphMetadataState> create_graph_forward_metadata_state()
+      override {
+    CHECK(requires_graph_forward_metadata_);
+    return std::make_unique<SimpleGraphMetadataState>();
+  }
+
+  void prepare_graph_forward_metadata(ModelGraphMetadataState* state,
+                                      const torch::Tensor& positions,
+                                      ModelInputParams& parameters) override {
+    CHECK(requires_graph_forward_metadata_);
+    auto* metadata_state = dynamic_cast<SimpleGraphMetadataState*>(state);
+    CHECK(metadata_state != nullptr);
+    if (!metadata_state->positions.defined()) {
+      metadata_state->positions = torch::empty_like(positions);
+    } else {
+      CHECK_EQ(metadata_state->positions.sizes(), positions.sizes());
+      CHECK_EQ(metadata_state->positions.scalar_type(),
+               positions.scalar_type());
+      CHECK_EQ(metadata_state->positions.device(), positions.device());
+    }
+    metadata_state->positions.copy_(positions, /*non_blocking=*/true);
+    parameters.attn_metadata = std::make_shared<layer::AttentionMetadata>();
+    parameters.attn_metadata->kv_seq_lens = metadata_state->positions;
+    ++graph_metadata_prepare_count_;
+    graph_metadata_addresses_.emplace_back(
+        metadata_state->positions.data_ptr());
+  }
+
+  int32_t graph_metadata_prepare_count() const {
+    return graph_metadata_prepare_count_;
+  }
+
+  const std::vector<const void*>& graph_metadata_addresses() const {
+    return graph_metadata_addresses_;
   }
 
   const torch::TensorOptions& options() const override {
@@ -390,6 +448,9 @@ class SimpleCausalLM : public CausalLM {
   bool return_aux_hidden_states_ = false;
   bool last_forward_enabled_graph_ = false;
   bool last_forward_had_attn_metadata_ = false;
+  bool requires_graph_forward_metadata_ = false;
+  int32_t graph_metadata_prepare_count_ = 0;
+  std::vector<const void*> graph_metadata_addresses_;
 };
 
 class AclGraphExecutorTest : public ::testing::Test {
@@ -1135,6 +1196,157 @@ TEST_F(AclGraphExecutorTest, GraphDoubleBufferFlagControlsSlotCount) {
       original_enable_graph_double_buffer);
 }
 
+TEST_F(AclGraphExecutorTest,
+       PreparedBindingUsesExplicitSlotAndCapturesOnlyDuringWarmup) {
+  ExecutionConfig& execution_config = ExecutionConfig::get_instance();
+  const double runtime_misses_before =
+      COUNTER_VALUE(prepared_task_graph_runtime_misses_total);
+  const bool original_enable_graph_double_buffer =
+      execution_config.enable_graph_double_buffer();
+  execution_config.enable_graph_double_buffer(true);
+
+  std::unique_ptr<Batch> batch = CreateTestBatch();
+  ASSERT_FALSE(batch->empty());
+  ForwardInput host_input = batch->prepare_forward_input(
+      options_.num_decoding_tokens(), 0, model_args_);
+  constexpr uint64_t kArenaCapacityBytes = 4 * 1024 * 1024;
+  PreparedInputArena arena(*device_, kArenaCapacityBytes);
+  ForwardInput prepared_input;
+  ASSERT_TRUE(arena.stage(host_input, prepared_input));
+
+  std::unique_ptr<::xllm::npu::AclGraphExecutorImpl> graph_executor =
+      std::make_unique<::xllm::npu::AclGraphExecutorImpl>(
+          model_.get(), model_args_, *device_, options_);
+  PreparedSlotBinding runtime_miss =
+      graph_executor->bind_prepared(/*slot_id=*/1, prepared_input, kv_caches_);
+  EXPECT_EQ(runtime_miss.slot_id, 1);
+  EXPECT_EQ(runtime_miss.mode, PreparedInvocationMode::EAGER);
+  EXPECT_EQ(COUNTER_VALUE(prepared_task_graph_runtime_misses_total) -
+                runtime_misses_before,
+            1);
+  EXPECT_EQ(graph_executor->prepared_graph_count_for_test(/*slot_id=*/1), 0);
+
+  prepared_input.input_params.meta.is_graph_warmup = true;
+  prepared_input.input_params.enable_graph = true;
+  PreparedSlotBinding warmup_miss =
+      graph_executor->bind_prepared(/*slot_id=*/1, prepared_input, kv_caches_);
+  EXPECT_EQ(warmup_miss.slot_id, 1);
+  EXPECT_EQ(warmup_miss.mode, PreparedInvocationMode::GRAPH_CAPTURE);
+  EXPECT_NE(warmup_miss.graph_key, 0);
+  EXPECT_EQ(graph_executor->prepared_graph_count_for_test(/*slot_id=*/1), 0);
+  ModelOutput capture_output =
+      graph_executor->launch_prepared(warmup_miss, prepared_input, kv_caches_);
+  ASSERT_TRUE(capture_output.hidden_states.defined());
+  EXPECT_EQ(graph_executor->prepared_graph_count_for_test(/*slot_id=*/1), 1);
+
+  prepared_input.input_params.meta.is_graph_warmup = false;
+  PreparedSlotBinding replay_binding =
+      graph_executor->bind_prepared(/*slot_id=*/1, prepared_input, kv_caches_);
+  EXPECT_EQ(replay_binding.slot_id, 1);
+  EXPECT_EQ(replay_binding.mode, PreparedInvocationMode::GRAPH_REPLAY);
+  EXPECT_EQ(replay_binding.graph_key, warmup_miss.graph_key);
+  EXPECT_NE(replay_binding.native_handle, nullptr);
+  ModelOutput replay_output = graph_executor->launch_prepared(
+      replay_binding, prepared_input, kv_caches_);
+  ASSERT_TRUE(replay_output.hidden_states.defined());
+  EXPECT_TRUE(torch::allclose(capture_output.hidden_states,
+                              replay_output.hidden_states));
+
+  prepared_input.input_params.meta.batch_forward_type =
+      BatchForwardType::PREFILL;
+  PreparedSlotBinding unsupported =
+      graph_executor->bind_prepared(/*slot_id=*/0, prepared_input, kv_caches_);
+  EXPECT_EQ(unsupported.mode, PreparedInvocationMode::EAGER);
+  EXPECT_EQ(COUNTER_VALUE(prepared_task_graph_runtime_misses_total) -
+                runtime_misses_before,
+            1);
+
+  execution_config.enable_graph_double_buffer(
+      original_enable_graph_double_buffer);
+}
+
+TEST_F(AclGraphExecutorTest,
+       PreparedBindingRefreshesGraphForwardMetadataAtStableAddresses) {
+  ExecutionConfig& execution_config = ExecutionConfig::get_instance();
+  const bool original_enable_graph_double_buffer =
+      execution_config.enable_graph_double_buffer();
+  execution_config.enable_graph_double_buffer(/*value=*/false);
+
+  SimpleCausalLM* simple_model = dynamic_cast<SimpleCausalLM*>(model_.get());
+  ASSERT_NE(simple_model, nullptr);
+  simple_model->set_requires_graph_forward_metadata(/*value=*/true);
+
+  std::unique_ptr<Batch> batch = CreateTestBatch();
+  ASSERT_FALSE(batch->empty());
+  ForwardInput host_input = batch->prepare_forward_input(
+      options_.num_decoding_tokens(), 0, model_args_);
+  host_input.input_params.meta.is_graph_warmup = true;
+  host_input.input_params.enable_graph = true;
+
+  constexpr uint64_t kArenaCapacityBytes = 4 * 1024 * 1024;
+  PreparedInputArena arena(*device_, kArenaCapacityBytes);
+  ForwardInput capture_input;
+  ASSERT_TRUE(arena.stage(host_input, capture_input));
+
+  std::unique_ptr<::xllm::npu::AclGraphExecutorImpl> graph_executor =
+      std::make_unique<::xllm::npu::AclGraphExecutorImpl>(
+          model_.get(), model_args_, *device_, options_);
+  PreparedSlotBinding capture_binding = graph_executor->bind_prepared(
+      /*slot_id=*/0, capture_input, kv_caches_);
+  ASSERT_EQ(capture_binding.mode, PreparedInvocationMode::GRAPH_CAPTURE);
+  ASSERT_NE(capture_binding.native_handle, nullptr);
+  ASSERT_EQ(simple_model->graph_metadata_prepare_count(), 1);
+  ASSERT_EQ(simple_model->graph_metadata_addresses().size(), 1);
+  const void* capture_metadata_address =
+      simple_model->graph_metadata_addresses().front();
+  ASSERT_NE(capture_metadata_address, nullptr);
+
+  ModelOutput capture_output = graph_executor->launch_prepared(
+      capture_binding, capture_input, kv_caches_);
+  ASSERT_TRUE(capture_output.hidden_states.defined());
+  ASSERT_EQ(graph_executor->prepared_graph_count_for_test(/*slot_id=*/0), 1);
+
+  host_input.positions.add_(1);
+  host_input.input_params.meta.is_graph_warmup = false;
+  ForwardInput replay_input;
+  ASSERT_TRUE(arena.stage(host_input, replay_input));
+  ASSERT_EQ(replay_input.device_input_buffer.data_ptr(),
+            capture_input.device_input_buffer.data_ptr());
+  ASSERT_EQ(replay_input.prepared_input_layout_signature,
+            capture_input.prepared_input_layout_signature);
+
+  PreparedSlotBinding replay_binding = graph_executor->bind_prepared(
+      /*slot_id=*/0, replay_input, kv_caches_);
+  ASSERT_EQ(replay_binding.mode, PreparedInvocationMode::GRAPH_REPLAY);
+  ASSERT_EQ(replay_binding.graph_key, capture_binding.graph_key);
+  ASSERT_NE(replay_binding.native_handle, nullptr);
+  ASSERT_EQ(simple_model->graph_metadata_prepare_count(), 2);
+  ASSERT_EQ(simple_model->graph_metadata_addresses().size(), 2);
+  EXPECT_EQ(simple_model->graph_metadata_addresses().back(),
+            capture_metadata_address);
+
+  ModelOutput replay_output =
+      graph_executor->launch_prepared(replay_binding, replay_input, kv_caches_);
+  ASSERT_TRUE(replay_output.hidden_states.defined());
+
+  std::unique_ptr<ModelGraphMetadataState> expected_state =
+      model_->create_graph_forward_metadata_state();
+  ModelInputParams expected_params = replay_input.input_params;
+  model_->prepare_graph_forward_metadata(
+      expected_state.get(), replay_input.positions, expected_params);
+  ModelOutput expected_output = model_->forward(replay_input.token_ids,
+                                                replay_input.positions,
+                                                kv_caches_,
+                                                expected_params);
+  EXPECT_TRUE(torch::allclose(replay_output.hidden_states,
+                              expected_output.hidden_states,
+                              /*rtol=*/1e-5,
+                              /*atol=*/1e-6));
+
+  execution_config.enable_graph_double_buffer(
+      original_enable_graph_double_buffer);
+}
+
 TEST(AclGraphPersistentParamTest, SpecVerifyMetadataUsesTokenCapacity) {
   SpeculativeConfig& speculative_config = SpeculativeConfig::get_instance();
   const bool original_enable_atb_spec_kernel =
@@ -1218,7 +1430,9 @@ TEST(AclGraphPersistentParamTest, SpecVerifyMetadataUsesTokenCapacity) {
 TEST(AclGraphPersistentParamTest,
      GenericSpecVerifyCaptureKeepsPersistentBlockTableWidth) {
   constexpr int32_t kSpecWidth = 6;
-  constexpr int64_t kActiveBlockTableWidth = 2;
+  // Expanded KV lengths reach 20 with block size 4, so the active table must
+  // expose five valid pages while remaining narrower than graph capacity.
+  constexpr int64_t kActiveBlockTableWidth = 5;
   ModelArgs args;
   args.model_type("deepseek_v4");
   args.dtype("float32");

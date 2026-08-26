@@ -7,6 +7,7 @@ cc_library(
     adaptive_speculative_controller.h
     speculative_profile_registry.h
     adaptive_pruning_helpers.h
+    block_spec_async_state.h
     spec_input_builder.h
     mtp_async_input_builder.h
     mtp_async_state.h
@@ -17,6 +18,7 @@ cc_library(
     adaptive_speculative_controller.cpp
     speculative_profile_registry.cpp
     adaptive_pruning_helpers.cpp
+    block_spec_async_state.cpp
     spec_input_builder.cpp
     mtp_async_input_builder.cpp
     mtp_async_state.cpp

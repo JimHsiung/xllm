@@ -9,6 +9,17 @@ cc_test(
     GTest::gtest_main
 )
 
+cc_test(
+  NAME
+    prepared_task_pipeline_test
+  SRCS
+    prepared_task_pipeline_test.cpp
+  DEPS
+    :runtime
+    GTest::gtest_main
+    torch
+)
+
 if(USE_NPU)
   cc_test(
     NAME

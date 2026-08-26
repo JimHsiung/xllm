@@ -248,6 +248,103 @@ std::tuple<torch::Tensor, torch::Tensor> dynamic_quant_int8(
 
 }  // namespace
 
+namespace deepseek_v4_indexer_detail {
+
+void scatter_prepared_dsa_cache_rows(torch::Tensor& cache,
+                                     torch::Tensor* auxiliary_cache,
+                                     const torch::Tensor& slot_mapping,
+                                     const torch::Tensor& value,
+                                     const torch::Tensor& auxiliary_value) {
+  CHECK(cache.defined());
+  CHECK(slot_mapping.defined());
+  CHECK(value.defined());
+  CHECK_GT(value.dim(), 0);
+  CHECK_GT(value.size(value.dim() - 1), 0);
+
+  torch::Tensor value_2d = value.reshape({-1, value.size(value.dim() - 1)});
+  torch::Tensor cache_2d = cache.view({-1, value_2d.size(1)});
+  torch::Tensor slots =
+      slot_mapping.reshape({-1}).to(torch::kLong).to(cache.device());
+  CHECK_EQ(slots.numel(), value_2d.size(0))
+      << "Prepared DSA cache-write rows must match padded slot rows: slots="
+      << slots.numel() << ", values=" << value_2d.size(0);
+  CHECK_GT(cache_2d.size(0), 0);
+  torch::Tensor valid_mask = slots.ge(0);
+  torch::Tensor safe_slots;
+  torch::Tensor zero_index;
+  torch::Tensor has_zero_slot;
+  if (!cache.device().is_cpu()) {
+    safe_slots = slots.clamp_min(0);
+    torch::Tensor zero_mask = slots.eq(0);
+    zero_index =
+        torch::argmax(zero_mask.to(torch::kLong), /*dim=*/0, /*keepdim=*/true);
+    has_zero_slot = torch::any(zero_mask);
+  }
+  if (cache.device().is_cpu()) {
+    torch::Tensor valid_slots = slots.index({valid_mask});
+    if (valid_slots.numel() == 0) {
+      return;
+    }
+    torch::Tensor valid_values = value_2d.index({valid_mask});
+    const int64_t max_slot = valid_slots.max().item<int64_t>();
+    CHECK_LT(max_slot, cache_2d.size(0));
+    cache_2d.index_copy_(/*dim=*/0, valid_slots, valid_values);
+  } else {
+    torch::Tensor old_values = cache_2d.index_select(/*dim=*/0, safe_slots);
+    torch::Tensor safe_values =
+        torch::where(valid_mask.unsqueeze(/*dim=*/1), value_2d, old_values);
+    torch::Tensor old_zero_row =
+        cache_2d.narrow(/*dim=*/0, /*start=*/0, /*length=*/1).clone();
+    torch::Tensor selected_zero_row =
+        value_2d.index_select(/*dim=*/0, zero_index);
+    torch::Tensor final_zero_row =
+        torch::where(has_zero_slot, selected_zero_row, old_zero_row);
+    xllm::kernel::npu::scatter_nd_update(
+        cache_2d, safe_slots.reshape({-1, 1}), safe_values);
+    cache_2d.narrow(/*dim=*/0, /*start=*/0, /*length=*/1).copy_(final_zero_row);
+  }
+
+  if (auxiliary_cache == nullptr || !auxiliary_cache->defined()) {
+    return;
+  }
+  CHECK_EQ(auxiliary_cache->device(), cache.device());
+  CHECK(auxiliary_value.defined());
+  CHECK_GT(auxiliary_value.dim(), 0);
+  CHECK_GT(auxiliary_value.size(auxiliary_value.dim() - 1), 0);
+  torch::Tensor auxiliary_value_2d = auxiliary_value.reshape(
+      {-1, auxiliary_value.size(auxiliary_value.dim() - 1)});
+  torch::Tensor auxiliary_cache_2d =
+      auxiliary_cache->view({-1, auxiliary_value_2d.size(1)});
+  CHECK_EQ(auxiliary_value_2d.size(0), slots.numel())
+      << "Prepared DSA auxiliary cache-write rows must match padded slots";
+  if (auxiliary_cache->device().is_cpu()) {
+    torch::Tensor valid_slots = slots.index({valid_mask});
+    torch::Tensor valid_auxiliary_values =
+        auxiliary_value_2d.index({valid_mask});
+    auxiliary_cache_2d.index_copy_(
+        /*dim=*/0, valid_slots, valid_auxiliary_values);
+  } else {
+    torch::Tensor old_auxiliary_values =
+        auxiliary_cache_2d.index_select(/*dim=*/0, safe_slots);
+    torch::Tensor safe_auxiliary_values =
+        torch::where(valid_mask.unsqueeze(/*dim=*/1),
+                     auxiliary_value_2d,
+                     old_auxiliary_values);
+    torch::Tensor old_zero_row =
+        auxiliary_cache_2d.narrow(/*dim=*/0, /*start=*/0, /*length=*/1).clone();
+    torch::Tensor selected_zero_row =
+        auxiliary_value_2d.index_select(/*dim=*/0, zero_index);
+    torch::Tensor final_zero_row =
+        torch::where(has_zero_slot, selected_zero_row, old_zero_row);
+    xllm::kernel::npu::scatter_nd_update(
+        auxiliary_cache_2d, safe_slots.reshape({-1, 1}), safe_auxiliary_values);
+    auxiliary_cache_2d.narrow(/*dim=*/0, /*start=*/0, /*length=*/1)
+        .copy_(final_zero_row);
+  }
+}
+
+}  // namespace deepseek_v4_indexer_detail
+
 DeepseekV4IndexerImpl::DeepseekV4IndexerImpl(
     int64_t dim,
     int64_t index_n_heads,
@@ -467,11 +564,26 @@ torch::Tensor DeepseekV4IndexerImpl::select_qli(
   if (kv.numel() > 0) {
     torch::Tensor kv_quant_2d =
         kv_quant.reshape({-1, kv_quant.size(kv_quant.dim() - 1)});
-    SlotScatterPlan scatter_plan = prepare_slot_scatter_plan(
-        attn_metadata.slot_mapping, kv_quant_2d.size(0), index_cache.device());
-    scatter_rows_by_prepared_slot(index_cache, scatter_plan, kv_quant);
-    if (quant_index_cache != nullptr && quant_index_cache->defined()) {
-      scatter_rows_by_prepared_slot(*quant_index_cache, scatter_plan, kv_scale);
+    const bool device_geometry_authoritative =
+        attn_metadata.dsa_metadata != nullptr &&
+        attn_metadata.dsa_metadata->device_geometry_authoritative;
+    if (device_geometry_authoritative) {
+      deepseek_v4_indexer_detail::scatter_prepared_dsa_cache_rows(
+          index_cache,
+          quant_index_cache,
+          attn_metadata.slot_mapping,
+          kv_quant,
+          kv_scale);
+    } else {
+      SlotScatterPlan scatter_plan =
+          prepare_slot_scatter_plan(attn_metadata.slot_mapping,
+                                    kv_quant_2d.size(0),
+                                    index_cache.device());
+      scatter_rows_by_prepared_slot(index_cache, scatter_plan, kv_quant);
+      if (quant_index_cache != nullptr && quant_index_cache->defined()) {
+        scatter_rows_by_prepared_slot(
+            *quant_index_cache, scatter_plan, kv_scale);
+      }
     }
   }
 

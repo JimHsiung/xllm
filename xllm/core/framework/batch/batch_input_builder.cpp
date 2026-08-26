@@ -246,6 +246,18 @@ BatchInputBuilder::BatchInputBuilder(
       std::all_of(sequences_.begin(), sequences_.end(), [](Sequence* sequence) {
         return sequence != nullptr && sequence->is_graph_warmup();
       });
+  if (is_graph_warmup_) {
+    graph_warmup_speculative_accepted_length_ =
+        sequences_.front()->graph_warmup_speculative_accepted_length();
+    CHECK(std::all_of(
+        sequences_.begin(),
+        sequences_.end(),
+        [this](Sequence* sequence) {
+          return sequence->graph_warmup_speculative_accepted_length() ==
+                 graph_warmup_speculative_accepted_length_;
+        }))
+        << "Graph warmup batch mixes speculative accepted lengths";
+  }
   state_.mtp_bootstrap_embeddings.reserve(sequences.size());
   state_.mtp_bootstrap_row_idxes.reserve(sequences.size());
   if (args_ != nullptr) {
@@ -1215,6 +1227,8 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
   input_params.meta.kv_max_seq_len = state_.max_seq_len;
   input_params.meta.q_max_seq_len = state_.q_max_seq_len;
   input_params.meta.is_graph_warmup = is_graph_warmup_;
+  input_params.meta.graph_warmup_speculative_accepted_length =
+      graph_warmup_speculative_accepted_length_;
   input_params.attention.device.kv_seq_lens =
       torch::tensor(state_.seq_lens, torch::kInt);
   input_params.attention.device.kv_cache_tokens_nums =

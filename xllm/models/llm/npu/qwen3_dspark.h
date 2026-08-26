@@ -70,6 +70,12 @@ class DSparkQwen3ForCausalLMImpl final
     return markov_head_.bias(previous_token_ids);
   }
 
+  void dspark_markov_bias_out(const torch::Tensor& previous_token_ids,
+                              torch::Tensor markov_embedding,
+                              torch::Tensor output) const {
+    markov_head_.bias_out(previous_token_ids, markov_embedding, output);
+  }
+
   // Compute per-request acceptance probability using the trained ConfidenceHead
   // over the whole draft block.
   //   hidden_all:  [num_reqs, num_spec, hidden_size]

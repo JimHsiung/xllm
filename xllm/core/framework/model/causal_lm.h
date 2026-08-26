@@ -192,6 +192,12 @@ class CausalLM : public torch::nn::Module {
     return {};
   }
 
+  virtual void dspark_markov_bias_out(const torch::Tensor& previous_token_ids,
+                                      torch::Tensor markov_embedding,
+                                      torch::Tensor output) {
+    NOT_IMPLEMENTED();
+  }
+
   // DSpark ConfidenceHead: acceptance-prob estimate for adaptive-speculative
   // pruning over the whole draft block. hidden_all [num_reqs, num_spec, H],
   // prev_matrix [num_reqs, num_spec]; returns [num_reqs, num_spec] fp32 in
@@ -320,6 +326,18 @@ class CausalLMImpl : public CausalLM {
       return model_->dspark_markov_bias(previous_token_ids);
     }
     return CausalLM::dspark_markov_bias(previous_token_ids);
+  }
+
+  void dspark_markov_bias_out(const torch::Tensor& previous_token_ids,
+                              torch::Tensor markov_embedding,
+                              torch::Tensor output) override {
+    if constexpr (detail::has_dspark_markov_bias_out<Model>::value) {
+      model_->dspark_markov_bias_out(
+          previous_token_ids, markov_embedding, output);
+      return;
+    }
+    CausalLM::dspark_markov_bias_out(
+        previous_token_ids, markov_embedding, output);
   }
 
   torch::Tensor dspark_confidence_probs(

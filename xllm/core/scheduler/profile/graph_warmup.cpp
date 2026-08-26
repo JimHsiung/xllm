@@ -43,6 +43,36 @@ GraphWarmupPlan graph_warmup_plan(InstanceRole role) {
   return GraphWarmupPlan::UNIFIED;
 }
 
+int32_t graph_warmup_invocations_per_bucket(bool enable_prepared_task_pipeline,
+                                            bool enable_schedule_overlap) {
+  return enable_prepared_task_pipeline && enable_schedule_overlap ? 2 : 1;
+}
+
+std::vector<int32_t> graph_warmup_accepted_length_schedule(
+    int32_t num_speculative_tokens,
+    bool enable_hybrid_mtp_variants,
+    int32_t invocations_per_variant) {
+  CHECK_GE(num_speculative_tokens, 0);
+  CHECK_GT(invocations_per_variant, 0);
+
+  const int32_t variant_count =
+      enable_hybrid_mtp_variants && num_speculative_tokens > 0
+          ? num_speculative_tokens + 1
+          : 1;
+  std::vector<int32_t> schedule;
+  schedule.reserve(static_cast<size_t>(variant_count) *
+                   static_cast<size_t>(invocations_per_variant));
+  for (int32_t accepted_prefix_length = 1;
+       accepted_prefix_length <= variant_count;
+       ++accepted_prefix_length) {
+    for (int32_t invocation = 0; invocation < invocations_per_variant;
+         ++invocation) {
+      schedule.emplace_back(accepted_prefix_length);
+    }
+  }
+  return schedule;
+}
+
 std::string graph_warmup_progress(int32_t completed,
                                   int32_t total,
                                   int32_t token_bucket,
@@ -81,13 +111,21 @@ std::string next_warmup_request_id() {
 
 void prepare_warmup_decode_sequence(Sequence* sequence,
                                     int64_t embedding_width,
-                                    int32_t num_speculative_tokens) {
+                                    int32_t num_speculative_tokens,
+                                    int32_t accepted_prefix_length) {
   CHECK(sequence != nullptr);
+  CHECK_GT(accepted_prefix_length, 0);
   if (num_speculative_tokens <= 0) {
+    CHECK_EQ(accepted_prefix_length, 1)
+        << "non-speculative warmup only supports accepted length 1";
     return;
   }
 
   CHECK_GT(embedding_width, 0);
+  CHECK_LE(accepted_prefix_length, num_speculative_tokens + 1)
+      << "warmup accepted length exceeds target verify width";
+  sequence->set_graph_warmup_speculative_accepted_length(
+      accepted_prefix_length);
   // Placeholder bootstrap hidden states; the worker converts dtype/device and
   // only the [1, embedding_width] shape matters for the batch input builder.
   sequence->update_mtp_bootstrap_embedding(

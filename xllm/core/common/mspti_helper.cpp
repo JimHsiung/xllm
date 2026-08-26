@@ -42,6 +42,11 @@ MstxRange::~MstxRange() {
   mstxRangeEnd(mstx_id_);
 }
 
+MstxHostRange::MstxHostRange(const char* name)
+    : mstx_id_(mstxRangeStartA(name, /*stream=*/nullptr)) {}
+
+MstxHostRange::~MstxHostRange() { mstxRangeEnd(mstx_id_); }
+
 #ifdef USE_MSPTI
 #define ALIGN_BUFFER(ptr, align) \
   (reinterpret_cast<uint8_t*>(   \

@@ -27,6 +27,10 @@ limitations under the License.
 
 namespace xllm {
 
+namespace specBuilder {
+struct DecodeBuildWorkspace;
+}  // namespace specBuilder
+
 // Returns whether this rank may execute the multi-step speculative decode
 // plan for the current global DP batch.
 bool should_run_speculative_decode(const ModelInputParams& params);
@@ -39,6 +43,25 @@ struct SpeculativeOutputStats {
   std::vector<int64_t> accepted_per_position;
   int64_t committed_tokens = 0;
 };
+
+// Slot-local pinned Host storage for speculative inputs generated during
+// Prepared decoding. Helpers write active prefixes without replacing storage.
+struct SpeculativePreparedHostInputWorkspace {
+  torch::Tensor token_ids;
+  torch::Tensor positions;
+  torch::Tensor selected_token_idxes;
+  torch::Tensor sample_idxes;
+  torch::Tensor do_sample;
+  torch::Tensor repeated_sampling_storage;
+};
+
+// Repeats per-sequence penalty and token-stat tensors into caller-owned pinned
+// Host byte storage. Prepared speculative workers reuse this storage while
+// staging each fixed invocation into its Arena.
+void repeat_speculative_sampling_metadata_out(
+    SamplingParameters& sampling_params,
+    int32_t repeats,
+    const torch::Tensor& destination_storage);
 
 SpeculativeOutputStats calculate_speculative_output_stats(
     const torch::Tensor& tokens,
@@ -134,16 +157,26 @@ class SpeculativeWorkerImpl : public WorkerImpl {
       const ForwardInput& inputs) = 0;
 
   // Common helper: update sampling params for validation
-  void update_sampling_params(SamplingParameters& sampling_params,
-                              const int32_t num_val_tokens,
-                              const int32_t total_num_val_tokens);
+  void update_sampling_params(
+      SamplingParameters& sampling_params,
+      const int32_t num_val_tokens,
+      const int32_t total_num_val_tokens,
+      bool stage_controls_on_host = false,
+      const torch::Tensor& fixed_indices_host = torch::Tensor(),
+      const torch::Tensor& fixed_do_sample_host = torch::Tensor(),
+      const torch::Tensor& fixed_repeated_sampling_storage = torch::Tensor());
   void update_sampling_params(SamplingParameters& sampling_params,
                               const std::vector<int32_t>& per_seq_val_tokens,
                               const int32_t total_num_val_tokens);
 
   // prepare inputs for target model at Decode phase (validation).
-  void prepare_validate_inputs(const ForwardInput& inputs,
-                               ForwardInput& validate_inputs);
+  void prepare_validate_inputs(
+      const ForwardInput& inputs,
+      ForwardInput& validate_inputs,
+      bool stage_sampling_on_host = false,
+      const SpeculativePreparedHostInputWorkspace* fixed_host_workspace =
+          nullptr,
+      specBuilder::DecodeBuildWorkspace* decode_build_workspace = nullptr);
   // Per-seq variant used by adaptive-speculative pruning: each sequence's
   // validate row width equals per_seq_val_tokens[i] (must be in [1, N+1]).
   // The dense meta/token/position/kv-slot buffers are rebuilt as varlen with

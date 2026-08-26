@@ -416,11 +416,15 @@ class QWen3Eagle3ForCausalLMImpl : public torch::nn::Module {
 };
 TORCH_MODULE(QWen3Eagle3ForCausalLM);
 
-// register the causal model
+// Register both the original Qwen name and the Kimi-K2.5 Eagle3 checkpoint
+// alias. The two checkpoints use the same one-layer Eagle3 module and weight
+// layout; the target model remains responsible for producing the three aux
+// hidden-state slices consumed by fc.weight.
 REGISTER_CAUSAL_MODEL(qwen3_eagle3, QWen3Eagle3ForCausalLM);
+REGISTER_CAUSAL_MODEL(kimi_k25_eagle3, QWen3Eagle3ForCausalLM);
 
-// register the model args
-REGISTER_MODEL_ARGS(qwen3_eagle3, [&] {
+inline bool load_qwen3_eagle3_model_args(const JsonReader& json,
+                                         ModelArgs* args) {
   LOAD_ARG_OR(model_type, "model_type", "qwen3_eagle3");
   LOAD_ARG_OR(dtype, "torch_dtype", "");
   LOAD_ARG_OR(vocab_size, "vocab_size", 152064);
@@ -450,6 +454,10 @@ REGISTER_MODEL_ARGS(qwen3_eagle3, [&] {
   });
 
   SET_ARG(stop_token_ids, std::unordered_set<int32_t>({args->eos_token_id()}));
-});
+  return true;
+}
+
+REGISTER_MODEL_ARGS_LOADER(qwen3_eagle3, load_qwen3_eagle3_model_args);
+REGISTER_MODEL_ARGS_LOADER(kimi_k25_eagle3, load_qwen3_eagle3_model_args);
 
 }  // namespace xllm::npu::model

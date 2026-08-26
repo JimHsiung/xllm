@@ -173,14 +173,6 @@ std::vector<int32_t> read_capture_layer_ids(
 }
 
 #if defined(USE_NPU)
-int32_t read_block_size(const std::string& model_weights_path) {
-  JsonReader reader;
-  const std::string config_path = model_weights_path + "/config.json";
-  CHECK(reader.parse(config_path))
-      << "Failed to parse DSpark draft config: " << config_path;
-  return reader.value_or<int32_t>("dspark_block_size", 0);
-}
-
 void configure_deepseek_v4_dspark_args(ModelArgs& args,
                                        const runtime::Options& options) {
   CHECK_GT(args.dspark_num_layers(), 0)
@@ -188,15 +180,22 @@ void configure_deepseek_v4_dspark_args(ModelArgs& args,
   args.n_layers(args.dspark_num_layers());
   args.n_hash_layers(0);
 
-  // Default to the checkpoint's block_size; --num_speculative_tokens overrides.
-  const int32_t ckpt_block_size = read_block_size(options.model_path());
+  // Default to the draft checkpoint's block size;
+  // --num_speculative_tokens overrides it when explicitly configured.
+  const int32_t ckpt_block_size = args.dspark_block_size();
   const int32_t user_num_spec = options.num_speculative_tokens();
-  if (user_num_spec > 0 && user_num_spec != ckpt_block_size) {
+  const int32_t runtime_block_size =
+      user_num_spec > 0 ? user_num_spec : ckpt_block_size;
+  CHECK_GT(runtime_block_size, 0)
+      << "DeepSeek-V4 DSpark requires dspark_block_size in the draft "
+         "checkpoint or --num_speculative_tokens > 0.";
+  if (ckpt_block_size > 0 && user_num_spec > 0 &&
+      user_num_spec != ckpt_block_size) {
     LOG(WARNING) << "--num_speculative_tokens=" << user_num_spec
                  << " overrides DSpark checkpoint dspark_block_size="
                  << ckpt_block_size << ".";
   }
-  args.dspark_block_size(user_num_spec > 0 ? user_num_spec : ckpt_block_size);
+  args.dspark_block_size(runtime_block_size);
 
   // DSpark stages are all standard SWA layers. Their stage ids are not target
   // model layer ids, so target compress_ratios[0..N) must not be reused.
@@ -1152,11 +1151,15 @@ void WorkerImpl::prepare_dp_ep_padding(ModelInputParams& input_params) {
                                                   .device(torch::kCPU)
                                                   .dtype(torch::kInt32)
                                                   .pinned_memory(true));
+  const torch::Device padding_staging_device =
+      ::xllm::ExecutionConfig::get_instance().enable_prepared_task_pipeline()
+          ? torch::Device(torch::kCPU)
+          : device_;
   DpEpPadding dp_ep_padding(token_size_per_dp_group,
                             raw_token_size_per_dp_group,
                             context_.get_model_args().num_experts_per_tok(),
                             context_.get_parallel_args().mapping_data(),
-                            device_,
+                            padding_staging_device,
                             dtype_,
                             is_prefill);
   DpEpPaddingData data = dp_ep_padding.build();
@@ -1626,6 +1629,13 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async(
   return future;
 }
 
+void WorkerImpl::initialize_prepared_task_thread() { device_.set_device(); }
+
+StreamEventPtr WorkerImpl::record_prepared_task_event() const {
+  CHECK(compute_stream_ != nullptr);
+  return compute_stream_->record_event_or_sync();
+}
+
 ForwardOutput WorkerImpl::get_last_step_result() {
   ForwardOutput output;
   std::unique_lock<std::mutex> lock(mtx_);
@@ -1976,6 +1986,10 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
     } else {
       CHECK(options_.draft_model_path().has_value())
           << "block-diffusion speculative decoding requires --draft_model.";
+      // The shared DeepSeek-V4 implementation interprets a positive value as
+      // non-causal DSpark attention. Keep that capability draft-only even if a
+      // target checkpoint happens to carry DSpark metadata.
+      args.dspark_block_size(0);
       args.layers_to_capture(
           read_capture_layer_ids(options_.draft_model_path().value()));
     }

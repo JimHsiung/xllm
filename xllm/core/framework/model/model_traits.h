@@ -271,6 +271,17 @@ struct has_dspark_markov_bias<
         std::declval<const torch::Tensor&>()))>> : std::true_type {};
 
 template <typename T, typename = void>
+struct has_dspark_markov_bias_out : std::false_type {};
+
+template <typename T>
+struct has_dspark_markov_bias_out<
+    T,
+    std::void_t<decltype(std::declval<T>()->dspark_markov_bias_out(
+        std::declval<const torch::Tensor&>(),
+        std::declval<torch::Tensor>(),
+        std::declval<torch::Tensor>()))>> : std::true_type {};
+
+template <typename T, typename = void>
 struct has_dspark_confidence_probs : std::false_type {};
 
 template <typename T>

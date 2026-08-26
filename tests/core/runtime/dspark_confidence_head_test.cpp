@@ -137,4 +137,25 @@ TEST(DSparkConfidenceHeadParity, WithMarkov_Batch6Gamma8) {
   check_parity(/*with_markov=*/true, /*batch=*/6, /*gamma=*/8);
 }
 
+TEST(DSparkMarkovHeadParity, FixedOutputMatchesLegacyBias) {
+  DSparkMarkovHead markov = make_markov_head(/*seed=*/13);
+  torch::Tensor previous_token_ids = torch::tensor(
+      {0, 7, 31, 127},
+      torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU));
+  torch::Tensor markov_embedding = torch::empty({4, kMarkovRank}, f32_cpu());
+  torch::Tensor fixed_output = torch::empty({4, kVocab}, f32_cpu());
+  const void* embedding_address = markov_embedding.data_ptr();
+  const void* output_address = fixed_output.data_ptr();
+
+  torch::Tensor expected = markov.bias(previous_token_ids);
+  markov.bias_out(previous_token_ids, markov_embedding, fixed_output);
+
+  EXPECT_EQ(markov_embedding.data_ptr(), embedding_address);
+  EXPECT_EQ(fixed_output.data_ptr(), output_address);
+  EXPECT_TRUE(torch::allclose(fixed_output,
+                              expected,
+                              /*rtol=*/1e-5,
+                              /*atol=*/1e-6));
+}
+
 }  // namespace xllm::npu::model

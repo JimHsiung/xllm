@@ -168,6 +168,11 @@ TEST(MtpAsyncInputBuilderTest, KeepsGenericPagedMetadataSeparate) {
                            torch::tensor({0, 1, 2}, torch::kInt)));
   EXPECT_TRUE(torch::equal(params.graph.expanded_paged_kv_indices,
                            torch::tensor({10, 10}, torch::kInt)));
+  const layer::ExpandedDecodeMetadata metadata =
+      layer::ExpandedDecodeMetadataBuilder::build(params);
+  EXPECT_TRUE(torch::equal(metadata.kv_seq_lens_host,
+                           torch::tensor({3, 4}, torch::kInt)));
+  EXPECT_EQ(metadata.kv_seq_lens_host_vec, (std::vector<int32_t>{3, 4}));
 }
 
 TEST(MtpAsyncInputBuilderTest, SupportsMaximumBlockTableWidth) {

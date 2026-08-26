@@ -30,6 +30,22 @@ limitations under the License.
 
 namespace xllm {
 
+// Optional fixed destinations for Prepared model outputs whose shapes are
+// known at startup. Undefined fields preserve the existing allocation path.
+struct PreparedModelOutputWorkspace {
+  torch::Tensor next_tokens;
+  torch::Tensor selected_embeddings;
+};
+
+void check_prepared_model_output_binding(
+    const SampleOutput& sample_output,
+    const PreparedModelOutputWorkspace& output_workspace);
+
+torch::Tensor gather_prepared_selected_embeddings(
+    const torch::Tensor& embeddings,
+    const torch::Tensor& selected_token_idxes,
+    const torch::Tensor& destination);
+
 class LLMWorkerImpl : public WorkerImpl {
  public:
   enum class ForwardSyncPolicy : int8_t {
@@ -54,13 +70,32 @@ class LLMWorkerImpl : public WorkerImpl {
       Stream& compute_stream,
       bool record_ready_event = true);
 
+  std::optional<ForwardOutput> execute_prepared_task(
+      const ForwardInput& input,
+      const std::optional<PreparedSlotBinding>& binding);
+  std::optional<ForwardOutput> execute_prepared_on_stream(
+      const ForwardInput& input,
+      Stream& compute_stream,
+      const std::optional<PreparedSlotBinding>& binding,
+      const PreparedModelOutputWorkspace* output_workspace = nullptr);
+  PreparedSlotBinding bind_prepared_task(int32_t slot_id,
+                                         const ForwardInput& input);
+  void prepare_prepared_graph_input(int32_t slot_id, ForwardInput& input);
+  bool prepared_graph_enabled() const;
+  void patch_prepared_task_input_for_schedule_overlap(ForwardInput& input);
+  void publish_prepared_task_output(const ForwardInput& input,
+                                    const std::optional<ForwardOutput>& output);
+
   folly::SemiFuture<std::optional<ForwardOutput>> step_async_no_sync(
       const ForwardInput& input);
 
   std::optional<ForwardOutput> step_internal(
       const ForwardInput& input,
       ForwardSyncPolicy sync_policy = ForwardSyncPolicy::LEGACY,
-      bool record_ready_event = true);
+      bool record_ready_event = true,
+      const PreparedSlotBinding* prepared_binding = nullptr,
+      const PreparedModelOutputWorkspace* output_workspace = nullptr,
+      bool retain_input_for_async_output = true);
 
  protected:
   std::optional<ForwardOutput> step_for_schedule_overlap(
@@ -104,6 +139,13 @@ class LLMWorkerImpl : public WorkerImpl {
     return model_->dspark_markov_bias(previous_token_ids);
   }
 
+  void dspark_markov_bias_out(const torch::Tensor& previous_token_ids,
+                              torch::Tensor markov_embedding,
+                              torch::Tensor output) {
+    model_->dspark_markov_bias_out(
+        previous_token_ids, markov_embedding, output);
+  }
+
   torch::Tensor dspark_confidence_probs(const torch::Tensor& hidden_all,
                                         const torch::Tensor& prev_matrix) {
     return model_->dspark_confidence_probs(hidden_all, prev_matrix);
@@ -129,6 +171,15 @@ class LLMWorkerImpl : public WorkerImpl {
 
  protected:
   std::unique_ptr<BeamSearcher> beam_searcher_;
+
+ private:
+  std::optional<ForwardOutput> execute_on_stream(
+      const ForwardInput& input,
+      Stream& compute_stream,
+      bool record_ready_event,
+      const PreparedSlotBinding* prepared_binding,
+      const PreparedModelOutputWorkspace* output_workspace = nullptr,
+      bool retain_input_for_async_output = true);
 };
 
 }  // namespace xllm

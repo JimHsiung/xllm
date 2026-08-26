@@ -143,6 +143,34 @@ TEST(EmbeddingCacheTest, RequestMismatchMaterializesMissingState) {
   EXPECT_FALSE(states[0].embedding.defined());
 }
 
+TEST(EmbeddingCacheTest, ReadsIntoCallerOwnedStorageWithoutReplacingIt) {
+  EmbeddingCache cache(/*total_nums=*/2);
+  std::vector<int32_t> ids = {0, 1};
+  std::vector<std::string> request_ids = {"req_0", "req_1"};
+  torch::Tensor target_tokens = torch::tensor({31, 41}, torch::kInt);
+  torch::Tensor target_embeddings = torch::tensor({{1.0F, 2.0F}, {3.0F, 4.0F}});
+  cache.write_prefill_target_context(
+      ids, request_ids, target_tokens, target_embeddings);
+
+  std::vector<EmbeddingCache::DecodeState> destination;
+  destination.reserve(/*new_cap=*/2);
+  destination.resize(/*count=*/2);
+  const EmbeddingCache::DecodeState* storage_address = destination.data();
+  cache.read_decode_states_out(ids, request_ids, destination);
+
+  ASSERT_EQ(destination.data(), storage_address);
+  ASSERT_EQ(destination.size(), ids.size());
+  EXPECT_EQ(destination[0].request_id, "req_0");
+  EXPECT_EQ(destination[0].token_id, 31);
+  EXPECT_TRUE(tensor_equal(destination[1].embedding, target_embeddings[1]));
+
+  cache.read_decode_states_out({1}, {"stale_req"}, destination);
+  ASSERT_EQ(destination.data(), storage_address);
+  ASSERT_EQ(destination.size(), 1U);
+  EXPECT_FALSE(destination[0].valid);
+  EXPECT_EQ(destination[0].token_id, 0);
+}
+
 TEST(EmbeddingCacheTest, ReadAcceptedPrefixLengthsRejectsStaleRequest) {
   EmbeddingCache cache(/*total_nums=*/2);
   std::vector<int32_t> ids = {0, 1};
@@ -197,6 +225,40 @@ TEST(EmbeddingCacheTest, WriteMtpBootstrapContextStoresExactDecodeState) {
   states = cache.read_decode_states({1}, {"req_bootstrap"});
   EXPECT_FALSE(states[0].valid);
   EXPECT_FALSE(states[0].embedding.defined());
+}
+
+TEST(EmbeddingCacheTest, PreparesExactHybridMtpGraphWarmupAcceptedState) {
+  EmbeddingCache cache(/*total_nums=*/1);
+  torch::Tensor embedding = torch::tensor({1.0F, 2.0F, 3.0F});
+  cache.write_mtp_bootstrap_context(
+      /*embedding_id=*/0, "req_warmup", /*token_id=*/17, embedding);
+
+  cache.prepare_graph_warmup_accepted_state(
+      /*embedding_id=*/0,
+      "req_warmup",
+      /*accepted_prefix_length=*/3,
+      /*num_speculative_tokens=*/3);
+
+  std::vector<EmbeddingCache::DecodeState> states =
+      cache.read_decode_states({0}, {"req_warmup"});
+  ASSERT_EQ(states.size(), 1U);
+  EXPECT_EQ(states[0].position_offset, 2);
+  EXPECT_EQ(states[0].correction_token_id, 17);
+  EXPECT_EQ(states[0].correction_position_offset, 2);
+  EXPECT_EQ(states[0].prev_token_id, 17);
+  EXPECT_TRUE(tensor_equal(states[0].prev_embedding, embedding));
+  EXPECT_FALSE(states[0].all_draft_accepted);
+  EXPECT_EQ(cache.read_accepted_prefix_lengths({0}, {"req_warmup"}),
+            (std::vector<int32_t>{3}));
+
+  cache.prepare_graph_warmup_accepted_state(
+      /*embedding_id=*/0,
+      "req_warmup",
+      /*accepted_prefix_length=*/4,
+      /*num_speculative_tokens=*/3);
+  states = cache.read_decode_states({0}, {"req_warmup"});
+  EXPECT_TRUE(states[0].all_draft_accepted);
+  EXPECT_EQ(states[0].position_offset, 3);
 }
 
 }  // namespace xllm

@@ -30,6 +30,8 @@ limitations under the License.
 #include "framework/state_dict/state_dict.h"
 #include "runtime/executor.h"
 #include "runtime/options.h"
+#include "runtime/prepared_task/prepared_pipeline_activator.h"
+#include "runtime/prepared_task/prepared_task_pipeline.h"
 #include "runtime/worker_impl.h"
 #include "util/threadpool.h"
 
@@ -144,7 +146,24 @@ class Worker {
   folly::SemiFuture<int64_t> get_active_activation_memory_async();
 
  private:
+  enum class PreparedAdapterKind : int8_t {
+    NONE = 0,
+    LLM,
+    MTP,
+    DFLASH,
+    DSPARK,
+  };
+
+  void initialize_prepared_pipeline();
+  bool finish_kv_cache_allocation(bool success);
+
   WorkerImpl* impl_ = nullptr;
+  std::unique_ptr<PreparedTaskPipeline> prepared_pipeline_;
+  PreparedAdapterKind prepared_adapter_kind_ = PreparedAdapterKind::NONE;
+  uint64_t prepared_input_arena_capacity_bytes_ = 0;
+  int32_t prepared_slot_count_ = 0;
+  int32_t prepared_num_speculative_tokens_ = 0;
+  PreparedPipelineActivator prepared_pipeline_activator_;
   ThreadPool threadpool_{/*num_threads=*/1,
                          /*cpu_binding=*/false,
                          /*pool_name=*/"Worker.async"};

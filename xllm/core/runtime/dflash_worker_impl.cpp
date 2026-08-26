@@ -18,9 +18,12 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -28,6 +31,7 @@ limitations under the License.
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
+#include "core/framework/sampling/rejection_sampler.h"
 #include "core/framework/speculative/adaptive_pruning_helpers.h"
 #include "core/framework/speculative/speculative_profile_registry.h"
 #include "framework/model/model_args.h"
@@ -42,11 +46,239 @@ limitations under the License.
 #endif
 #include "core/framework/speculative/spec_input_builder.h"
 #include "core/framework/speculative/spec_verify.h"
+#include "runtime/prepared_task/block_spec_prepared_task_backend.h"
 #include "util/json_reader.h"
 #include "util/timer.h"
+#include "util/verbose_trace_logger.h"
 
 namespace xllm {
+namespace dflash_detail {
+
+PreparedDecodeCacheSlotViews view_prepared_decode_cache_slots(
+    const torch::Tensor& query_cache_slots,
+    const torch::Tensor& target_cache_slots,
+    int64_t batch_size,
+    int32_t num_speculative_tokens,
+    bool sample_from_anchor) {
+  CHECK_GT(batch_size, 0);
+  CHECK_GT(num_speculative_tokens, 0);
+  const int64_t query_width =
+      decode_draft_width(num_speculative_tokens, sample_from_anchor);
+  const int64_t target_width = num_speculative_tokens + 1;
+  CHECK_EQ(query_cache_slots.numel(), batch_size * query_width);
+  CHECK_EQ(target_cache_slots.numel(), batch_size * target_width);
+  return PreparedDecodeCacheSlotViews{
+      query_cache_slots.view({batch_size, query_width}),
+      target_cache_slots.view({batch_size, target_width})};
+}
+
+void check_fixed_prepared_output_binding(const torch::Tensor& actual,
+                                         const torch::Tensor& fixed_storage,
+                                         const torch::Device& expected_device,
+                                         torch::ScalarType expected_dtype,
+                                         int64_t expected_numel,
+                                         std::string_view tensor_name) {
+  CHECK_GT(expected_numel, 0);
+  CHECK(actual.defined()) << "Prepared Block-Spec " << tensor_name
+                          << " must be defined";
+  CHECK(fixed_storage.defined())
+      << "Prepared Block-Spec fixed " << tensor_name << " must be defined";
+  CHECK_EQ(actual.numel(), expected_numel)
+      << "Prepared Block-Spec " << tensor_name
+      << " must have the configured element count";
+  CHECK_EQ(fixed_storage.numel(), expected_numel)
+      << "Prepared Block-Spec fixed " << tensor_name
+      << " must have the configured element count";
+  CHECK_EQ(actual.device(), expected_device)
+      << "Prepared Block-Spec " << tensor_name
+      << " must share the Worker device";
+  CHECK_EQ(fixed_storage.device(), expected_device)
+      << "Prepared Block-Spec fixed " << tensor_name
+      << " must share the Worker device";
+  CHECK_EQ(actual.scalar_type(), expected_dtype)
+      << "Prepared Block-Spec " << tensor_name << " has an incompatible dtype";
+  CHECK_EQ(fixed_storage.scalar_type(), expected_dtype)
+      << "Prepared Block-Spec fixed " << tensor_name
+      << " has an incompatible dtype";
+  CHECK(actual.is_contiguous())
+      << "Prepared Block-Spec " << tensor_name << " must be contiguous";
+  CHECK(fixed_storage.is_contiguous())
+      << "Prepared Block-Spec fixed " << tensor_name << " must be contiguous";
+  CHECK_EQ(actual.data_ptr(), fixed_storage.data_ptr())
+      << "Prepared Block-Spec " << tensor_name
+      << " replaced the fixed output storage";
+}
+
+void check_context_kv_write_tensor_contract(
+    const torch::Tensor& context_hidden,
+    const torch::Tensor& positions,
+    const torch::Tensor& cache_slots,
+    const torch::Device& expected_device,
+    int64_t expected_hidden_size,
+    torch::ScalarType expected_hidden_dtype) {
+  CHECK_GT(expected_hidden_size, 0);
+  CHECK(context_hidden.defined()) << "DFlash context hidden must be defined";
+  CHECK(positions.defined()) << "DFlash context positions must be defined";
+  CHECK(cache_slots.defined()) << "DFlash context cache slots must be defined";
+  CHECK_EQ(context_hidden.dim(), 2)
+      << "DFlash context hidden must be two-dimensional";
+  CHECK_EQ(context_hidden.size(/*dim=*/1), expected_hidden_size)
+      << "DFlash context hidden width must match the configured context "
+         "hidden size";
+  CHECK_EQ(positions.dim(), 1)
+      << "DFlash context positions must be one-dimensional";
+  CHECK_EQ(cache_slots.dim(), 1)
+      << "DFlash context cache slots must be one-dimensional";
+  const int64_t row_count = context_hidden.size(/*dim=*/0);
+  CHECK_EQ(positions.numel(), row_count)
+      << "DFlash context positions must match the context hidden rows";
+  CHECK_EQ(cache_slots.numel(), row_count)
+      << "DFlash context cache slots must match the context hidden rows";
+  CHECK_EQ(context_hidden.device(), expected_device)
+      << "DFlash context hidden must share the contract device";
+  CHECK_EQ(positions.device(), expected_device)
+      << "DFlash context positions must share the contract device";
+  CHECK_EQ(cache_slots.device(), expected_device)
+      << "DFlash context cache slots must share the contract device";
+  CHECK_EQ(context_hidden.scalar_type(), expected_hidden_dtype)
+      << "DFlash context hidden has an incompatible dtype";
+  CHECK_EQ(positions.scalar_type(), torch::kInt)
+      << "DFlash context positions must use int32 dtype";
+  CHECK_EQ(cache_slots.scalar_type(), torch::kInt)
+      << "DFlash context cache slots must use int32 dtype";
+}
+
+}  // namespace dflash_detail
 namespace {
+
+void trace_block_spec_step_state(std::string_view algorithm,
+                                 const std::vector<int32_t>& embedding_ids,
+                                 const std::vector<std::string>& request_ids,
+                                 const torch::Tensor& accepted_tokens,
+                                 const torch::Tensor& base_positions,
+                                 const torch::Tensor& base_kv_seq_lens) {
+  if (!VerboseTraceLogger::get_instance().enabled()) {
+    return;
+  }
+
+  CHECK(accepted_tokens.defined());
+  CHECK_EQ(accepted_tokens.dim(), 2);
+  const int64_t batch_size = accepted_tokens.size(0);
+  const int64_t token_width = accepted_tokens.size(1);
+  CHECK_EQ(embedding_ids.size(), static_cast<size_t>(batch_size));
+  CHECK(request_ids.empty() ||
+        request_ids.size() == static_cast<size_t>(batch_size));
+  CHECK(base_positions.defined());
+  CHECK_EQ(base_positions.numel(), batch_size);
+  CHECK(base_kv_seq_lens.defined());
+  CHECK_EQ(base_kv_seq_lens.numel(), batch_size);
+
+  const torch::Tensor accepted_tokens_cpu =
+      accepted_tokens.to(torch::kCPU, torch::kInt64).contiguous();
+  const torch::Tensor base_positions_cpu =
+      base_positions.to(torch::kCPU, torch::kInt64).contiguous().view({-1});
+  const torch::Tensor base_kv_seq_lens_cpu =
+      base_kv_seq_lens.to(torch::kCPU, torch::kInt64).contiguous().view({-1});
+  const int64_t* token_data = accepted_tokens_cpu.const_data_ptr<int64_t>();
+  const int64_t* position_data = base_positions_cpu.const_data_ptr<int64_t>();
+  const int64_t* kv_seq_len_data =
+      base_kv_seq_lens_cpu.const_data_ptr<int64_t>();
+  for (int64_t row = 0; row < batch_size; ++row) {
+    int64_t committed_length = 0;
+    bool saw_padding = false;
+    std::string token_list;
+    token_list.reserve(static_cast<size_t>(token_width) * 12);
+    for (int64_t column = 0; column < token_width; ++column) {
+      const int64_t token = token_data[row * token_width + column];
+      if (column > 0) {
+        token_list.push_back(',');
+      }
+      token_list.append(std::to_string(token));
+      if (token < 0) {
+        saw_padding = true;
+        continue;
+      }
+      CHECK(!saw_padding)
+          << "Block-Spec accepted-token padding must be a contiguous suffix";
+      ++committed_length;
+    }
+    const std::string_view request_id =
+        request_ids.empty()
+            ? std::string_view()
+            : std::string_view(request_ids[static_cast<size_t>(row)]);
+    XLLM_VERBOSE_TRACE()
+        << "event=speculative_step_state algorithm=" << algorithm
+        << " request_id="
+        << (request_id.empty() ? std::string_view("-") : request_id)
+        << " embedding_id=" << embedding_ids[static_cast<size_t>(row)]
+        << " base_position=" << position_data[row]
+        << " base_kv_seq_len=" << kv_seq_len_data[row]
+        << " committed_length=" << committed_length << " accepted_draft_length="
+        << std::max<int64_t>(committed_length - 1, 0)
+        << " tokens=" << token_list;
+  }
+}
+
+void trace_block_spec_step_state_from_host_input(
+    std::string_view algorithm,
+    const ForwardInput& input,
+    const torch::Tensor& accepted_tokens) {
+  if (!VerboseTraceLogger::get_instance().enabled()) {
+    return;
+  }
+
+  const int64_t batch_size = accepted_tokens.size(0);
+  const torch::Tensor& positions =
+      input.positions_host.defined() ? input.positions_host : input.positions;
+  CHECK(positions.defined());
+  CHECK_EQ(positions.numel(), batch_size);
+  const Slice<int32_t> kv_seq_lens =
+      input.input_params.attention.host.kv_seq_lens;
+  CHECK_EQ(kv_seq_lens.size(), static_cast<size_t>(batch_size));
+  std::vector<int64_t> base_kv_seq_lens;
+  base_kv_seq_lens.reserve(static_cast<size_t>(batch_size));
+  for (int64_t row = 0; row < batch_size; ++row) {
+    base_kv_seq_lens.emplace_back(kv_seq_lens[static_cast<size_t>(row)]);
+  }
+  trace_block_spec_step_state(
+      algorithm,
+      input.input_params.embedding.embedding_ids,
+      input.input_params.embedding.request_ids,
+      accepted_tokens,
+      positions,
+      torch::tensor(base_kv_seq_lens, torch::dtype(torch::kLong)));
+}
+
+void trace_block_spec_step_state_from_target_input(
+    std::string_view algorithm,
+    const ForwardInput& input,
+    const torch::Tensor& accepted_tokens,
+    const torch::Tensor& base_positions,
+    int64_t target_width) {
+  if (!VerboseTraceLogger::get_instance().enabled()) {
+    return;
+  }
+
+  const int64_t batch_size = accepted_tokens.size(0);
+  const torch::Tensor& target_kv_seq_lens =
+      input.input_params.attention.device.kv_seq_lens;
+  CHECK(target_kv_seq_lens.defined());
+  torch::Tensor base_kv_seq_lens;
+  if (target_kv_seq_lens.numel() == batch_size) {
+    base_kv_seq_lens = target_kv_seq_lens - (target_width - 1);
+  } else {
+    CHECK_EQ(target_kv_seq_lens.numel(), batch_size * target_width)
+        << "Block-Spec trace requires chunked or tokenwise Target KV metadata";
+    base_kv_seq_lens = target_kv_seq_lens.view({batch_size, target_width})
+                           .select(/*dim=*/1, /*index=*/0);
+  }
+  trace_block_spec_step_state(algorithm,
+                              input.input_params.embedding.embedding_ids,
+                              input.input_params.embedding.request_ids,
+                              accepted_tokens,
+                              base_positions,
+                              base_kv_seq_lens);
+}
 
 // Per-rank sampling RNG can diverge across the tensor-parallel group.
 // Broadcasting the sampled draft/accepted tokens to the group's rank 0 keeps
@@ -114,18 +346,56 @@ void repeat_sampling_tensor(torch::Tensor& tensor, int32_t repeats) {
   }
 }
 
-void repeat_sampling_params(SamplingParameters& sampling_params,
-                            int32_t repeats) {
-  repeat_sampling_tensor(sampling_params.frequency_penalties, repeats);
-  repeat_sampling_tensor(sampling_params.presence_penalties, repeats);
-  repeat_sampling_tensor(sampling_params.repetition_penalties, repeats);
-  repeat_sampling_tensor(sampling_params.temperatures, repeats);
-  repeat_sampling_tensor(sampling_params.top_p, repeats);
-  repeat_sampling_tensor(sampling_params.top_k, repeats);
-  repeat_sampling_tensor(sampling_params.unique_token_ids, repeats);
-  repeat_sampling_tensor(sampling_params.unique_token_counts, repeats);
-  repeat_sampling_tensor(sampling_params.unique_token_ids_lens, repeats);
-  repeat_sampling_tensor(sampling_params.do_sample, repeats);
+void repeat_sampling_params(
+    SamplingParameters& sampling_params,
+    int32_t repeats,
+    const torch::Tensor& fixed_do_sample_host,
+    const torch::Tensor& fixed_repeated_sampling_storage) {
+  if (fixed_repeated_sampling_storage.defined()) {
+    repeat_speculative_sampling_metadata_out(
+        sampling_params, repeats, fixed_repeated_sampling_storage);
+  } else {
+    repeat_sampling_tensor(sampling_params.frequency_penalties, repeats);
+    repeat_sampling_tensor(sampling_params.presence_penalties, repeats);
+    repeat_sampling_tensor(sampling_params.repetition_penalties, repeats);
+    repeat_sampling_tensor(sampling_params.temperatures, repeats);
+    repeat_sampling_tensor(sampling_params.top_p, repeats);
+    repeat_sampling_tensor(sampling_params.top_k, repeats);
+    repeat_sampling_tensor(sampling_params.unique_token_ids, repeats);
+    repeat_sampling_tensor(sampling_params.unique_token_counts, repeats);
+    repeat_sampling_tensor(sampling_params.unique_token_ids_lens, repeats);
+  }
+  if (fixed_do_sample_host.defined()) {
+    CHECK(sampling_params.all_greedy_sample)
+        << "Fixed zero do_sample staging requires greedy sampling";
+    sampling_params.do_sample = specBuilder::fill_cpu_bool_out(
+        /*value=*/false,
+        sampling_params.selected_token_idxes.numel(),
+        fixed_do_sample_host);
+  } else {
+    repeat_sampling_tensor(sampling_params.do_sample, repeats);
+  }
+}
+
+SpeculativePreparedHostInputWorkspace allocate_prepared_host_input_workspace(
+    int64_t capacity,
+    const torch::Tensor& repeated_sampling_storage = torch::Tensor()) {
+  CHECK_GT(capacity, 0);
+  const torch::TensorOptions int_options = torch::TensorOptions()
+                                               .dtype(torch::kInt)
+                                               .device(torch::kCPU)
+                                               .pinned_memory(true);
+  const torch::TensorOptions bool_options = torch::TensorOptions()
+                                                .dtype(torch::kBool)
+                                                .device(torch::kCPU)
+                                                .pinned_memory(true);
+  return SpeculativePreparedHostInputWorkspace{
+      torch::empty({capacity}, int_options),
+      torch::empty({capacity}, int_options),
+      torch::empty({capacity}, int_options),
+      torch::empty({capacity}, int_options),
+      torch::empty({capacity}, bool_options),
+      repeated_sampling_storage};
 }
 
 void clear_selected_embeddings(ForwardOutput& output) {
@@ -135,6 +405,12 @@ void clear_selected_embeddings(ForwardOutput& output) {
 void clear_all_output_embeddings(ForwardOutput& output) {
   output.sample_output.embeddings = torch::Tensor();
   clear_selected_embeddings(output);
+}
+
+void release_prepared_model_intermediates(ForwardOutput& output) {
+  output.logits = torch::Tensor();
+  output.selected_hidden = torch::Tensor();
+  output.mtp_topk_state.reset();
 }
 
 void record_metadata_ready_event(Stream& stream, ForwardInput& input) {
@@ -321,6 +597,1126 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
     adaptive_spec_controller_ =
         std::make_unique<AdaptiveSpeculativeController>(options);
   }
+}
+
+int64_t DFlashWorkerImpl::prepared_dspark_markov_rank() const {
+  LOG(FATAL) << "DFlash does not have a DSpark Markov head";
+  return 0;
+}
+
+int64_t DFlashWorkerImpl::prepared_dspark_vocab_size() const {
+  LOG(FATAL) << "DFlash does not have a DSpark vocabulary";
+  return 0;
+}
+
+void DFlashWorkerImpl::launch_prepared_dspark_markov_sample(
+    const torch::Tensor& /*base_logits*/,
+    const torch::Tensor& /*anchor_token_ids*/,
+    const SamplingParameters& /*sampling_params*/,
+    int64_t /*row_count*/,
+    int32_t /*block_step*/,
+    dspark_detail::PreparedSamplingWorkspace& /*workspace*/) const {
+  LOG(FATAL) << "DFlash cannot launch a DSpark Markov sample";
+}
+
+void DFlashWorkerImpl::launch_prepared_dspark_token_broadcast(
+    const SamplingParameters& /*sampling_params*/,
+    int64_t /*row_count*/,
+    int32_t /*block_step*/,
+    dspark_detail::PreparedSamplingWorkspace& /*workspace*/) const {
+  LOG(FATAL) << "DFlash cannot launch a DSpark token broadcast";
+}
+
+class DFlashWorkerImpl::PreparedTaskBackend final
+    : public BlockSpecPreparedTaskBackendBase {
+ public:
+  PreparedTaskBackend(DFlashWorkerImpl* worker,
+                      const BlockSpecPreparedTaskBufferConfig& config)
+      : BlockSpecPreparedTaskBackendBase(config),
+        worker_(CHECK_NOTNULL(worker)),
+        algorithm_(worker_->options_.speculative_algorithm() == "DSpark"
+                       ? BlockSpecAlgorithm::DSPARK
+                       : BlockSpecAlgorithm::DFLASH),
+        max_rows_(config.max_rows),
+        speculative_width_(worker_->options_.num_speculative_tokens()),
+        query_width_(dflash_detail::decode_draft_width(
+            worker_->options_.num_speculative_tokens(),
+            worker_->sample_from_anchor())),
+        accepted_token_capacity_(config.accepted_token_capacity),
+        context_hidden_size_(config.context_hidden_size),
+        draft_hidden_size_(
+            worker_->draft_impl_->context_.get_model_args().hidden_size()) {
+    CHECK(worker_->impl_ != nullptr);
+    CHECK(worker_->draft_impl_ != nullptr);
+    CHECK(worker_->options_.speculative_algorithm() == "DFlash" ||
+          worker_->options_.speculative_algorithm() == "DSpark");
+    CHECK_GT(speculative_width_, 0);
+    CHECK_GT(query_width_, 0);
+    CHECK_EQ(accepted_token_capacity_, speculative_width_ + 1);
+    CHECK_GT(context_hidden_size_, 0);
+    CHECK_GT(draft_hidden_size_, 0);
+
+    const ModelArgs& target_args = worker_->impl_->context_.get_model_args();
+    if (util::is_deepseek_v4_model_type(target_args.model_type())) {
+      const int64_t max_model_tokens =
+          std::max<int64_t>({target_args.max_seq_len(),
+                             target_args.max_position_embeddings(),
+                             target_args.window_size()});
+      CHECK_GT(max_model_tokens, 0)
+          << "DeepSeek-V4 Prepared cache-slot mapping requires a positive "
+             "model sequence capacity";
+      max_swa_block_table_width_ =
+          (max_model_tokens + config.block_size - 1) / config.block_size;
+    }
+
+    const torch::TensorOptions token_options =
+        torch::TensorOptions().dtype(config.token_dtype).device(config.device);
+    const torch::TensorOptions hidden_options =
+        torch::TensorOptions().dtype(config.hidden_dtype).device(config.device);
+    const torch::TensorOptions position_options =
+        torch::TensorOptions()
+            .dtype(config.position_dtype)
+            .device(config.device);
+    const torch::TensorOptions index_options =
+        torch::TensorOptions().dtype(torch::kLong).device(config.device);
+    const torch::TensorOptions mask_options =
+        torch::TensorOptions().dtype(torch::kBool).device(config.device);
+    const torch::TensorOptions host_byte_options = torch::TensorOptions()
+                                                       .dtype(torch::kUInt8)
+                                                       .device(torch::kCPU)
+                                                       .pinned_memory(true);
+    CHECK_GT(worker_->options_.max_tokens_per_batch(), 0);
+    const int64_t dsa_geometry_token_capacity =
+        std::max<int64_t>(worker_->options_.max_tokens_per_batch(),
+                          max_rows_ * accepted_token_capacity_);
+    const int64_t dsa_compact_storage_capacity =
+        dsa_geometry_token_capacity * 2;
+
+    slots_.reserve(static_cast<size_t>(config.slot_count));
+    for (int32_t slot_id = 0; slot_id < config.slot_count; ++slot_id) {
+      SlotResources resources;
+      resources.prefill_next_tokens = torch::empty({max_rows_}, token_options);
+      resources.prefill_selected_hidden =
+          torch::empty({max_rows_, context_hidden_size_}, hidden_options);
+      resources.draft_next_tokens =
+          torch::empty({max_rows_ * speculative_width_}, token_options);
+      resources.draft_selected_hidden = torch::empty(
+          {max_rows_ * speculative_width_, draft_hidden_size_}, hidden_options);
+      resources.target_next_tokens =
+          torch::empty({max_rows_ * accepted_token_capacity_}, token_options);
+      resources.target_context_hidden = torch::empty(
+          {max_rows_ * accepted_token_capacity_, context_hidden_size_},
+          hidden_options);
+      resources.continuation_context_hidden =
+          torch::zeros({max_rows_, context_hidden_size_}, hidden_options);
+      if (max_swa_block_table_width_ > 0) {
+        resources.dsa_device_geometry_workspace =
+            std::make_shared<DSADeviceGeometryWorkspace>();
+        resources.dsa_device_geometry_workspace->actual_seq_lengths_query =
+            torch::empty({max_rows_ + 1}, position_options);
+        resources.dsa_device_geometry_workspace->kv_cu_seq_lens =
+            torch::empty({max_rows_ + 1}, position_options);
+        resources.dsa_device_geometry_workspace->max_seqlen_q =
+            torch::empty({1}, position_options);
+        resources.dsa_device_geometry_workspace->max_seqlen_kv =
+            torch::empty({1}, position_options);
+        resources.dsa_device_geometry_workspace->start_pos =
+            torch::empty({max_rows_}, position_options);
+        resources.dsa_device_geometry_workspace->c4_compact_positions =
+            torch::empty({dsa_compact_storage_capacity}, position_options);
+        resources.dsa_device_geometry_workspace->c128_compact_positions =
+            torch::empty({dsa_compact_storage_capacity}, position_options);
+        resources.dsa_device_geometry_workspace->c4_compact_slots =
+            torch::empty({dsa_compact_storage_capacity}, position_options);
+        resources.dsa_device_geometry_workspace->c128_compact_slots =
+            torch::empty({dsa_compact_storage_capacity}, position_options);
+        resources.dsa_device_geometry_workspace->swa_block_table = torch::empty(
+            {max_rows_ * max_swa_block_table_width_}, position_options);
+        resources.dsa_device_geometry_workspace->token_indices =
+            torch::empty({dsa_geometry_token_capacity}, index_options);
+        resources.dsa_device_geometry_workspace->position_values =
+            torch::empty({dsa_geometry_token_capacity}, position_options);
+        resources.dsa_device_geometry_workspace->position_remainders =
+            torch::empty({dsa_geometry_token_capacity}, position_options);
+        resources.dsa_device_geometry_workspace->boundary_mask =
+            torch::empty({dsa_geometry_token_capacity}, mask_options);
+        resources.dsa_device_geometry_workspace->boundary_ranks =
+            torch::empty({dsa_geometry_token_capacity}, index_options);
+        resources.dsa_device_geometry_workspace->sentinel_indices =
+            torch::empty({dsa_geometry_token_capacity}, index_options);
+        resources.dsa_device_geometry_workspace->destination_indices =
+            torch::empty({dsa_geometry_token_capacity}, index_options);
+        resources.dsa_device_geometry_workspace->token_offsets =
+            torch::empty({dsa_geometry_token_capacity}, position_options);
+        resources.dsa_device_geometry_workspace->token_candidates =
+            torch::empty({dsa_geometry_token_capacity}, position_options);
+        resources.dsa_device_geometry_workspace->mapping_valid =
+            torch::empty({dsa_geometry_token_capacity}, mask_options);
+        resources.dsa_device_geometry_workspace->mapping_valid_aux =
+            torch::empty({dsa_geometry_token_capacity}, mask_options);
+        resources.dsa_device_geometry_workspace->swa_logical_column_indices =
+            torch::empty({max_swa_block_table_width_}, index_options);
+        const int64_t swa_matrix_capacity =
+            max_rows_ * max_swa_block_table_width_;
+        resources.dsa_device_geometry_workspace->swa_physical_columns =
+            torch::empty({swa_matrix_capacity}, index_options);
+        resources.dsa_device_geometry_workspace->swa_gathered =
+            torch::empty({swa_matrix_capacity}, position_options);
+        resources.dsa_device_geometry_workspace->swa_valid =
+            torch::empty({swa_matrix_capacity}, mask_options);
+        resources.dsa_device_geometry_workspace->swa_valid_aux =
+            torch::empty({swa_matrix_capacity}, mask_options);
+        resources.dsa_device_geometry_workspace->manager_row_indices =
+            torch::empty({max_rows_}, index_options);
+        resources.dsa_device_geometry_workspace->manager_expanded_block_tables
+            .reserve(kMaxDeepseekV4CacheManagers);
+        resources.dsa_group_block_table_storage.reserve(
+            kMaxDeepseekV4CacheManagers);
+        for (int32_t manager_id = 0; manager_id < kMaxDeepseekV4CacheManagers;
+             ++manager_id) {
+          resources.dsa_device_geometry_workspace->manager_expanded_block_tables
+              .emplace_back(
+                  torch::empty({swa_matrix_capacity}, position_options));
+          resources.dsa_group_block_table_storage.emplace_back(torch::empty(
+              {max_rows_, max_swa_block_table_width_}, position_options));
+        }
+        resources.active_dsa_group_block_tables.reserve(
+            kMaxDeepseekV4CacheManagers);
+      }
+      resources.prefill_swa_slots.reserve(
+          static_cast<size_t>(worker_->options_.max_tokens_per_batch()));
+      resources.decode_states.reserve(static_cast<size_t>(max_rows_));
+      specBuilder::reserve_decode_build_workspace(
+          resources.decode_build_workspace,
+          max_rows_ * accepted_token_capacity_);
+      resources.anchor_host_workspace =
+          allocate_prepared_host_input_workspace(max_rows_);
+      const int64_t generated_row_capacity =
+          max_rows_ * accepted_token_capacity_;
+      torch::Tensor repeated_sampling_storage = torch::empty(
+          {static_cast<int64_t>(config.input_arena_capacity_bytes)},
+          host_byte_options);
+      resources.query_host_workspace = allocate_prepared_host_input_workspace(
+          generated_row_capacity, repeated_sampling_storage);
+      resources.target_host_workspace = allocate_prepared_host_input_workspace(
+          generated_row_capacity, repeated_sampling_storage);
+      resources.rejection_workspace = GreedyTokenIdRejectionWorkspace{
+          torch::empty({max_rows_, accepted_token_capacity_}, token_options),
+          torch::empty({max_rows_, speculative_width_}, mask_options),
+          torch::empty({max_rows_, accepted_token_capacity_}, mask_options),
+          torch::full({max_rows_, accepted_token_capacity_}, -1, token_options),
+          torch::empty({max_rows_, accepted_token_capacity_}, token_options)};
+      resources.decode_patch_workspace =
+          block_spec_async::allocate_block_spec_decode_input_patch_workspace(
+              max_rows_,
+              query_width_,
+              accepted_token_capacity_,
+              position_options,
+              position_options);
+      if (algorithm_ == BlockSpecAlgorithm::DSPARK) {
+        resources.dspark_sampling_workspace =
+            dspark_detail::allocate_prepared_sampling_workspace(
+                max_rows_,
+                static_cast<int32_t>(speculative_width_),
+                worker_->prepared_dspark_markov_rank(),
+                worker_->prepared_dspark_vocab_size(),
+                token_options,
+                hidden_options);
+      }
+      slots_.emplace_back(std::move(resources));
+    }
+  }
+
+  void initialize_state_thread() override {
+    worker_->initialize_prepared_task_thread();
+  }
+
+  void initialize_launch_thread() override {
+    worker_->initialize_prepared_task_thread();
+  }
+
+ protected:
+  void prepare_staged_input(const ForwardInput& input,
+                            ExecutionSlot& slot,
+                            const BlockSpecPreparedTaskPlan& plan) override {
+    CHECK(plan.algorithm == algorithm_)
+        << "Block-Spec Prepared Backend received the wrong algorithm plan";
+    CHECK_EQ(plan.speculative_width, speculative_width_);
+    CHECK(input.json_object_states.empty() &&
+          input.json_object_state_snapshots.empty())
+        << "Prepared Block-Spec does not support JSON grammar";
+    CHECK(worker_->adaptive_spec_controller_ == nullptr ||
+          !worker_->adaptive_spec_controller_->enabled())
+        << "Prepared Block-Spec does not support adaptive speculative "
+           "decoding";
+    CHECK_EQ(worker_->parallel_args_.dp_size(), 1)
+        << "Prepared Block-Spec Worker binding currently requires DP=1";
+    CHECK_EQ(worker_->parallel_args_.cp_size(), 1)
+        << "Prepared Block-Spec Worker binding currently requires CP=1";
+    validate_model_managed_block_tables(input);
+    CHECK(input.sampling_params.all_greedy_sample)
+        << "Prepared Block-Spec Worker binding supports greedy sampling";
+    CHECK(!input.sampling_params.logprobs)
+        << "Prepared Block-Spec Worker binding does not support logprobs";
+    CHECK_EQ(input.sampling_params.max_top_logprobs, 0)
+        << "Prepared Block-Spec Worker binding does not support top logprobs";
+    CHECK(input.transfer_kv_infos.empty())
+        << "Prepared Block-Spec Worker binding does not support PD transfer";
+
+    SlotResources& resources = mutable_slot(slot.slot_id);
+    reset_slot(resources);
+    resources.task_kind = plan.task_kind;
+    c10::StreamGuard stream_guard =
+        worker_->prepare_stream_->set_stream_guard();
+    ForwardInput prefill_source;
+    const ForwardInput* primary_source = &input;
+    if (plan.task_kind == PreparedTaskKind::PREFILL_LIKE &&
+        !input.input_params.multi_block_tables.empty()) {
+      CHECK_LE(input.positions_host.numel(),
+               worker_->options_.max_tokens_per_batch())
+          << "Prepared grouped prefill exceeds the fixed SWA slot workspace";
+      prefill_source = input;
+      specBuilder::build_grouped_prefill_swa_slots_out(
+          input, worker_->options_.block_size(), resources.prefill_swa_slots);
+      prefill_source.input_params.attention.host.new_cache_slots =
+          std::move(resources.prefill_swa_slots);
+      primary_source = &prefill_source;
+    }
+    CHECK(
+        stage_primary_input(slot.slot_id, *primary_source, slot.prepared_input))
+        << "DFlash ForwardInput is not supported by the fixed Prepared Arena";
+    if (primary_source == &prefill_source) {
+      resources.prefill_swa_slots =
+          std::move(prefill_source.input_params.attention.host.new_cache_slots);
+    }
+    switch (plan.task_kind) {
+      case PreparedTaskKind::PREFILL_LIKE:
+        prepare_prefill(slot.prepared_input, slot.slot_id, resources);
+        return;
+      case PreparedTaskKind::DECODE:
+        prepare_decode(input, slot, plan, resources);
+        return;
+      case PreparedTaskKind::EMPTY:
+        prepare_empty(slot.prepared_input, slot.slot_id, resources);
+        return;
+    }
+    LOG(FATAL) << "Unsupported Prepared Block-Spec Task kind";
+  }
+
+  void launch_predecessor_patch(
+      const block_spec_async::BlockSpecDeviceStepState& predecessor_state,
+      ExecutionSlot& slot) override {
+    SlotResources& resources = mutable_slot(slot.slot_id);
+    CHECK(resources.task_kind == PreparedTaskKind::DECODE);
+    patch_continuation_state(
+        slot.slot_id,
+        predecessor_state,
+        slot.prepared_input.input_params.embedding.predecessor_rows,
+        resources.continuation);
+  }
+
+  void launch_model_invocation(const BlockSpecPreparedInvocation& invocation,
+                               ExecutionSlot& slot) override {
+    SlotResources& resources = mutable_slot(slot.slot_id);
+    switch (invocation.kind) {
+      case BlockSpecPreparedInvocationKind::TARGET_PREFILL:
+        launch_target_prefill(resources);
+        return;
+      case BlockSpecPreparedInvocationKind::TASK_CONTINUATION_PATCH:
+        launch_decode_geometry_patch(resources);
+        return;
+      case BlockSpecPreparedInvocationKind::BLOCK_DRAFT:
+        launch_block_draft(resources);
+        return;
+      case BlockSpecPreparedInvocationKind::TARGET_VALIDATE_PATCH:
+        launch_target_validate_patch(resources);
+        return;
+      case BlockSpecPreparedInvocationKind::TARGET_VALIDATE:
+        launch_target_validate(resources);
+        return;
+      case BlockSpecPreparedInvocationKind::REJECTION_SAMPLE:
+        launch_rejection_sample(slot, resources);
+        return;
+      case BlockSpecPreparedInvocationKind::PUBLISH_CONTEXT_KV_STATE:
+        return;
+      case BlockSpecPreparedInvocationKind::WRITE_CONTEXT_KV:
+        launch_context_kv_write(slot, resources);
+        return;
+      case BlockSpecPreparedInvocationKind::EMPTY_COLLECTIVE:
+        launch_empty(slot, resources);
+        return;
+      case BlockSpecPreparedInvocationKind::DSPARK_MARKOV_SAMPLE:
+        launch_dspark_markov_sample(invocation.block_step, resources);
+        return;
+      case BlockSpecPreparedInvocationKind::DSPARK_TOKEN_BROADCAST:
+        launch_dspark_token_broadcast(invocation.block_step, resources);
+        return;
+    }
+    LOG(FATAL) << "Unsupported Prepared Block-Spec invocation";
+  }
+
+  StreamEventPtr record_task_stream_event() const override {
+    CHECK(worker_->compute_stream_ != nullptr);
+    return worker_->compute_stream_->record_event_or_sync();
+  }
+
+  c10::Stream task_stream() const override {
+    CHECK(worker_->compute_stream_ != nullptr);
+    return worker_->compute_stream_->get_stream()->unwrap();
+  }
+
+  bool wait_prepare_stream_event(const StreamEventPtr& event) const override {
+    CHECK(worker_->prepare_stream_ != nullptr);
+    return worker_->prepare_stream_->wait_event(event);
+  }
+
+  void consume_ready(ExecutionSlot& slot) override {
+    SlotResources& resources = mutable_slot(slot.slot_id);
+    if (!slot.output.has_value()) {
+      return;
+    }
+    c10::StreamGuard stream_guard =
+        worker_->prepare_stream_->set_stream_guard();
+    switch (resources.task_kind) {
+      case PreparedTaskKind::PREFILL_LIKE:
+        consume_prefill(slot, resources);
+        return;
+      case PreparedTaskKind::DECODE:
+        consume_decode(slot, resources);
+        return;
+      case PreparedTaskKind::EMPTY:
+        clear_all_output_embeddings(*slot.output);
+        return;
+    }
+    LOG(FATAL) << "Unsupported Prepared Block-Spec consume kind";
+  }
+
+ private:
+  struct LeafInvocation {
+    ForwardInput input;
+    std::optional<PreparedSlotBinding> binding;
+    PreparedModelOutputWorkspace output_workspace;
+  };
+
+  struct SlotResources {
+    LeafInvocation target_prefill;
+    LeafInvocation block_draft;
+    LeafInvocation target_validate;
+    LeafInvocation empty_target;
+    std::optional<ForwardOutput> target_output;
+    std::optional<ForwardOutput> draft_output;
+    block_spec_async::BlockSpecContinuationState continuation;
+    block_spec_async::BlockSpecDecodeInputPatchTarget decode_patch_target;
+    block_spec_async::BlockSpecDecodeInputPatchWorkspace decode_patch_workspace;
+    dspark_detail::PreparedSamplingWorkspace dspark_sampling_workspace;
+    SamplingParameters dspark_sampling_params;
+    GreedyTokenIdRejectionWorkspace rejection_workspace;
+    torch::Tensor prefill_next_tokens;
+    torch::Tensor prefill_selected_hidden;
+    torch::Tensor draft_next_tokens;
+    torch::Tensor draft_selected_hidden;
+    torch::Tensor target_next_tokens;
+    torch::Tensor target_context_hidden;
+    torch::Tensor continuation_context_hidden;
+    DSADeviceGeometryWorkspacePtr dsa_device_geometry_workspace;
+    std::vector<torch::Tensor> dsa_group_block_table_storage;
+    std::vector<torch::Tensor> active_dsa_group_block_tables;
+    torch::Tensor active_cache_slot_block_tables;
+    SpeculativePreparedHostInputWorkspace anchor_host_workspace;
+    SpeculativePreparedHostInputWorkspace query_host_workspace;
+    SpeculativePreparedHostInputWorkspace target_host_workspace;
+    std::vector<EmbeddingCache::DecodeState> decode_states;
+    std::vector<int32_t> prefill_swa_slots;
+    specBuilder::DecodeBuildWorkspace decode_build_workspace;
+    torch::Tensor draft_token_ids;
+    torch::Tensor dspark_base_logits;
+    block_spec_async::CacheSlotMappingMode cache_slot_mapping_mode =
+        block_spec_async::CacheSlotMappingMode::LINEAR;
+    int64_t batch_size = 0;
+    PreparedTaskKind task_kind = PreparedTaskKind::EMPTY;
+  };
+
+  SlotResources& mutable_slot(int32_t slot_id) {
+    CHECK_GE(slot_id, 0);
+    CHECK_LT(static_cast<size_t>(slot_id), slots_.size());
+    return slots_[static_cast<size_t>(slot_id)];
+  }
+
+  void validate_model_managed_block_tables(const ForwardInput& input) const {
+    const std::vector<torch::Tensor>& block_tables =
+        input.input_params.multi_block_tables;
+    if (block_tables.empty()) {
+      return;
+    }
+    const ModelArgs& target_args = worker_->impl_->context_.get_model_args();
+    CHECK(util::is_deepseek_v4_model_type(target_args.model_type()))
+        << "Prepared Block-Spec multi-block input requires DeepSeek-V4";
+    CHECK_GT(input.input_params.meta.num_sequences, 0);
+    const std::vector<int32_t>& compress_ratios = target_args.compress_ratios();
+    size_t expected_manager_count = 1;
+    if (std::find(compress_ratios.begin(), compress_ratios.end(), 4) !=
+        compress_ratios.end()) {
+      ++expected_manager_count;
+    }
+    if (std::find(compress_ratios.begin(), compress_ratios.end(), 128) !=
+        compress_ratios.end()) {
+      ++expected_manager_count;
+    }
+    CHECK_EQ(block_tables.size(), expected_manager_count)
+        << "Prepared DeepSeek-V4 manager tables must follow the complete "
+           "SWA/C4/C128 model-role set";
+    for (size_t manager_index = 0; manager_index < block_tables.size();
+         ++manager_index) {
+      const torch::Tensor& block_table = block_tables[manager_index];
+      CHECK(block_table.defined()) << "Prepared multi_block_tables["
+                                   << manager_index << "] is undefined";
+      CHECK(block_table.device().is_cpu())
+          << "Prepared multi_block_tables must remain on Host";
+      CHECK_EQ(block_table.scalar_type(), torch::kInt)
+          << "Prepared multi_block_tables must use int32";
+      CHECK_EQ(block_table.dim(), 2)
+          << "Prepared multi_block_tables must be two-dimensional";
+      CHECK_GE(block_table.size(0), input.input_params.meta.num_sequences)
+          << "Prepared multi_block_tables row count is too small";
+      CHECK_GT(block_table.size(1), 0)
+          << "Prepared multi_block_tables must have at least one column";
+    }
+  }
+
+  void stage_cache_slot_block_tables(ForwardInput& staged_input,
+                                     SlotResources& resources) {
+    resources.cache_slot_mapping_mode =
+        block_spec_async::CacheSlotMappingMode::LINEAR;
+    resources.active_cache_slot_block_tables = torch::Tensor();
+    resources.active_dsa_group_block_tables.clear();
+    if (staged_input.input_params.multi_block_tables.empty()) {
+      return;
+    }
+
+    const std::vector<torch::Tensor>& host_group_tables =
+        staged_input.input_params.multi_block_tables;
+    CHECK_LE(host_group_tables.size(),
+             resources.dsa_group_block_table_storage.size())
+        << "Prepared DeepSeek-V4 manager count exceeds fixed capacity";
+    for (size_t manager_id = 0; manager_id < host_group_tables.size();
+         ++manager_id) {
+      const torch::Tensor& host_block_table = host_group_tables[manager_id];
+      CHECK(host_block_table.device().is_cpu());
+      CHECK_EQ(host_block_table.scalar_type(), torch::kInt);
+      CHECK_EQ(host_block_table.dim(), 2);
+      CHECK_GE(host_block_table.size(0), resources.batch_size);
+      const torch::Tensor& storage =
+          resources.dsa_group_block_table_storage[manager_id];
+      CHECK_LE(host_block_table.size(1), storage.size(1))
+          << "Prepared DeepSeek-V4 manager block table exceeds fixed capacity";
+      torch::Tensor source = host_block_table.narrow(
+          /*dim=*/0, /*start=*/0, resources.batch_size);
+      torch::Tensor destination =
+          storage.narrow(/*dim=*/0, /*start=*/0, resources.batch_size)
+              .narrow(/*dim=*/1,
+                      /*start=*/0,
+                      host_block_table.size(1));
+      destination.copy_(source, /*non_blocking=*/true);
+      resources.active_dsa_group_block_tables.emplace_back(destination);
+      const uint64_t transfer_bytes =
+          static_cast<uint64_t>(source.numel()) * source.element_size();
+      staged_input.prepared_arena_h2d_bytes += transfer_bytes;
+      ++staged_input.prepared_arena_h2d_copies;
+      COUNTER_ADD(prepared_task_staging_h2d_bytes_total, transfer_bytes);
+      COUNTER_INC(prepared_task_staging_h2d_copies_total);
+    }
+    CHECK(!resources.active_dsa_group_block_tables.empty());
+    resources.active_cache_slot_block_tables =
+        resources.active_dsa_group_block_tables.front();
+    resources.cache_slot_mapping_mode =
+        block_spec_async::CacheSlotMappingMode::CIRCULAR;
+  }
+
+  void reset_leaf_invocation(LeafInvocation& invocation) {
+    invocation.binding.reset();
+    invocation.output_workspace = PreparedModelOutputWorkspace();
+    invocation.input.metadata_ready_event.reset();
+    invocation.input.retained_device_tensors.clear();
+  }
+
+  void reset_slot(SlotResources& resources) {
+    reset_leaf_invocation(resources.target_prefill);
+    reset_leaf_invocation(resources.block_draft);
+    reset_leaf_invocation(resources.target_validate);
+    reset_leaf_invocation(resources.empty_target);
+    resources.target_output.reset();
+    resources.draft_output.reset();
+    resources.continuation = block_spec_async::BlockSpecContinuationState();
+    resources.decode_patch_target =
+        block_spec_async::BlockSpecDecodeInputPatchTarget();
+    resources.active_cache_slot_block_tables = torch::Tensor();
+    resources.active_dsa_group_block_tables.clear();
+    resources.cache_slot_mapping_mode =
+        block_spec_async::CacheSlotMappingMode::LINEAR;
+    resources.dspark_sampling_params = SamplingParameters();
+    resources.draft_token_ids = torch::Tensor();
+    resources.dspark_base_logits = torch::Tensor();
+    if (algorithm_ == BlockSpecAlgorithm::DSPARK) {
+      dspark_detail::reset_prepared_sampling_workspace(
+          resources.dspark_sampling_workspace);
+    }
+    resources.batch_size = 0;
+  }
+
+  const BlockSpecPreparedInvocation& find_invocation(
+      const BlockSpecPreparedTaskPlan& plan,
+      BlockSpecPreparedInvocationKind kind) const {
+    for (const BlockSpecPreparedInvocation& invocation : plan.invocations) {
+      if (invocation.kind == kind) {
+        return invocation;
+      }
+    }
+    LOG(FATAL) << "Prepared DFlash plan is missing an invocation";
+    return plan.invocations.front();
+  }
+
+  void bind_leaf(LLMWorkerImpl& leaf,
+                 int32_t slot_id,
+                 LeafInvocation& invocation) {
+    if (leaf.prepared_graph_enabled()) {
+      invocation.binding = leaf.bind_prepared_task(slot_id, invocation.input);
+    } else {
+      invocation.binding.reset();
+    }
+    invocation.input.metadata_ready_event =
+        worker_->prepare_stream_->record_event_or_sync();
+    CHECK(invocation.input.metadata_ready_event != nullptr)
+        << "Failed to record Prepared DFlash input-ready event";
+  }
+
+  void stage_leaf(LLMWorkerImpl& leaf,
+                  ForwardInput& source,
+                  ExecutionSlot& slot,
+                  SlotResources& resources,
+                  LeafInvocation& destination) {
+    if (leaf.prepared_graph_enabled()) {
+      leaf.prepare_prepared_graph_input(slot.slot_id, source);
+    }
+    CHECK(stage_invocation_input(slot.slot_id, source, destination.input))
+        << "DFlash model invocation is not supported by the fixed Arena";
+    if (resources.cache_slot_mapping_mode ==
+        block_spec_async::CacheSlotMappingMode::CIRCULAR) {
+      ModelInputParams& params = destination.input.input_params;
+      params.device_multi_block_tables.clear();
+      params.device_multi_block_tables.reserve(
+          resources.active_dsa_group_block_tables.size());
+      for (const torch::Tensor& block_table :
+           resources.active_dsa_group_block_tables) {
+        params.device_multi_block_tables.emplace_back(block_table);
+      }
+      params.dsa_device_geometry_authoritative = true;
+      params.dsa_device_geometry_kv_headroom =
+          static_cast<int32_t>(accepted_token_capacity_);
+      CHECK(resources.dsa_device_geometry_workspace != nullptr);
+      params.dsa_device_geometry_workspace =
+          resources.dsa_device_geometry_workspace;
+    }
+    bind_leaf(leaf, slot.slot_id, destination);
+  }
+
+  std::optional<ForwardOutput> launch_leaf(LLMWorkerImpl& leaf,
+                                           const LeafInvocation& invocation) {
+    return leaf.execute_prepared_on_stream(invocation.input,
+                                           *worker_->compute_stream_,
+                                           invocation.binding,
+                                           &invocation.output_workspace);
+  }
+
+  void prepare_prefill(const ForwardInput& staged_input,
+                       int32_t slot_id,
+                       SlotResources& resources) {
+    resources.batch_size = staged_input.input_params.meta.num_sequences;
+    CHECK_GT(resources.batch_size, 0);
+    CHECK_LE(resources.batch_size, max_rows_);
+    resources.target_prefill.input = staged_input;
+    resources.target_prefill.input.sampling_params.return_probs = false;
+    if (staged_input.sampling_params.selected_token_idxes.defined()) {
+      const int64_t selected_count =
+          staged_input.sampling_params.selected_token_idxes.numel();
+      CHECK_EQ(selected_count, resources.batch_size)
+          << "Prepared Block-Spec Target Prefill requires one selected token "
+             "per sequence";
+      CHECK_LE(selected_count, max_rows_);
+      resources.target_prefill.output_workspace.next_tokens =
+          resources.prefill_next_tokens.narrow(
+              /*dim=*/0, /*start=*/0, selected_count);
+      resources.target_prefill.output_workspace.selected_embeddings =
+          resources.prefill_selected_hidden.narrow(
+              /*dim=*/0, /*start=*/0, selected_count);
+    }
+    bind_leaf(*worker_->impl_, slot_id, resources.target_prefill);
+  }
+
+  void prepare_decode(const ForwardInput& input,
+                      ExecutionSlot& slot,
+                      const BlockSpecPreparedTaskPlan& plan,
+                      SlotResources& resources) {
+    CHECK_GE(worker_->mask_token_id_, 0)
+        << "Prepared DFlash Backend was created before the draft model loaded";
+    resources.batch_size = input.input_params.meta.num_sequences;
+    CHECK_GT(resources.batch_size, 0);
+    CHECK_LE(resources.batch_size, max_rows_);
+    stage_cache_slot_block_tables(slot.prepared_input, resources);
+
+    ForwardInput updated_input;
+    const ForwardInput* working_input = &input;
+    if (!slot.predecessor_slot_id.has_value()) {
+      updated_input = input;
+      worker_->embedding_cache_->read_decode_states_out(
+          input.input_params.embedding.embedding_ids,
+          input.input_params.embedding.request_ids,
+          resources.decode_states);
+      worker_->update_decode_step_input(updated_input,
+                                        resources.decode_states,
+                                        &resources.anchor_host_workspace);
+      working_input = &updated_input;
+    }
+
+    ForwardInput query_source;
+    worker_->prepare_query_inputs(*working_input,
+                                  query_source,
+                                  /*stage_sampling_on_host=*/true,
+                                  &resources.query_host_workspace,
+                                  &resources.decode_build_workspace);
+    query_source.sampling_params.return_probs = false;
+    if (algorithm_ == BlockSpecAlgorithm::DSPARK) {
+      query_source.skip_sampling_for_logits_only = true;
+      query_source.return_selected_hidden = false;
+    }
+    CHECK(find_invocation(plan, BlockSpecPreparedInvocationKind::BLOCK_DRAFT)
+              .input_partition == 1);
+    stage_leaf(*worker_->draft_impl_,
+               query_source,
+               slot,
+               resources,
+               resources.block_draft);
+    specBuilder::reclaim_decode_build_workspace(
+        query_source.input_params, resources.decode_build_workspace);
+    const int64_t draft_row_count = resources.batch_size * speculative_width_;
+    if (algorithm_ == BlockSpecAlgorithm::DFLASH) {
+      resources.block_draft.output_workspace.next_tokens =
+          resources.draft_next_tokens.narrow(
+              /*dim=*/0, /*start=*/0, draft_row_count);
+      resources.block_draft.output_workspace.selected_embeddings =
+          resources.draft_selected_hidden.narrow(
+              /*dim=*/0, /*start=*/0, draft_row_count);
+    }
+
+    ForwardInput target_source;
+    worker_->prepare_validate_inputs(*working_input,
+                                     target_source,
+                                     /*stage_sampling_on_host=*/true,
+                                     &resources.target_host_workspace,
+                                     &resources.decode_build_workspace);
+    target_source.sampling_params.return_probs = false;
+    CHECK(
+        find_invocation(plan, BlockSpecPreparedInvocationKind::TARGET_VALIDATE)
+            .input_partition == 2);
+    stage_leaf(*worker_->impl_,
+               target_source,
+               slot,
+               resources,
+               resources.target_validate);
+    specBuilder::reclaim_decode_build_workspace(
+        target_source.input_params, resources.decode_build_workspace);
+    const int64_t target_row_count =
+        resources.batch_size * accepted_token_capacity_;
+    resources.target_validate.output_workspace.next_tokens =
+        resources.target_next_tokens.narrow(
+            /*dim=*/0, /*start=*/0, target_row_count);
+    resources.target_validate.output_workspace.selected_embeddings =
+        resources.target_context_hidden.narrow(
+            /*dim=*/0, /*start=*/0, target_row_count);
+
+    ForwardInput& query_input = resources.block_draft.input;
+    ForwardInput& target_input = resources.target_validate.input;
+    const int64_t query_row_count = resources.batch_size * query_width_;
+    CHECK_EQ(query_input.token_ids.numel(), query_row_count);
+    CHECK_EQ(query_input.positions.numel(), query_row_count);
+    CHECK_EQ(target_input.token_ids.numel(), target_row_count);
+    CHECK_EQ(target_input.positions.numel(), target_row_count);
+    torch::Tensor query_token_rows =
+        query_input.token_ids.view({resources.batch_size, query_width_});
+    torch::Tensor query_position_rows =
+        query_input.positions.view({resources.batch_size, query_width_});
+    torch::Tensor target_token_rows = target_input.token_ids.view(
+        {resources.batch_size, accepted_token_capacity_});
+    torch::Tensor target_position_rows = target_input.positions.view(
+        {resources.batch_size, accepted_token_capacity_});
+    resources.continuation = block_spec_async::BlockSpecContinuationState{
+        query_token_rows.select(/*dim=*/1, /*index=*/0),
+        resources.continuation_context_hidden.narrow(
+            /*dim=*/0, /*start=*/0, resources.batch_size),
+        query_position_rows.select(/*dim=*/1, /*index=*/0)};
+    resources.continuation.anchor_context_hidden.zero_();
+
+    if (algorithm_ == BlockSpecAlgorithm::DSPARK) {
+      resources.draft_token_ids =
+          resources.dspark_sampling_workspace.token_ids.narrow(
+              /*dim=*/0, /*start=*/0, resources.batch_size);
+      resources.dspark_sampling_params = slot.prepared_input.sampling_params;
+      resources.dspark_sampling_params.selected_token_idxes = torch::Tensor();
+      resources.dspark_sampling_params.sample_idxes = torch::Tensor();
+      resources.dspark_sampling_params.return_probs = false;
+      resources.dspark_sampling_params.logprobs = false;
+      resources.dspark_sampling_params.max_top_logprobs = 0;
+      resources.dspark_sampling_params.use_beam_search = false;
+    }
+
+    const torch::Tensor& source_block_tables =
+        resources.cache_slot_mapping_mode ==
+                block_spec_async::CacheSlotMappingMode::CIRCULAR
+            ? resources.active_cache_slot_block_tables
+            : slot.prepared_input.input_params.attention.device.block_tables;
+    CHECK(source_block_tables.defined());
+    CHECK_EQ(source_block_tables.dim(), 2);
+    CHECK_EQ(source_block_tables.size(0), resources.batch_size);
+    const dflash_detail::PreparedDecodeCacheSlotViews cache_slot_views =
+        dflash_detail::view_prepared_decode_cache_slots(
+            query_input.input_params.attention.device.new_cache_slots,
+            target_input.input_params.attention.device.new_cache_slots,
+            resources.batch_size,
+            worker_->options_.num_speculative_tokens(),
+            worker_->sample_from_anchor());
+    resources.decode_patch_target =
+        block_spec_async::BlockSpecDecodeInputPatchTarget{
+            query_token_rows,
+            query_position_rows,
+            query_input.input_params.attention.device.kv_seq_lens,
+            cache_slot_views.query,
+            target_token_rows,
+            target_position_rows,
+            target_input.input_params.attention.device.kv_seq_lens,
+            cache_slot_views.target,
+            source_block_tables,
+            resources.cache_slot_mapping_mode};
+  }
+
+  void prepare_empty(const ForwardInput& staged_input,
+                     int32_t slot_id,
+                     SlotResources& resources) {
+    resources.empty_target.input = staged_input;
+    bind_leaf(*worker_->impl_, slot_id, resources.empty_target);
+  }
+
+  void launch_target_prefill(SlotResources& resources) {
+    resources.target_output =
+        launch_leaf(*worker_->impl_, resources.target_prefill);
+    CHECK(resources.target_output.has_value())
+        << "Prepared DFlash Target Prefill returned no output";
+    release_prepared_model_intermediates(*resources.target_output);
+  }
+
+  void launch_decode_geometry_patch(SlotResources& resources) {
+    CHECK(resources.task_kind == PreparedTaskKind::DECODE);
+    CHECK(resources.block_draft.input.metadata_ready_event != nullptr);
+    CHECK(worker_->compute_stream_->wait_event(
+        resources.block_draft.input.metadata_ready_event))
+        << "Prepared Block-Spec geometry patch failed to wait for input";
+    block_spec_async::patch_block_spec_decode_input_geometry(
+        resources.continuation,
+        worker_->options_.block_size(),
+        resources.decode_patch_target,
+        resources.decode_patch_workspace);
+  }
+
+  void launch_block_draft(SlotResources& resources) {
+    resources.draft_output =
+        launch_leaf(*worker_->draft_impl_, resources.block_draft);
+    CHECK(resources.draft_output.has_value())
+        << "Prepared Block-Spec Draft returned no output";
+    if (algorithm_ == BlockSpecAlgorithm::DSPARK) {
+      CHECK(resources.draft_output->logits.defined())
+          << "Prepared DSpark Draft must return logits";
+      const int64_t expected_rows = resources.batch_size * speculative_width_;
+      CHECK_EQ(resources.draft_output->logits.size(0), expected_rows);
+      CHECK_EQ(resources.draft_output->logits.size(1),
+               worker_->prepared_dspark_vocab_size());
+      resources.dspark_base_logits = resources.draft_output->logits.view(
+          {resources.batch_size,
+           speculative_width_,
+           resources.draft_output->logits.size(1)});
+      release_prepared_model_intermediates(*resources.draft_output);
+      clear_all_output_embeddings(*resources.draft_output);
+      return;
+    }
+
+    SampleOutput& draft_sample = resources.draft_output->sample_output;
+    const int64_t expected_draft_token_count =
+        resources.batch_size * speculative_width_;
+    dflash_detail::check_fixed_prepared_output_binding(
+        draft_sample.next_tokens,
+        resources.block_draft.output_workspace.next_tokens,
+        worker_->device_.unwrap(),
+        torch::kLong,
+        expected_draft_token_count,
+        "Draft token output");
+    worker_->maybe_broadcast_spec_tokens(draft_sample.next_tokens);
+    dflash_detail::check_fixed_prepared_output_binding(
+        draft_sample.next_tokens,
+        resources.block_draft.output_workspace.next_tokens,
+        worker_->device_.unwrap(),
+        torch::kLong,
+        expected_draft_token_count,
+        "Draft token output after broadcast");
+    resources.draft_token_ids = draft_sample.next_tokens.view(
+        {resources.batch_size, speculative_width_});
+    release_prepared_model_intermediates(*resources.draft_output);
+    clear_all_output_embeddings(*resources.draft_output);
+  }
+
+  void launch_dspark_markov_sample(int32_t block_step,
+                                   SlotResources& resources) {
+    CHECK(algorithm_ == BlockSpecAlgorithm::DSPARK);
+    CHECK(resources.dspark_base_logits.defined());
+    worker_->launch_prepared_dspark_markov_sample(
+        resources.dspark_base_logits,
+        resources.continuation.anchor_tokens,
+        resources.dspark_sampling_params,
+        resources.batch_size,
+        block_step,
+        resources.dspark_sampling_workspace);
+  }
+
+  void launch_dspark_token_broadcast(int32_t block_step,
+                                     SlotResources& resources) {
+    CHECK(algorithm_ == BlockSpecAlgorithm::DSPARK);
+    worker_->launch_prepared_dspark_token_broadcast(
+        resources.dspark_sampling_params,
+        resources.batch_size,
+        block_step,
+        resources.dspark_sampling_workspace);
+    if (block_step == speculative_width_ - 1) {
+      resources.dspark_base_logits = torch::Tensor();
+      resources.draft_output.reset();
+    }
+  }
+
+  void launch_target_validate_patch(SlotResources& resources) {
+    CHECK(resources.draft_token_ids.defined());
+    block_spec_async::patch_block_spec_target_token_ids(
+        resources.draft_token_ids,
+        resources.decode_patch_target.target_token_ids);
+  }
+
+  void launch_target_validate(SlotResources& resources) {
+    resources.target_output =
+        launch_leaf(*worker_->impl_, resources.target_validate);
+    CHECK(resources.target_output.has_value())
+        << "Prepared DFlash Target Validate returned no output";
+    release_prepared_model_intermediates(*resources.target_output);
+  }
+
+  void launch_rejection_sample(ExecutionSlot& slot, SlotResources& resources) {
+    CHECK(resources.target_output.has_value());
+    CHECK(resources.draft_token_ids.defined());
+    const SampleOutput& target_sample = resources.target_output->sample_output;
+    CHECK(!target_sample.logprobs.defined())
+        << "Prepared DFlash greedy rejection does not support logprobs";
+    const int64_t target_token_count =
+        resources.batch_size * accepted_token_capacity_;
+    dflash_detail::check_fixed_prepared_output_binding(
+        target_sample.next_tokens,
+        resources.target_validate.output_workspace.next_tokens,
+        worker_->device_.unwrap(),
+        torch::kLong,
+        target_token_count,
+        "Target token output");
+    dflash_detail::check_fixed_prepared_output_binding(
+        target_sample.embeddings,
+        resources.target_validate.output_workspace.selected_embeddings,
+        worker_->device_.unwrap(),
+        worker_->dtype_,
+        target_token_count * context_hidden_size_,
+        "Target context hidden output");
+    torch::Tensor target_token_ids = target_sample.next_tokens.view(
+        {resources.batch_size, accepted_token_capacity_});
+    torch::Tensor target_draft_token_ids = target_token_ids.narrow(
+        /*dim=*/1, /*start=*/0, speculative_width_);
+    torch::Tensor bonus_token_ids = target_token_ids.narrow(
+        /*dim=*/1, /*start=*/speculative_width_, /*length=*/1);
+    GreedyTokenIdRejectionWorkspace rejection_workspace{
+        resources.rejection_workspace.candidate_token_ids.narrow(
+            /*dim=*/0, /*start=*/0, resources.batch_size),
+        resources.rejection_workspace.draft_matches.narrow(
+            /*dim=*/0, /*start=*/0, resources.batch_size),
+        resources.rejection_workspace.accepted_prefix_mask.narrow(
+            /*dim=*/0, /*start=*/0, resources.batch_size),
+        resources.rejection_workspace.rejected_token_ids.narrow(
+            /*dim=*/0, /*start=*/0, resources.batch_size),
+        resources.rejection_workspace.masked_accepted_token_ids.narrow(
+            /*dim=*/0, /*start=*/0, resources.batch_size)};
+    RejectionSampler::greedy_masked_sample_from_token_ids_out(
+        resources.draft_token_ids,
+        target_draft_token_ids,
+        bonus_token_ids,
+        rejection_workspace);
+
+    SampleOutput accepted_output;
+    accepted_output.next_tokens = rejection_workspace.masked_accepted_token_ids;
+    accepted_output.embeddings = target_sample.embeddings.view(
+        {resources.batch_size, accepted_token_capacity_, context_hidden_size_});
+    bind_publish_source(
+        slot.slot_id,
+        BlockSpecPreparedPublishSource{
+            accepted_output.next_tokens,
+            accepted_output.embeddings,
+            resources.continuation.base_positions,
+            resources.decode_patch_target.source_block_tables,
+            resources.decode_patch_target.cache_slot_mapping_mode});
+    resources.target_output->sample_output = std::move(accepted_output);
+    slot.output = std::move(resources.target_output);
+  }
+
+  void launch_context_kv_write(ExecutionSlot& slot, SlotResources& resources) {
+    if (resources.task_kind == PreparedTaskKind::PREFILL_LIKE) {
+      CHECK(resources.target_output.has_value());
+      const torch::Tensor& context_hidden =
+          resources.target_output->sample_output.embeddings;
+      if (context_hidden.defined()) {
+        worker_->write_context_kv(slot.prepared_input,
+                                  context_hidden,
+                                  resources.target_prefill.input.positions,
+                                  resources.target_prefill.input.input_params
+                                      .attention.device.new_cache_slots,
+                                  /*synchronize_completion=*/false);
+      }
+      slot.output = std::move(resources.target_output);
+      return;
+    }
+
+    CHECK(resources.task_kind == PreparedTaskKind::DECODE);
+    const block_spec_async::BlockSpecDeviceStepState& state =
+        device_step_state(slot.slot_id);
+    torch::Tensor context_hidden =
+        state.context_hidden
+            .narrow(/*dim=*/0, /*start=*/0, resources.batch_size)
+            .view({resources.batch_size * accepted_token_capacity_,
+                   context_hidden_size_});
+    torch::Tensor context_positions =
+        state.context_positions
+            .narrow(/*dim=*/0, /*start=*/0, resources.batch_size)
+            .view({resources.batch_size * accepted_token_capacity_});
+    torch::Tensor context_cache_slots =
+        state.context_cache_slots
+            .narrow(/*dim=*/0, /*start=*/0, resources.batch_size)
+            .view({resources.batch_size * accepted_token_capacity_});
+    worker_->write_context_kv(slot.prepared_input,
+                              context_hidden,
+                              context_positions,
+                              context_cache_slots,
+                              /*synchronize_completion=*/false);
+  }
+
+  void launch_empty(ExecutionSlot& slot, SlotResources& resources) {
+    std::optional<ForwardOutput> output =
+        launch_leaf(*worker_->impl_, resources.empty_target);
+    if (output.has_value()) {
+      release_prepared_model_intermediates(*output);
+      clear_all_output_embeddings(*output);
+    }
+    slot.output = std::move(output);
+  }
+
+  void consume_prefill(ExecutionSlot& slot, SlotResources& resources) {
+    SampleOutput& sample = slot.output->sample_output;
+    const ForwardInput& input = resources.target_prefill.input;
+    if (!input.sampling_params.selected_token_idxes.defined()) {
+      clear_all_output_embeddings(*slot.output);
+      return;
+    }
+    CHECK(worker_->embedding_cache_ != nullptr);
+    worker_->embedding_cache_->write_prefill_target_context(
+        input.input_params.embedding.embedding_ids,
+        input.input_params.embedding.request_ids,
+        sample.next_tokens,
+        sample.embeddings,
+        input.sampling_params.selected_token_idxes);
+
+    torch::Tensor bootstrap_embeddings = sample.selected_embeddings.defined()
+                                             ? sample.selected_embeddings
+                                             : sample.embeddings;
+    const int64_t sequence_count =
+        static_cast<int64_t>(input.input_params.embedding.embedding_ids.size());
+    CHECK_EQ(bootstrap_embeddings.size(0), sequence_count)
+        << "Prepared Block-Spec Target Prefill must publish one fixed selected "
+           "embedding per sequence";
+    sample.embeddings = bootstrap_embeddings.detach();
+    clear_selected_embeddings(*slot.output);
+    worker_->prepare_stream_->synchronize();
+  }
+
+  void consume_decode(ExecutionSlot& slot, SlotResources& resources) {
+    SampleOutput& sample = slot.output->sample_output;
+    torch::Tensor accepted_tokens =
+        safe_to(sample.next_tokens, torch::kCPU).contiguous();
+    if (accepted_tokens.scalar_type() != torch::kLong) {
+      accepted_tokens = accepted_tokens.to(torch::kLong);
+    }
+    sample.next_tokens = accepted_tokens;
+    const ForwardInput& input = resources.target_validate.input;
+    trace_block_spec_step_state_from_target_input(
+        worker_->options_.speculative_algorithm(),
+        input,
+        accepted_tokens,
+        resources.continuation.base_positions,
+        accepted_token_capacity_);
+    worker_->record_validate_metrics(
+        sample, /*per_seq_val_tokens=*/std::vector<int32_t>{});
+    CHECK(worker_->embedding_cache_ != nullptr);
+    worker_->embedding_cache_->write_target_context(
+        input.input_params.embedding.embedding_ids,
+        input.input_params.embedding.request_ids,
+        accepted_tokens,
+        sample.embeddings,
+        speculative_width_);
+    clear_all_output_embeddings(*slot.output);
+    worker_->prepare_stream_->synchronize();
+  }
+
+  DFlashWorkerImpl* worker_ = nullptr;
+  BlockSpecAlgorithm algorithm_ = BlockSpecAlgorithm::DFLASH;
+  int64_t max_rows_ = 0;
+  int64_t speculative_width_ = 0;
+  int64_t query_width_ = 0;
+  int64_t accepted_token_capacity_ = 0;
+  int64_t context_hidden_size_ = 0;
+  int64_t draft_hidden_size_ = 0;
+  int64_t max_swa_block_table_width_ = 0;
+  static constexpr int32_t kMaxDeepseekV4CacheManagers = 3;
+  std::vector<SlotResources> slots_;
+};
+
+std::unique_ptr<BlockSpecPreparedTaskBackend>
+DFlashWorkerImpl::create_prepared_task_backend(
+    uint64_t input_arena_capacity_bytes,
+    int32_t slot_count) {
+  CHECK(options_.speculative_algorithm() == "DFlash" ||
+        options_.speculative_algorithm() == "DSpark")
+      << "Prepared Block-Spec Backend requires DFlash or DSpark";
+  CHECK(impl_ != nullptr && draft_impl_ != nullptr);
+  CHECK(embedding_cache_ != nullptr)
+      << "Prepared DFlash Backend requires allocated KV/embedding caches";
+  CHECK_GE(mask_token_id_, 0);
+  CHECK_GT(expected_context_hidden_size_, 0);
+  BlockSpecPreparedTaskBufferConfig config;
+  config.device = device_.unwrap();
+  config.input_arena_capacity_bytes = input_arena_capacity_bytes;
+  config.slot_count = slot_count;
+  config.block_size = options_.block_size();
+  config.max_rows = options_.max_seqs_per_batch();
+  config.accepted_token_capacity = options_.num_speculative_tokens() + 1;
+  config.context_hidden_size = expected_context_hidden_size_;
+  config.token_dtype = torch::kLong;
+  config.hidden_dtype = dtype_;
+  config.position_dtype = torch::kInt;
+  config.cache_slot_dtype = torch::kInt;
+  return std::make_unique<PreparedTaskBackend>(this, config);
 }
 
 bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
@@ -1028,6 +2424,8 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
   maybe_broadcast_spec_tokens(val_output.next_tokens);
   compute_stream_->synchronize();
   val_output.next_tokens = val_output.next_tokens.to(torch::kCPU);
+  trace_block_spec_step_state_from_host_input(
+      options_.speculative_algorithm(), input, val_output.next_tokens);
   // Precise adaptive-aware metrics on the already-CPU tensor: static path
   // passes an empty per_seq_val_tokens and every row counts full width;
   // adaptive passes the per-seq widths so padded tail slots aren't counted
@@ -1163,7 +2561,8 @@ void DFlashWorkerImpl::maybe_broadcast_spec_tokens(torch::Tensor& tokens) {
 
 void DFlashWorkerImpl::update_decode_step_input(
     ForwardInput& input,
-    const std::vector<EmbeddingCache::DecodeState>& last_states) const {
+    const std::vector<EmbeddingCache::DecodeState>& last_states,
+    const SpeculativePreparedHostInputWorkspace* fixed_host_workspace) const {
   const int32_t num_sequences = input.input_params.meta.num_sequences;
   CHECK_EQ(last_states.size(), static_cast<size_t>(num_sequences))
       << "DFlash decode context state count mismatch";
@@ -1172,13 +2571,40 @@ void DFlashWorkerImpl::update_decode_step_input(
   std::vector<int32_t> token_ids_vec;
   std::vector<int32_t> positions_vec;
   std::vector<int32_t> kv_seq_lens_vec;
-  token_ids_vec.reserve(num_sequences);
-  positions_vec.reserve(num_sequences);
+  torch::Tensor fixed_token_ids;
+  torch::Tensor fixed_positions;
+  int32_t* fixed_token_ids_data = nullptr;
+  int32_t* fixed_positions_data = nullptr;
+  if (fixed_host_workspace == nullptr) {
+    token_ids_vec.reserve(num_sequences);
+    positions_vec.reserve(num_sequences);
 #if defined(USE_NPU)
-  kv_seq_lens_vec.reserve(num_sequences);
+    kv_seq_lens_vec.reserve(num_sequences);
 #else
-  kv_seq_lens_vec.reserve(num_sequences + 1);
+    kv_seq_lens_vec.reserve(num_sequences + 1);
 #endif
+  } else {
+    CHECK(fixed_host_workspace->token_ids.defined());
+    CHECK(fixed_host_workspace->positions.defined());
+    CHECK(fixed_host_workspace->token_ids.device().is_cpu());
+    CHECK(fixed_host_workspace->positions.device().is_cpu());
+    CHECK_EQ(fixed_host_workspace->token_ids.scalar_type(), torch::kInt);
+    CHECK_EQ(fixed_host_workspace->positions.scalar_type(), torch::kInt);
+    CHECK(fixed_host_workspace->token_ids.is_contiguous());
+    CHECK(fixed_host_workspace->positions.is_contiguous());
+    CHECK_GE(fixed_host_workspace->token_ids.numel(), num_sequences);
+    CHECK_GE(fixed_host_workspace->positions.numel(), num_sequences);
+    CHECK_EQ(input.input_params.attention.host.kv_seq_lens.size(),
+             static_cast<size_t>(num_sequences))
+        << "Prepared Block-Spec fixed Host staging requires one KV length per "
+           "sequence";
+    fixed_token_ids = fixed_host_workspace->token_ids.narrow(
+        /*dim=*/0, /*start=*/0, num_sequences);
+    fixed_positions = fixed_host_workspace->positions.narrow(
+        /*dim=*/0, /*start=*/0, num_sequences);
+    fixed_token_ids_data = fixed_token_ids.data_ptr<int32_t>();
+    fixed_positions_data = fixed_positions.data_ptr<int32_t>();
+  }
 
   const torch::Tensor& token_ids_cpu = input.token_ids_host;
   const torch::Tensor& positions_cpu = input.positions_host;
@@ -1214,31 +2640,55 @@ void DFlashWorkerImpl::update_decode_step_input(
         << ", current_position=" << current_position
         << ", current_kv_len=" << current_kv_len;
 
-    token_ids_vec.emplace_back(rewrite_fake_token ? state.token_id
-                                                  : input_token_id);
-    positions_vec.emplace_back(current_position);
-    specBuilder::append_seq_len_by_layout(kv_seq_lens_vec, current_kv_len);
+    const int32_t output_token_id =
+        rewrite_fake_token ? state.token_id : input_token_id;
+    if (fixed_host_workspace == nullptr) {
+      token_ids_vec.emplace_back(output_token_id);
+      positions_vec.emplace_back(current_position);
+      specBuilder::append_seq_len_by_layout(kv_seq_lens_vec, current_kv_len);
+    } else {
+      fixed_token_ids_data[seq_id] = output_token_id;
+      fixed_positions_data[seq_id] = current_position;
+      input.input_params.attention.host.kv_seq_lens[seq_id] = current_kv_len;
+    }
   }
 
-  input.token_ids_host = specBuilder::make_cpu_int_tensor(token_ids_vec);
-  input.positions_host = specBuilder::make_cpu_int_tensor(positions_vec);
-  input.input_params.attention.host.kv_seq_lens = std::move(kv_seq_lens_vec);
+  if (fixed_host_workspace == nullptr) {
+    input.token_ids_host = specBuilder::make_cpu_int_tensor(token_ids_vec);
+    input.positions_host = specBuilder::make_cpu_int_tensor(positions_vec);
+    input.input_params.attention.host.kv_seq_lens = std::move(kv_seq_lens_vec);
+  } else {
+    input.token_ids_host = fixed_token_ids;
+    input.positions_host = fixed_positions;
+  }
   input.device_tensors_ready = false;
 }
 
-void DFlashWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
-                                               ForwardInput& validate_input) {
+void DFlashWorkerImpl::prepare_validate_inputs(
+    const ForwardInput& input,
+    ForwardInput& validate_input,
+    bool stage_sampling_on_host,
+    const SpeculativePreparedHostInputWorkspace* fixed_host_workspace,
+    specBuilder::DecodeBuildWorkspace* decode_build_workspace) {
   c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
-  ForwardInput prepared_input = input;
-  prepared_input.metadata_ready_event.reset();
-  SpeculativeWorkerImpl::prepare_validate_inputs(prepared_input,
-                                                 validate_input);
+  SpeculativeWorkerImpl::prepare_validate_inputs(input,
+                                                 validate_input,
+                                                 stage_sampling_on_host,
+                                                 fixed_host_workspace,
+                                                 decode_build_workspace);
+  validate_input.metadata_ready_event.reset();
   validate_input.input_params.embedding.input_embedding = torch::Tensor();
   record_metadata_ready_event(*prepare_stream_, validate_input);
 }
 
-void DFlashWorkerImpl::prepare_query_inputs(const ForwardInput& input,
-                                            ForwardInput& query_input) {
+void DFlashWorkerImpl::prepare_query_inputs(
+    const ForwardInput& input,
+    ForwardInput& query_input,
+    bool stage_sampling_on_host,
+    const SpeculativePreparedHostInputWorkspace* fixed_host_workspace,
+    specBuilder::DecodeBuildWorkspace* decode_build_workspace) {
+  CHECK(fixed_host_workspace == nullptr || stage_sampling_on_host)
+      << "Fixed DFlash Host workspace requires Host staging";
   c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
   query_input = input;
   query_input.device_tensors_ready = false;
@@ -1246,8 +2696,13 @@ void DFlashWorkerImpl::prepare_query_inputs(const ForwardInput& input,
   input_params.embedding.input_embedding = torch::Tensor();
   dflash_detail::invalidate_draft_model_geometry(input_params);
 
-  specBuilder::DecodeBuildBuffers buf;
-  std::vector<int32_t> selected_idxes;
+  specBuilder::DecodeBuildWorkspace local_build_workspace;
+  specBuilder::DecodeBuildWorkspace& build_workspace =
+      decode_build_workspace == nullptr ? local_build_workspace
+                                        : *decode_build_workspace;
+  specBuilder::reset_decode_build_workspace(build_workspace);
+  specBuilder::DecodeBuildBuffers& buf = build_workspace.buffers;
+  std::vector<int32_t>& selected_idxes = build_workspace.selected_indices;
   const bool use_block_parallel_rows = draft_use_block_parallel_rows();
   build_query_rows(input,
                    mask_token_id_,
@@ -1269,11 +2724,26 @@ void DFlashWorkerImpl::prepare_query_inputs(const ForwardInput& input,
       << "DFlash per-seq row count must be uniform (query_width=" << query_width
       << ", num_sequences=" << num_sequences_query << ")";
 
-  specBuilder::set_token_position_tensors(query_input,
-                                          buf.out_token_ids,
-                                          buf.out_positions,
-                                          input.token_ids.options(),
-                                          input.positions.options());
+  torch::TensorOptions token_options = input.token_ids.options();
+  torch::TensorOptions position_options = input.positions.options();
+  if (stage_sampling_on_host) {
+    token_options = token_options.device(torch::kCPU);
+    position_options = position_options.device(torch::kCPU);
+  }
+  if (fixed_host_workspace == nullptr) {
+    specBuilder::set_token_position_tensors(query_input,
+                                            buf.out_token_ids,
+                                            buf.out_positions,
+                                            token_options,
+                                            position_options);
+  } else {
+    query_input.token_ids_host = specBuilder::copy_cpu_int_values_out(
+        buf.out_token_ids, fixed_host_workspace->token_ids);
+    query_input.positions_host = specBuilder::copy_cpu_int_values_out(
+        buf.out_positions, fixed_host_workspace->positions);
+    query_input.token_ids = query_input.token_ids_host;
+    query_input.positions = query_input.positions_host;
+  }
   input_params.meta.batch_forward_type = draft_batch_forward_type();
   if (use_block_parallel_rows) {
     expand_block_parallel_sequence_rows(input_params, query_width);
@@ -1287,25 +2757,54 @@ void DFlashWorkerImpl::prepare_query_inputs(const ForwardInput& input,
                                    std::move(buf.out_kv_seq_lens),
                                    /*update_block_tables=*/
                                    use_block_parallel_rows);
+  build_workspace.owns_kv_seq_lens = true;
+  build_workspace.owns_q_seq_lens = true;
+  build_workspace.owns_q_cu_seq_lens = true;
   scale_speculative_parallel_token_counts(input_params, query_width);
-  input_params.attention.rebuild_device_buffer(device_);
+  if (!stage_sampling_on_host) {
+    input_params.attention.rebuild_device_buffer(device_);
+  }
 
   torch::TensorOptions idx_options =
-      torch::TensorOptions().dtype(torch::kInt).device(device_);
-  // Pinned-host + async H2D on prepare_stream_ (the file's idiom), so the copy
-  // overlaps instead of a blocking non-pinned transfer every decode step.
-  query_input.sampling_params.selected_token_idxes =
-      safe_to(specBuilder::make_cpu_int_tensor(selected_idxes),
-              idx_options,
-              /*non_blocking=*/true);
-  query_input.sampling_params.sample_idxes =
-      torch::arange(static_cast<int64_t>(selected_idxes.size()), idx_options);
+      torch::TensorOptions()
+          .dtype(torch::kInt)
+          .device(stage_sampling_on_host ? torch::Device(torch::kCPU)
+                                         : device_.unwrap());
+  // Prepared keeps controls on Host for the fixed Arena's direct H2D. Legacy
+  // retains the existing asynchronous upload on the prepare stream.
+  if (fixed_host_workspace == nullptr) {
+    torch::Tensor selected_token_idxes =
+        specBuilder::make_cpu_int_tensor(selected_idxes);
+    query_input.sampling_params.selected_token_idxes =
+        stage_sampling_on_host ? selected_token_idxes
+                               : safe_to(selected_token_idxes,
+                                         idx_options,
+                                         /*non_blocking=*/true);
+    query_input.sampling_params.sample_idxes =
+        torch::arange(static_cast<int64_t>(selected_idxes.size()), idx_options);
+  } else {
+    query_input.sampling_params.selected_token_idxes =
+        specBuilder::copy_cpu_int_values_out(
+            selected_idxes, fixed_host_workspace->selected_token_idxes);
+    query_input.sampling_params.sample_idxes =
+        specBuilder::fill_cpu_int_range_out(
+            /*start=*/0,
+            /*step=*/1,
+            static_cast<int64_t>(selected_idxes.size()),
+            fixed_host_workspace->sample_idxes);
+  }
   // Force the draft sampler to emit selected-token probabilities even on the
   // greedy path (temperature=0); the rejection sampler needs them to verify
   // the block. Without this the greedy sampler skips probs entirely.
   query_input.sampling_params.return_probs = true;
   repeat_sampling_params(query_input.sampling_params,
-                         options_.num_speculative_tokens());
+                         options_.num_speculative_tokens(),
+                         fixed_host_workspace == nullptr
+                             ? torch::Tensor()
+                             : fixed_host_workspace->do_sample,
+                         fixed_host_workspace == nullptr
+                             ? torch::Tensor()
+                             : fixed_host_workspace->repeated_sampling_storage);
   query_input.device_tensors_ready = true;
 }
 
@@ -1313,15 +2812,15 @@ void DFlashWorkerImpl::write_context_kv(
     const ForwardInput& input,
     const torch::Tensor& context_hidden,
     const torch::Tensor& positions_device,
-    const torch::Tensor& new_cache_slots_device) {
-  CHECK(context_hidden.defined()) << "DFlash context hidden is undefined.";
-  CHECK_EQ(context_hidden.dim(), 2) << "DFlash context hidden must be 2D.";
-  CHECK_EQ(context_hidden.size(1), expected_context_hidden_size_)
-      << "DFlash context hidden size must be hidden_size * "
-      << "target_layer_ids.size().";
-
-  CHECK(context_hidden.device() == device_.unwrap())
-      << "DFlash context hidden must already be on the compute device.";
+    const torch::Tensor& new_cache_slots_device,
+    bool synchronize_completion) {
+  dflash_detail::check_context_kv_write_tensor_contract(
+      context_hidden,
+      positions_device,
+      new_cache_slots_device,
+      device_.unwrap(),
+      expected_context_hidden_size_,
+      dtype_);
 
   // Both the target forward that produced context_hidden and this pass run
   // on compute_stream_, so no explicit event dance is needed — the stream
@@ -1338,6 +2837,8 @@ void DFlashWorkerImpl::write_context_kv(
   KVTransferCompletion kv_transfers;
   if (options_.kv_cache_transfer_mode() == "PUSH" &&
       !input.transfer_kv_infos.empty()) {
+    CHECK(synchronize_completion)
+        << "Prepared DFlash does not support asynchronous PD-PUSH";
     std::shared_ptr<NPULayerSynchronizerImpl> layer_synchronizer =
         std::make_shared<NPULayerSynchronizerImpl>(
             draft_impl_->context_.get_model_args().n_layers());
@@ -1365,18 +2866,21 @@ void DFlashWorkerImpl::write_context_kv(
       << "DFlash context-KV scatter failed (layer_synchronizer record_event "
          "returned false); PD-PUSH transfer would deadlock.";
 
-  // The context-KV scatter is the last device op of the step and is launched
-  // no-sync. Under schedule-overlap the scheduler dispatches the next step's
-  // host prep as soon as this step's host call returns, while this scatter may
-  // still be in flight. Sync so the next step's draft query reads a fully
-  // written context-KV cache instead of a partially scattered one.
-  compute_stream_->synchronize();
+  // Legacy execution returns directly to the scheduler and therefore waits
+  // here before the next step may read the draft cache. Prepared execution
+  // records its Slot completion Event after this scatter and waits only at
+  // Consume/reuse, keeping the launch path free of a Host synchronization.
+  if (synchronize_completion) {
+    compute_stream_->synchronize();
+  }
 
 #if defined(USE_NPU)
   // Wait for the draft KV push (if any) so the source draft cache is not
   // overwritten by the next step while the transfer is still reading it
   // (mirrors step_internal's wait_kv_push()). No-op when no push was issued.
-  CHECK(kv_transfers.wait()) << "DFlash draft context-KV push failed";
+  if (synchronize_completion) {
+    CHECK(kv_transfers.wait()) << "DFlash draft context-KV push failed";
+  }
 #endif
 }
 

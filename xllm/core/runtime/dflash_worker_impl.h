@@ -19,16 +19,20 @@ limitations under the License.
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
 #include "core/framework/speculative/embedding_cache.h"
 #include "framework/kv_cache_transfer/kv_cache_transfer.h"
 #include "framework/model/model_args.h"
+#include "runtime/prepared_task/dspark_prepared_sampling.h"
 #include "runtime/speculative_worker_impl.h"
 #include "util/utils.h"
 
 namespace xllm {
+
+class BlockSpecPreparedTaskBackend;
 
 namespace dflash_detail {
 
@@ -37,6 +41,33 @@ inline int32_t decode_draft_width(int32_t num_speculative_tokens,
   return sample_from_anchor ? num_speculative_tokens
                             : num_speculative_tokens + 1;
 }
+
+struct PreparedDecodeCacheSlotViews {
+  torch::Tensor query;
+  torch::Tensor target;
+};
+
+PreparedDecodeCacheSlotViews view_prepared_decode_cache_slots(
+    const torch::Tensor& query_cache_slots,
+    const torch::Tensor& target_cache_slots,
+    int64_t batch_size,
+    int32_t num_speculative_tokens,
+    bool sample_from_anchor);
+
+void check_fixed_prepared_output_binding(const torch::Tensor& actual,
+                                         const torch::Tensor& fixed_storage,
+                                         const torch::Device& expected_device,
+                                         torch::ScalarType expected_dtype,
+                                         int64_t expected_numel,
+                                         std::string_view tensor_name);
+
+void check_context_kv_write_tensor_contract(
+    const torch::Tensor& context_hidden,
+    const torch::Tensor& positions,
+    const torch::Tensor& cache_slots,
+    const torch::Device& expected_device,
+    int64_t expected_hidden_size,
+    torch::ScalarType expected_hidden_dtype);
 
 inline void invalidate_draft_model_geometry(ModelInputParams& input_params) {
   // Attention metadata is model-owned: DeepSeek-V4 bakes DSA group layout and
@@ -86,6 +117,10 @@ class DFlashWorkerImpl : public SpeculativeWorkerImpl {
 
   ForwardInput update_input_by_last_step_output(ForwardInput& inputs) override;
 
+  std::unique_ptr<BlockSpecPreparedTaskBackend> create_prepared_task_backend(
+      uint64_t input_arena_capacity_bytes,
+      int32_t slot_count);
+
  protected:
   std::optional<ForwardOutput> step_prefill(const ForwardInput& input) override;
 
@@ -123,10 +158,35 @@ class DFlashWorkerImpl : public SpeculativeWorkerImpl {
   // Shared with subclasses (DSpark): build the N/N+1-wide draft query block and
   // the target validate input. A DSpark override of run_decode_draft calls both
   // before its draft forward.
-  void prepare_query_inputs(const ForwardInput& input,
-                            ForwardInput& query_input);
-  void prepare_validate_inputs(const ForwardInput& input,
-                               ForwardInput& validate_input);
+  void prepare_query_inputs(
+      const ForwardInput& input,
+      ForwardInput& query_input,
+      bool stage_sampling_on_host = false,
+      const SpeculativePreparedHostInputWorkspace* fixed_host_workspace =
+          nullptr,
+      specBuilder::DecodeBuildWorkspace* decode_build_workspace = nullptr);
+  void prepare_validate_inputs(
+      const ForwardInput& input,
+      ForwardInput& validate_input,
+      bool stage_sampling_on_host = false,
+      const SpeculativePreparedHostInputWorkspace* fixed_host_workspace =
+          nullptr,
+      specBuilder::DecodeBuildWorkspace* decode_build_workspace = nullptr);
+
+  virtual int64_t prepared_dspark_markov_rank() const;
+  virtual int64_t prepared_dspark_vocab_size() const;
+  virtual void launch_prepared_dspark_markov_sample(
+      const torch::Tensor& base_logits,
+      const torch::Tensor& anchor_token_ids,
+      const SamplingParameters& sampling_params,
+      int64_t row_count,
+      int32_t block_step,
+      dspark_detail::PreparedSamplingWorkspace& workspace) const;
+  virtual void launch_prepared_dspark_token_broadcast(
+      const SamplingParameters& sampling_params,
+      int64_t row_count,
+      int32_t block_step,
+      dspark_detail::PreparedSamplingWorkspace& workspace) const;
 
  private:
   bool draft_use_block_parallel_rows() const {
@@ -210,12 +270,15 @@ class DFlashWorkerImpl : public SpeculativeWorkerImpl {
 
   void update_decode_step_input(
       ForwardInput& input,
-      const std::vector<EmbeddingCache::DecodeState>& last_states) const;
+      const std::vector<EmbeddingCache::DecodeState>& last_states,
+      const SpeculativePreparedHostInputWorkspace* fixed_host_workspace =
+          nullptr) const;
 
   void write_context_kv(const ForwardInput& input,
                         const torch::Tensor& context_hidden,
                         const torch::Tensor& positions_device,
-                        const torch::Tensor& new_cache_slots_device);
+                        const torch::Tensor& new_cache_slots_device,
+                        bool synchronize_completion = true);
 
   void write_target_context_to_cache(const ForwardInput& input,
                                      const SampleOutput& validate_output);
@@ -230,6 +293,9 @@ class DFlashWorkerImpl : public SpeculativeWorkerImpl {
   int64_t expected_context_hidden_size_ = 0;
   dflash_detail::DSparkSasMode draft_sas_mode_ =
       dflash_detail::DSparkSasMode::NOT_DSPARK;
+
+ private:
+  class PreparedTaskBackend;
 };
 
 }  // namespace xllm

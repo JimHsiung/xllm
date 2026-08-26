@@ -103,6 +103,9 @@ inline void deepseek_v4_clamp_multi_block_tables(
   if (input_params.multi_block_tables.size() > registered_group_count) {
     input_params.multi_block_tables.resize(registered_group_count);
   }
+  if (input_params.device_multi_block_tables.size() > registered_group_count) {
+    input_params.device_multi_block_tables.resize(registered_group_count);
+  }
 }
 
 inline size_t deepseek_v4_align_up(size_t value, size_t alignment) {
@@ -367,11 +370,9 @@ inline void deepseek_v4_build_cache_specs(
   };
 
   register_group(DSACacheType::SLIDING_WINDOW, 1, window_size);
-  for (const int32_t ratio : compress_ratios) {
-    const int32_t cr = deepseek_v4_normalize_compress_ratio(ratio);
-    if (cr == 4 || cr == 128) {
-      register_group(DSACacheType::TOKEN, cr, base_block_size);
-    }
+  for (const int32_t ratio :
+       canonical_dsa_token_manager_ratios(compress_ratios)) {
+    register_group(DSACacheType::TOKEN, ratio, base_block_size);
   }
 
   caches_info.resize(model_args.n_layers());
@@ -543,15 +544,12 @@ class DeepseekV4ModelImpl
       return gid;
     };
 
-    // Keep DSA group ids consistent with BlockManagerPool manager order:
-    // 1) sliding-window manager first
-    // 2) token managers in first-seen compress_ratio order
+    // Keep DSA group ids consistent with the fixed multi-block export order:
+    // SWA, then the C4/C128 roles that are present in the model.
     register_group(DSACacheType::SLIDING_WINDOW, 1, window_size);
-    for (const auto ratio : compress_ratios) {
-      const int32_t cr = deepseek_v4_normalize_compress_ratio(ratio);
-      if (cr == 4 || cr == 128) {
-        register_group(DSACacheType::TOKEN, cr, base_block_size);
-      }
+    for (const int32_t ratio :
+         canonical_dsa_token_manager_ratios(compress_ratios)) {
+      register_group(DSACacheType::TOKEN, ratio, base_block_size);
     }
 
     caches_info_.resize(model_args.n_layers());
@@ -722,8 +720,15 @@ class DeepseekV4ModelImpl
       if (dsa_hadamard_.defined()) {
         dsa.hadamard = dsa_hadamard_;
       }
-      copy_to_graph_packed_metadata_buffer(
-          dsa, deepseek_v4_state->dsa_metadata_persistent, positions.device());
+      if (modified_input_params.dsa_device_geometry_authoritative) {
+        layer::DSAMetadataBuilder::patch_device_geometry(
+            modified_input_params, group_infos_, dsa);
+      } else {
+        copy_to_graph_packed_metadata_buffer(
+            dsa,
+            deepseek_v4_state->dsa_metadata_persistent,
+            positions.device());
+      }
       prepare_dsa_metadata_for_forward(*attn_metadata,
                                        positions.device(),
                                        /*pack_metadata=*/false,
@@ -809,24 +814,50 @@ class DeepseekV4ModelImpl
       const bool metadata_prepared =
           dsa.c1_metadata.defined() && dsa.c4_metadata.defined() &&
           dsa.c128_metadata.defined() && dsa.qli_metadata.defined();
+      const bool authoritative_graph_metadata_ready =
+          acl_graph_forward &&
+          modified_input_params.dsa_device_geometry_authoritative &&
+          dsa.device_geometry_authoritative && dsa.start_pos.defined();
       const bool graph_metadata_ready = acl_graph_forward &&
-                                        dsa.packed_metadata_buffer.defined() &&
-                                        dsa.start_pos.defined();
+                                        dsa.start_pos.defined() &&
+                                        (dsa.packed_metadata_buffer.defined() ||
+                                         authoritative_graph_metadata_ready);
 
       if (metadata_prepared || graph_metadata_ready) {
+        if (authoritative_graph_metadata_ready) {
+          CHECK(modified_input_params.dsa_device_geometry_workspace != nullptr)
+              << "Prepared DSA Graph requires fixed Device geometry";
+          // These out/in-place updates are captured with the model and replay
+          // against the same Slot-local workspace addresses. Draft/continuation
+          // patches update the Arena-backed lengths and manager tables before
+          // graph launch on the same task stream.
+          layer::DSAMetadataBuilder::patch_device_geometry(
+              modified_input_params, group_infos_, dsa);
+        }
         prepare_forward_dsa_runtime_metadata(
-            dsa, modified_input_params, acl_graph_forward, input_rope_by_ratio);
+            dsa,
+            modified_input_params,
+            acl_graph_forward || authoritative_graph_metadata_ready,
+            input_rope_by_ratio);
       } else {
         CHECK(!acl_graph_forward)
             << "DeepSeek V4 ACL graph requires prebuilt DSA metadata";
         if (dsa_hadamard_.defined()) {
           dsa.hadamard = dsa_hadamard_;
         }
+        layer::DSAMetadataBuilder::patch_device_geometry(
+            modified_input_params, group_infos_, dsa);
         deepseek_v4_pack_dsa_metadata_to_device(dsa, runtime_device);
 
         if (dsa.actual_seq_lengths_kv.defined() && dsa.seq_lens_q.defined()) {
-          dsa.start_pos =
-              (dsa.actual_seq_lengths_kv - dsa.seq_lens_q).to(torch::kInt32);
+          if (modified_input_params.dsa_device_geometry_authoritative) {
+            CHECK(dsa.start_pos.defined())
+                << "Prepared DSA start_pos is missing from fixed Device "
+                   "geometry";
+          } else {
+            dsa.start_pos =
+                (dsa.actual_seq_lengths_kv - dsa.seq_lens_q).to(torch::kInt32);
+          }
         }
         prepare_forward_dsa_runtime_metadata(dsa,
                                              modified_input_params,
@@ -1249,6 +1280,12 @@ class DeepseekV4ModelImpl
     auto& dsa = *metadata->dsa_metadata;
     auto& persistent = state.dsa_metadata_persistent;
 
+    if (dsa.device_geometry_authoritative) {
+      CHECK(dsa.start_pos.defined())
+          << "Prepared DSA Graph requires fixed start_pos storage";
+      return metadata;
+    }
+
     dsa.attn_mask =
         copy_to_persistent_tensor(dsa.attn_mask, persistent.attn_mask);
     dsa.start_pos =
@@ -1616,8 +1653,13 @@ class DeepseekV4ModelImpl
     }
 
     if (dsa.actual_seq_lengths_kv.defined() && dsa.seq_lens_q.defined()) {
-      dsa.start_pos =
-          (dsa.actual_seq_lengths_kv - dsa.seq_lens_q).to(torch::kInt32);
+      if (dsa.device_geometry_authoritative) {
+        CHECK(dsa.start_pos.defined())
+            << "Prepared DSA start_pos is missing from fixed Device geometry";
+      } else {
+        dsa.start_pos =
+            (dsa.actual_seq_lengths_kv - dsa.seq_lens_q).to(torch::kInt32);
+      }
     }
   }
 
@@ -1700,11 +1742,13 @@ class DeepseekV4ModelImpl
     const int64_t batch_size =
         std::max<int64_t>(dsa.actual_seq_lengths_kv.size(0), 1);
     const int64_t max_seqlen_q =
-        std::max<int64_t>(params.meta.q_max_seq_len,
-                          vector_max_or_zero(params.attention.host.q_seq_lens));
+        std::max<int64_t>({params.meta.q_max_seq_len,
+                           vector_max_or_zero(params.attention.host.q_seq_lens),
+                           dsa.max_query_len});
     const int64_t max_seqlen_kv = std::max<int64_t>(
-        params.meta.kv_max_seq_len,
-        vector_max_or_zero(params.attention.host.kv_seq_lens));
+        {params.meta.kv_max_seq_len,
+         vector_max_or_zero(params.attention.host.kv_seq_lens),
+         dsa.max_seq_len});
     // Keep the opaque tiling metadata identical to the arguments passed by
     // DSAttentionImpl::forward. Native DSpark SAS expands the window and uses
     // explicit indices; the compatibility fallback keeps the DSV4 window and
@@ -1840,11 +1884,13 @@ class DeepseekV4ModelImpl
     const int64_t index_head_dim =
         std::max<int64_t>(index_head_dim_ > 0 ? index_head_dim_ : head_dim_, 1);
     const int64_t qli_max_seqlen_q =
-        std::max<int64_t>(params.meta.q_max_seq_len,
-                          vector_max_or_zero(params.attention.host.q_seq_lens));
+        std::max<int64_t>({params.meta.q_max_seq_len,
+                           vector_max_or_zero(params.attention.host.q_seq_lens),
+                           dsa.max_query_len});
     const int64_t qli_max_seqlen_k = std::max<int64_t>(
-        params.meta.kv_max_seq_len,
-        vector_max_or_zero(params.attention.host.kv_seq_lens));
+        {params.meta.kv_max_seq_len,
+         vector_max_or_zero(params.attention.host.kv_seq_lens),
+         dsa.max_seq_len});
 
     xllm::kernel::QuantLightningIndexerMetadataParams qli_params;
     qli_params.num_heads_q = global_index_num_heads;
@@ -2090,8 +2136,10 @@ inline void load_deepseek_v4_model_args(const JsonReader& json,
       json.value_or<std::vector<int32_t>>("dspark_target_layer_ids",
                                           std::vector<int32_t>{})
           .size());
-  // Don't arm dspark_block_size on the shared target (enables non-causal DSpark
-  // attention there); the draft worker sets it from the checkpoint.
+  // Decode the checkpoint value here so the draft worker does not need to
+  // reopen config.json. WorkerImpl clears it on the shared target and applies
+  // any --num_speculative_tokens override only on the DSpark draft.
+  LOAD_ARG_OR(dspark_block_size, "dspark_block_size", 0);
 
   // Token ids
   LOAD_ARG_OR(bos_token_id, "bos_token_id", 0);

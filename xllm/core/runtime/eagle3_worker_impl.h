@@ -43,6 +43,9 @@ class Eagle3WorkerImpl : public MTPWorkerImpl {
   // EAGLE-3 specific draft output post-processing during decode:
   // selected prob extraction + draft->target token id mapping.
   void process_draft_sample_output(SampleOutput& sample_output) override;
+  void process_prepared_draft_sample_output(
+      SampleOutput& sample_output,
+      torch::Tensor fixed_token_ids) override;
 
   // EAGLE-3 specific: hot_token_id for draft-to-target token mapping
   // hot_token_id = d2t + arange(d2t.size(0))

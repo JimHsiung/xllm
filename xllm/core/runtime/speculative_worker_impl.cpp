@@ -16,6 +16,8 @@ limitations under the License.
 #include "speculative_worker_impl.h"
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
@@ -49,6 +51,73 @@ int64_t get_dp_local_tp_size(const ParallelArgs& parallel_args) {
   const int64_t dp_size = std::max<int64_t>(parallel_args.dp_size(), 1);
   const int64_t cp_size = std::max<int64_t>(parallel_args.cp_size(), 1);
   return std::max<int64_t>(parallel_args.world_size() / dp_size / cp_size, 1);
+}
+
+int64_t align_sampling_workspace_offset(int64_t offset, int64_t alignment) {
+  CHECK_GE(offset, 0);
+  CHECK_GT(alignment, 0);
+  const int64_t remainder = offset % alignment;
+  return remainder == 0 ? offset : offset + alignment - remainder;
+}
+
+void repeat_sampling_tensor_out(torch::Tensor& tensor,
+                                int32_t repeats,
+                                const torch::Tensor& destination_storage,
+                                int64_t& storage_offset) {
+  if (!tensor.defined()) {
+    return;
+  }
+  CHECK_GT(repeats, 0);
+  CHECK(tensor.device().is_cpu())
+      << "Prepared sampling metadata source must remain on Host";
+  CHECK(tensor.is_contiguous())
+      << "Prepared sampling metadata source must be contiguous";
+  CHECK_GT(tensor.dim(), 0)
+      << "Prepared sampling metadata must have a row dimension";
+
+  const int64_t element_size = static_cast<int64_t>(tensor.element_size());
+  storage_offset =
+      align_sampling_workspace_offset(storage_offset, element_size);
+  const int64_t source_bytes = static_cast<int64_t>(tensor.nbytes());
+  const int64_t destination_bytes = source_bytes * repeats;
+  CHECK_LE(destination_bytes, destination_storage.numel() - storage_offset)
+      << "Prepared repeated sampling metadata exceeds fixed Host workspace: "
+      << "required_bytes=" << destination_bytes
+      << ", remaining_bytes=" << destination_storage.numel() - storage_offset;
+
+  CHECK_LE(tensor.dim(), 2)
+      << "Prepared sampling metadata supports one- or two-dimensional "
+         "tensors";
+  std::array<int64_t, 2> output_sizes = {
+      tensor.size(/*dim=*/0) * repeats,
+      tensor.dim() == 2 ? tensor.size(/*dim=*/1) : 0};
+  torch::Tensor destination =
+      destination_storage
+          .narrow(/*dim=*/0,
+                  /*start=*/storage_offset,
+                  /*length=*/destination_bytes)
+          .view(tensor.scalar_type())
+          .view(torch::IntArrayRef(output_sizes.data(),
+                                   static_cast<size_t>(tensor.dim())));
+
+  const int64_t source_rows = tensor.size(0);
+  CHECK_GT(source_rows, 0)
+      << "Prepared sampling metadata cannot repeat an empty row dimension";
+  const int64_t row_bytes = source_bytes / source_rows;
+  CHECK_EQ(row_bytes * source_rows, source_bytes);
+  if (row_bytes > 0) {
+    const uint8_t* source = static_cast<const uint8_t*>(tensor.data_ptr());
+    uint8_t* output = static_cast<uint8_t*>(destination.data_ptr());
+    for (int64_t row = 0; row < source_rows; ++row) {
+      for (int32_t repeat = 0; repeat < repeats; ++repeat) {
+        std::memcpy(output + (row * repeats + repeat) * row_bytes,
+                    source + row * row_bytes,
+                    static_cast<size_t>(row_bytes));
+      }
+    }
+  }
+  tensor = destination;
+  storage_offset += destination_bytes;
 }
 
 KVCacheEstimateOptions make_kv_cache_estimate_options(
@@ -137,6 +206,59 @@ void scale_speculative_parallel_token_counts(ModelInputParams& params,
   }
   params.expert.eplb_decode_token_mask = eplb::expand_decode_token_mask(
       params.expert.eplb_decode_token_mask, multiplier);
+}
+
+void repeat_speculative_sampling_metadata_out(
+    SamplingParameters& sampling_params,
+    int32_t repeats,
+    const torch::Tensor& destination_storage) {
+  CHECK(destination_storage.defined())
+      << "Prepared repeated sampling metadata requires fixed Host storage";
+  CHECK(destination_storage.device().is_cpu());
+  CHECK_EQ(destination_storage.scalar_type(), torch::kUInt8);
+  CHECK(destination_storage.is_contiguous());
+
+  int64_t storage_offset = 0;
+  repeat_sampling_tensor_out(sampling_params.frequency_penalties,
+                             repeats,
+                             destination_storage,
+                             storage_offset);
+  repeat_sampling_tensor_out(sampling_params.presence_penalties,
+                             repeats,
+                             destination_storage,
+                             storage_offset);
+  repeat_sampling_tensor_out(sampling_params.repetition_penalties,
+                             repeats,
+                             destination_storage,
+                             storage_offset);
+  repeat_sampling_tensor_out(sampling_params.temperatures,
+                             repeats,
+                             destination_storage,
+                             storage_offset);
+  repeat_sampling_tensor_out(
+      sampling_params.top_p, repeats, destination_storage, storage_offset);
+  repeat_sampling_tensor_out(
+      sampling_params.top_k, repeats, destination_storage, storage_offset);
+  repeat_sampling_tensor_out(sampling_params.unique_token_ids,
+                             repeats,
+                             destination_storage,
+                             storage_offset);
+  repeat_sampling_tensor_out(sampling_params.unique_token_counts,
+                             repeats,
+                             destination_storage,
+                             storage_offset);
+  repeat_sampling_tensor_out(sampling_params.unique_token_ids_lens,
+                             repeats,
+                             destination_storage,
+                             storage_offset);
+  repeat_sampling_tensor_out(sampling_params.filter_mask,
+                             repeats,
+                             destination_storage,
+                             storage_offset);
+  repeat_sampling_tensor_out(sampling_params.filter_bitmask,
+                             repeats,
+                             destination_storage,
+                             storage_offset);
 }
 
 SpeculativeOutputStats calculate_speculative_output_stats(
@@ -333,30 +455,64 @@ ForwardInput SpeculativeWorkerImpl::update_input_by_last_step_output(
 void SpeculativeWorkerImpl::update_sampling_params(
     SamplingParameters& sampling_params,
     const int32_t num_val_tokens,
-    const int32_t total_num_val_tokens) {
-  std::vector<int32_t> selected_token_idxes_vec;
-  selected_token_idxes_vec.reserve(total_num_val_tokens);
-  for (int32_t i = 0; i < total_num_val_tokens; i++) {
-    selected_token_idxes_vec.emplace_back(i);
+    const int32_t total_num_val_tokens,
+    bool stage_controls_on_host,
+    const torch::Tensor& fixed_indices_host,
+    const torch::Tensor& fixed_do_sample_host,
+    const torch::Tensor& fixed_repeated_sampling_storage) {
+  CHECK((!fixed_indices_host.defined() && !fixed_do_sample_host.defined()) ||
+        stage_controls_on_host)
+      << "Fixed sampling controls require Host staging";
+  torch::Tensor selected_token_idxes;
+  if (fixed_indices_host.defined()) {
+    selected_token_idxes = specBuilder::fill_cpu_int_range_out(
+        /*start=*/0,
+        /*step=*/1,
+        total_num_val_tokens,
+        fixed_indices_host);
+  } else {
+    std::vector<int32_t> selected_token_idxes_vec;
+    selected_token_idxes_vec.reserve(total_num_val_tokens);
+    for (int32_t i = 0; i < total_num_val_tokens; ++i) {
+      selected_token_idxes_vec.emplace_back(i);
+    }
+    selected_token_idxes = torch::tensor(
+        selected_token_idxes_vec,
+        torch::TensorOptions().dtype(torch::kInt).device(torch::kCPU));
   }
-  torch::Tensor selected_token_idxes = torch::tensor(selected_token_idxes_vec);
 
   // sample_idxes equals to selected_token_idxes since only process decode batch
-  sampling_params.selected_token_idxes = selected_token_idxes.to(device_);
-  sampling_params.sample_idxes = selected_token_idxes.to(device_);
+  sampling_params.selected_token_idxes = stage_controls_on_host
+                                             ? selected_token_idxes
+                                             : selected_token_idxes.to(device_);
+  sampling_params.sample_idxes = sampling_params.selected_token_idxes;
 
-  TENSOR_REPEAT(sampling_params.frequency_penalties, num_val_tokens);
-  TENSOR_REPEAT(sampling_params.presence_penalties, num_val_tokens);
-  TENSOR_REPEAT(sampling_params.repetition_penalties, num_val_tokens);
-  TENSOR_REPEAT(sampling_params.temperatures, num_val_tokens);
-  TENSOR_REPEAT(sampling_params.top_p, num_val_tokens);
-  TENSOR_REPEAT(sampling_params.top_k, num_val_tokens);
-  TENSOR_REPEAT(sampling_params.unique_token_ids, num_val_tokens);
-  TENSOR_REPEAT(sampling_params.unique_token_counts, num_val_tokens);
-  TENSOR_REPEAT(sampling_params.unique_token_ids_lens, num_val_tokens);
-  TENSOR_REPEAT(sampling_params.do_sample, num_val_tokens);
-  TENSOR_REPEAT(sampling_params.filter_mask, num_val_tokens);
-  TENSOR_REPEAT(sampling_params.filter_bitmask, num_val_tokens);
+  if (fixed_repeated_sampling_storage.defined()) {
+    CHECK(stage_controls_on_host)
+        << "Fixed repeated sampling metadata requires Host staging";
+    repeat_speculative_sampling_metadata_out(
+        sampling_params, num_val_tokens, fixed_repeated_sampling_storage);
+  } else {
+    TENSOR_REPEAT(sampling_params.frequency_penalties, num_val_tokens);
+    TENSOR_REPEAT(sampling_params.presence_penalties, num_val_tokens);
+    TENSOR_REPEAT(sampling_params.repetition_penalties, num_val_tokens);
+    TENSOR_REPEAT(sampling_params.temperatures, num_val_tokens);
+    TENSOR_REPEAT(sampling_params.top_p, num_val_tokens);
+    TENSOR_REPEAT(sampling_params.top_k, num_val_tokens);
+    TENSOR_REPEAT(sampling_params.unique_token_ids, num_val_tokens);
+    TENSOR_REPEAT(sampling_params.unique_token_counts, num_val_tokens);
+    TENSOR_REPEAT(sampling_params.unique_token_ids_lens, num_val_tokens);
+    TENSOR_REPEAT(sampling_params.filter_mask, num_val_tokens);
+    TENSOR_REPEAT(sampling_params.filter_bitmask, num_val_tokens);
+  }
+  if (fixed_do_sample_host.defined()) {
+    CHECK(sampling_params.all_greedy_sample)
+        << "Fixed zero do_sample staging requires greedy sampling";
+    sampling_params.do_sample = specBuilder::fill_cpu_bool_out(
+        /*value=*/false, total_num_val_tokens, fixed_do_sample_host);
+  } else {
+    TENSOR_REPEAT(sampling_params.do_sample, num_val_tokens);
+  }
 }
 
 void SpeculativeWorkerImpl::update_sampling_params(
@@ -399,12 +555,21 @@ void SpeculativeWorkerImpl::update_sampling_params(
 
 void SpeculativeWorkerImpl::prepare_validate_inputs(
     const ForwardInput& input,
-    ForwardInput& validate_input) {
-  validate_input = input.to(device_, dtype_);
+    ForwardInput& validate_input,
+    bool stage_sampling_on_host,
+    const SpeculativePreparedHostInputWorkspace* fixed_host_workspace,
+    specBuilder::DecodeBuildWorkspace* decode_build_workspace) {
+  CHECK(fixed_host_workspace == nullptr || stage_sampling_on_host)
+      << "Fixed speculative Host workspace requires Host staging";
+  validate_input = stage_sampling_on_host ? input : input.to(device_, dtype_);
   validate_input.device_tensors_ready = false;
   auto& input_params = validate_input.input_params;
   torch::TensorOptions token_options = validate_input.token_ids.options();
   torch::TensorOptions position_options = validate_input.positions.options();
+  if (stage_sampling_on_host) {
+    token_options = token_options.device(torch::kCPU);
+    position_options = position_options.device(torch::kCPU);
+  }
 
   const int32_t num_speculative_tokens = options_.num_speculative_tokens();
   const int32_t num_sequences = input_params.meta.num_sequences;
@@ -417,11 +582,18 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
   Slice<int32_t> token_ids = tensor_slice(input.token_ids_host);
   Slice<int32_t> positions = tensor_slice(input.positions_host);
   Slice<int32_t> kv_seq_lens = input.input_params.attention.host.kv_seq_lens;
-  specBuilder::DecodeBuildBuffers buf;
+  specBuilder::DecodeBuildWorkspace local_build_workspace;
+  specBuilder::DecodeBuildWorkspace& build_workspace =
+      decode_build_workspace == nullptr ? local_build_workspace
+                                        : *decode_build_workspace;
+  specBuilder::reset_decode_build_workspace(build_workspace);
+  specBuilder::DecodeBuildBuffers& buf = build_workspace.buffers;
   buf.out_token_ids.reserve(total_num_val_tokens);
   buf.out_positions.reserve(total_num_val_tokens);
   buf.out_new_cache_slots.reserve(total_num_val_tokens);
-  if (!::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel()) {
+  const bool use_atb_spec_kernel =
+      ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
+  if (!use_atb_spec_kernel) {
     buf.out_kv_seq_lens.reserve(total_num_val_tokens);
     buf.out_q_seq_lens.reserve(total_num_val_tokens);
     buf.out_q_cu_seq_lens.reserve(total_num_val_tokens);
@@ -429,9 +601,12 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
                                  row_ctx.block_table_stride);
   }
 
-  std::vector<int32_t> atb_kv_seq_lens_vec = {};
-  std::vector<int32_t> atb_q_seq_lens_vec = {};
-  std::vector<int32_t> atb_q_cu_seq_lens_vec = {};
+  std::vector<int32_t>& atb_kv_seq_lens_vec =
+      build_workspace.auxiliary_kv_seq_lens;
+  std::vector<int32_t>& atb_q_seq_lens_vec =
+      build_workspace.auxiliary_q_seq_lens;
+  std::vector<int32_t>& atb_q_cu_seq_lens_vec =
+      build_workspace.auxiliary_q_cu_seq_lens;
   int32_t atb_kv_max_seq_len = 0;
   for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
     int32_t start_position = positions[seq_id];
@@ -450,16 +625,13 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
         row.token_id = -val_idx;
       }
       row.position_offset = val_idx;
-      row.append_kv_len =
-          !::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
-      row.append_q_len_one =
-          !::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
-      row.append_block_table =
-          !::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
+      row.append_kv_len = !use_atb_spec_kernel;
+      row.append_q_len_one = !use_atb_spec_kernel;
+      row.append_block_table = !use_atb_spec_kernel;
       specBuilder::append_decode_row(row_ctx, row, block_size, buf);
     }
 
-    if (::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel()) {
+    if (use_atb_spec_kernel) {
       const int32_t kv_len_after_validation = kv_len + num_speculative_tokens;
       specBuilder::update_kv_seq_lens_and_max(
           atb_kv_seq_lens_vec, kv_len_after_validation, atb_kv_max_seq_len);
@@ -473,13 +645,22 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
   CHECK_EQ(buf.out_positions.size(), buf.out_token_ids.size())
       << "validate positions/tokens mismatch";
 
-  specBuilder::set_token_position_tensors(validate_input,
-                                          buf.out_token_ids,
-                                          buf.out_positions,
-                                          token_options,
-                                          position_options);
+  if (fixed_host_workspace == nullptr) {
+    specBuilder::set_token_position_tensors(validate_input,
+                                            buf.out_token_ids,
+                                            buf.out_positions,
+                                            token_options,
+                                            position_options);
+  } else {
+    validate_input.token_ids_host = specBuilder::copy_cpu_int_values_out(
+        buf.out_token_ids, fixed_host_workspace->token_ids);
+    validate_input.positions_host = specBuilder::copy_cpu_int_values_out(
+        buf.out_positions, fixed_host_workspace->positions);
+    validate_input.token_ids = validate_input.token_ids_host;
+    validate_input.positions = validate_input.positions_host;
+  }
   // update the input_params
-  if (!::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel()) {
+  if (!use_atb_spec_kernel) {
     input_params.meta.num_sequences = total_num_val_tokens;
     input_params.meta.q_max_seq_len = 1;
     input_params.meta.batch_forward_type = BatchForwardType::DECODE;
@@ -487,7 +668,13 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
     input_params.meta.q_max_seq_len = num_val_tokens;
     input_params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
   }
-  if (::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel()) {
+  build_workspace.owns_kv_seq_lens = true;
+  build_workspace.owns_q_seq_lens = true;
+  build_workspace.owns_q_cu_seq_lens = true;
+  build_workspace.uses_auxiliary_kv_seq_lens = use_atb_spec_kernel;
+  build_workspace.uses_auxiliary_q_seq_lens = use_atb_spec_kernel;
+  build_workspace.uses_auxiliary_q_cu_seq_lens = use_atb_spec_kernel;
+  if (use_atb_spec_kernel) {
     specBuilder::update_input_params(input_params,
                                      buf,
                                      num_val_tokens,
@@ -505,11 +692,24 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
                                      std::move(buf.out_kv_seq_lens),
                                      /*update_block_tables=*/true);
   }
-  input_params.attention.rebuild_device_buffer(device_);
+  if (!stage_sampling_on_host) {
+    input_params.attention.rebuild_device_buffer(device_);
+  }
 
   // update the sampling_params
-  update_sampling_params(
-      validate_input.sampling_params, num_val_tokens, total_num_val_tokens);
+  update_sampling_params(validate_input.sampling_params,
+                         num_val_tokens,
+                         total_num_val_tokens,
+                         stage_sampling_on_host,
+                         fixed_host_workspace == nullptr
+                             ? torch::Tensor()
+                             : fixed_host_workspace->selected_token_idxes,
+                         fixed_host_workspace == nullptr
+                             ? torch::Tensor()
+                             : fixed_host_workspace->do_sample,
+                         fixed_host_workspace == nullptr
+                             ? torch::Tensor()
+                             : fixed_host_workspace->repeated_sampling_storage);
 
   scale_speculative_parallel_token_counts(input_params, num_val_tokens);
   validate_input.device_tensors_ready = true;

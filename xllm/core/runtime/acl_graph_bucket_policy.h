@@ -63,4 +63,32 @@ inline bool is_acl_graph_decode_capture_allowed(uint32_t batch_size,
   return is_graph_warmup && batch_size <= max_local_batch_size;
 }
 
+inline constexpr uint64_t spec_verify_attention_plan_bucket_unchecked(
+    int64_t max_kv_seq_len,
+    int64_t block_size) {
+  const uint64_t block =
+      static_cast<uint64_t>((max_kv_seq_len + block_size - 1) / block_size);
+  const uint64_t is_block_endpoint = max_kv_seq_len % block_size == 0 ? 1 : 0;
+  return (block << 1) | is_block_endpoint;
+}
+
+// A Prepared speculative Task is staged before its predecessor finishes. The
+// Device continuation patch can advance every Target Verify KV length beyond
+// the Host template by at most `kv_seq_len_headroom`. Reusing the template's
+// paged-attention plan is safe only when that entire range stays inside one
+// conservative plan bucket.
+inline constexpr bool spec_verify_attention_plan_headroom_is_safe(
+    int64_t template_max_kv_seq_len,
+    int64_t kv_seq_len_headroom,
+    int64_t block_size) {
+  if (template_max_kv_seq_len <= 0 || kv_seq_len_headroom < 0 ||
+      block_size <= 0) {
+    return false;
+  }
+  return spec_verify_attention_plan_bucket_unchecked(template_max_kv_seq_len,
+                                                     block_size) ==
+         spec_verify_attention_plan_bucket_unchecked(
+             template_max_kv_seq_len + kv_seq_len_headroom, block_size);
+}
+
 }  // namespace xllm::npu

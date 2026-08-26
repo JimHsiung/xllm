@@ -265,6 +265,10 @@ class Sequence final {
   }
 
   bool is_graph_warmup() const { return sequence_params_.is_graph_warmup; }
+  int32_t graph_warmup_speculative_accepted_length() const {
+    return graph_warmup_speculative_accepted_length_;
+  }
+  void set_graph_warmup_speculative_accepted_length(int32_t accepted_length);
   // get input embedding
   torch::Tensor get_input_embedding() const { return input_embedding_; }
 
@@ -621,6 +625,10 @@ class Sequence final {
 
   // temporary PD handoff bootstrap hidden state for first MTP decode.
   torch::Tensor mtp_bootstrap_embedding_;
+
+  // Synthetic Graph warmup metadata. Real requests always retain length 1;
+  // hybrid MTP warmup enumerates every accepted-prefix Graph key variant.
+  int32_t graph_warmup_speculative_accepted_length_ = 1;
 
   // number of tokens in the sequence
   size_t num_tokens_ = 0;

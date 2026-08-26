@@ -116,6 +116,37 @@ void EmbeddingCache::write_mtp_bootstrap_context(
   tail = std::move(state);
 }
 
+void EmbeddingCache::prepare_graph_warmup_accepted_state(
+    int32_t embedding_id,
+    const std::string& request_id,
+    int32_t accepted_prefix_length,
+    int32_t num_speculative_tokens) {
+  CHECK_GT(accepted_prefix_length, 0);
+  CHECK_GE(num_speculative_tokens, 0);
+  CHECK_LE(accepted_prefix_length, num_speculative_tokens + 1);
+
+  DecodeState& state = mutable_tail(embedding_id);
+  CHECK(state.valid) << "Graph warmup MTP state must be bootstrapped first";
+  CHECK_EQ(state.request_id, request_id)
+      << "Graph warmup MTP request identity changed after bootstrap";
+  CHECK_GE(state.token_id, 0);
+  CHECK(state.embedding.defined());
+
+  const int32_t accepted_offset = accepted_prefix_length - 1;
+  state.all_draft_accepted =
+      accepted_prefix_length == num_speculative_tokens + 1;
+  state.position_offset = accepted_offset;
+  state.correction_token_id = state.token_id;
+  state.correction_position_offset = accepted_offset;
+  if (accepted_prefix_length > 1) {
+    state.prev_token_id = state.token_id;
+    state.prev_embedding = state.embedding.detach().clone();
+  } else {
+    state.prev_token_id = -1;
+    state.prev_embedding = torch::Tensor();
+  }
+}
+
 void EmbeddingCache::write_target_context(
     const std::vector<int32_t>& ids,
     const std::vector<std::string>& request_ids,
@@ -207,15 +238,27 @@ const torch::Tensor& EmbeddingCache::embedding_placeholder() const {
 std::vector<EmbeddingCache::DecodeState> EmbeddingCache::read_decode_states(
     const std::vector<int32_t>& ids,
     const std::vector<std::string>& request_ids) const {
+  std::vector<DecodeState> states;
+  states.reserve(ids.size());
+  read_decode_states_out(ids, request_ids, states);
+  return states;
+}
+
+void EmbeddingCache::read_decode_states_out(
+    const std::vector<int32_t>& ids,
+    const std::vector<std::string>& request_ids,
+    std::vector<DecodeState>& destination) const {
   CHECK(!ids.empty()) << "decode ids should not be empty";
   CHECK(request_ids.empty() || request_ids.size() == ids.size())
       << "decode request id count mismatch";
-  std::vector<DecodeState> states;
-  states.reserve(ids.size());
+  CHECK_GE(destination.capacity(), ids.size())
+      << "decode state destination capacity is too small";
+  destination.resize(ids.size());
   for (int32_t i = 0; i < static_cast<int32_t>(ids.size()); ++i) {
     const int32_t id = ids[i];
     const DecodeState& cached_state = get_tail(id);
-    DecodeState state = cached_state;
+    DecodeState& state = destination[static_cast<size_t>(i)];
+    state = cached_state;
     if (state.valid && !request_ids.empty() &&
         state.request_id != request_ids[i]) {
       state = DecodeState();
@@ -233,9 +276,7 @@ std::vector<EmbeddingCache::DecodeState> EmbeddingCache::read_decode_states(
             << "decode entry missing previous target embedding";
       }
     }
-    states.emplace_back(std::move(state));
   }
-  return states;
 }
 
 std::vector<int32_t> EmbeddingCache::read_accepted_prefix_lengths(

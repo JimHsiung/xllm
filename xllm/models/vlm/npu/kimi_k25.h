@@ -1067,6 +1067,27 @@ class KimiK2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
 };
 TORCH_MODULE(KimiK2_5_VLForConditionalGeneration);
 
+// Eagle3 is a text-generation speculative engine. Reuse the Kimi-K2.5 text
+// backbone without constructing its vision tower, while retaining the VLM
+// registration as the automatic backend for ordinary multimodal serving.
+class KimiK25TextForCausalLMImpl final
+    : public npu::model::DeepseekV2ForCausalLMImpl {
+ public:
+  explicit KimiK25TextForCausalLMImpl(const ModelContext& context)
+      : npu::model::DeepseekV2ForCausalLMImpl(context) {}
+
+  void load_model(std::unique_ptr<ModelLoader> loader,
+                  std::string /*prefix*/ = "model.") override {
+    load_model_with_prefixes(
+        std::move(loader), "language_model.model.", "language_model.lm_head.");
+  }
+};
+TORCH_MODULE(KimiK25TextForCausalLM);
+
+REGISTER_CAUSAL_MODEL_WITH_VARNAME(kimi_k25_text,
+                                   kimi_k25,
+                                   KimiK25TextForCausalLM);
+
 using KimiK25MultimodalProcessor = MultimodalProcessor<KimiK25PromptProcessor,
                                                        KimiK25ImageProcessor,
                                                        KimiK25VideoProcessor>;

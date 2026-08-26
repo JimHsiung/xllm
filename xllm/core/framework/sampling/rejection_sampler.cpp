@@ -376,4 +376,99 @@ RejectionSampler::greedy_sample_from_token_ids(
   return {accepted_token_ids, masked_accepted_token_ids};
 }
 
+void RejectionSampler::greedy_masked_sample_from_token_ids_out(
+    const torch::Tensor& draft_token_ids,
+    const torch::Tensor& target_token_ids,
+    const torch::Tensor& bonus_token_ids,
+    GreedyTokenIdRejectionWorkspace& workspace) {
+  CHECK(draft_token_ids.defined())
+      << "Prepared rejection draft_token_ids must be defined";
+  CHECK(target_token_ids.defined())
+      << "Prepared rejection target_token_ids must be defined";
+  CHECK(bonus_token_ids.defined())
+      << "Prepared rejection bonus_token_ids must be defined";
+  CHECK(workspace.candidate_token_ids.defined())
+      << "Prepared rejection candidate_token_ids workspace must be defined";
+  CHECK(workspace.draft_matches.defined())
+      << "Prepared rejection draft_matches workspace must be defined";
+  CHECK(workspace.accepted_prefix_mask.defined())
+      << "Prepared rejection accepted_prefix_mask workspace must be defined";
+  CHECK(workspace.rejected_token_ids.defined())
+      << "Prepared rejection rejected_token_ids workspace must be defined";
+  CHECK(workspace.masked_accepted_token_ids.defined())
+      << "Prepared rejection masked_accepted_token_ids workspace must be "
+         "defined";
+  CHECK_EQ(draft_token_ids.dim(), 2);
+  CHECK_EQ(target_token_ids.sizes(), draft_token_ids.sizes())
+      << "target and draft token shapes must match";
+  CHECK_EQ(bonus_token_ids.dim(), 2);
+  CHECK_EQ(bonus_token_ids.size(0), draft_token_ids.size(0));
+  CHECK_EQ(bonus_token_ids.size(1), 1);
+  CHECK_EQ(draft_token_ids.scalar_type(), torch::kLong);
+  CHECK_EQ(target_token_ids.scalar_type(), torch::kLong);
+  CHECK_EQ(bonus_token_ids.scalar_type(), torch::kLong);
+
+  const int64_t batch_size = draft_token_ids.size(0);
+  const int64_t draft_width = draft_token_ids.size(1);
+  const int64_t accepted_width = draft_width + 1;
+  CHECK_EQ(workspace.candidate_token_ids.sizes(),
+           torch::IntArrayRef({batch_size, accepted_width}));
+  CHECK_EQ(workspace.draft_matches.sizes(),
+           torch::IntArrayRef({batch_size, draft_width}));
+  CHECK_EQ(workspace.accepted_prefix_mask.sizes(),
+           torch::IntArrayRef({batch_size, accepted_width}));
+  CHECK_EQ(workspace.rejected_token_ids.sizes(),
+           torch::IntArrayRef({batch_size, accepted_width}));
+  CHECK_EQ(workspace.masked_accepted_token_ids.sizes(),
+           torch::IntArrayRef({batch_size, accepted_width}));
+
+  const torch::Device expected_device = workspace.candidate_token_ids.device();
+  CHECK_EQ(draft_token_ids.device(), expected_device)
+      << "Prepared rejection draft_token_ids must share the workspace device";
+  CHECK_EQ(target_token_ids.device(), expected_device)
+      << "Prepared rejection target_token_ids must share the workspace "
+         "device";
+  CHECK_EQ(bonus_token_ids.device(), expected_device)
+      << "Prepared rejection bonus_token_ids must share the workspace device";
+  CHECK_EQ(workspace.draft_matches.device(), expected_device)
+      << "Prepared rejection draft_matches must share the workspace device";
+  CHECK_EQ(workspace.accepted_prefix_mask.device(), expected_device)
+      << "Prepared rejection accepted_prefix_mask must share the workspace "
+         "device";
+  CHECK_EQ(workspace.rejected_token_ids.device(), expected_device)
+      << "Prepared rejection rejected_token_ids must share the workspace "
+         "device";
+  CHECK_EQ(workspace.masked_accepted_token_ids.device(), expected_device)
+      << "Prepared rejection masked_accepted_token_ids must share the "
+         "workspace device";
+  CHECK_EQ(workspace.candidate_token_ids.scalar_type(), torch::kLong);
+  CHECK_EQ(workspace.draft_matches.scalar_type(), torch::kBool);
+  CHECK_EQ(workspace.accepted_prefix_mask.scalar_type(), torch::kBool);
+  CHECK_EQ(workspace.rejected_token_ids.scalar_type(), torch::kLong);
+  CHECK_EQ(workspace.masked_accepted_token_ids.scalar_type(), torch::kLong);
+
+  workspace.candidate_token_ids
+      .narrow(/*dim=*/1, /*start=*/0, /*length=*/draft_width)
+      .copy_(target_token_ids, /*non_blocking=*/true);
+  workspace.candidate_token_ids
+      .narrow(/*dim=*/1, /*start=*/draft_width, /*length=*/1)
+      .copy_(bonus_token_ids, /*non_blocking=*/true);
+  torch::eq_out(workspace.draft_matches, target_token_ids, draft_token_ids);
+
+  workspace.accepted_prefix_mask.select(/*dim=*/1, /*index=*/0).fill_(true);
+  for (int64_t token_index = 0; token_index < draft_width; ++token_index) {
+    torch::Tensor next_prefix = workspace.accepted_prefix_mask.select(
+        /*dim=*/1, /*index=*/token_index + 1);
+    torch::logical_and_out(
+        next_prefix,
+        workspace.accepted_prefix_mask.select(/*dim=*/1,
+                                              /*index=*/token_index),
+        workspace.draft_matches.select(/*dim=*/1, /*index=*/token_index));
+  }
+  torch::where_out(workspace.masked_accepted_token_ids,
+                   workspace.accepted_prefix_mask,
+                   workspace.candidate_token_ids,
+                   workspace.rejected_token_ids);
+}
+
 }  // namespace xllm

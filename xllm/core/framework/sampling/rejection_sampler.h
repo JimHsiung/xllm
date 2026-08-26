@@ -22,6 +22,14 @@ limitations under the License.
 
 namespace xllm {
 
+struct GreedyTokenIdRejectionWorkspace {
+  torch::Tensor candidate_token_ids;
+  torch::Tensor draft_matches;
+  torch::Tensor accepted_prefix_mask;
+  torch::Tensor rejected_token_ids;
+  torch::Tensor masked_accepted_token_ids;
+};
+
 class RejectionSampler final {
  public:
   RejectionSampler(const torch::Tensor& do_sample,
@@ -83,6 +91,15 @@ class RejectionSampler final {
       const torch::Tensor& target_token_ids,
       const torch::Tensor& bonus_token_ids,
       bool mask_out_rejected_tokens);
+
+  // Fixed-output variant for Prepared execution. Every workspace tensor must
+  // have the active batch shape; no output or intermediate tensor is allocated
+  // by this function.
+  static void greedy_masked_sample_from_token_ids_out(
+      const torch::Tensor& draft_token_ids,
+      const torch::Tensor& target_token_ids,
+      const torch::Tensor& bonus_token_ids,
+      GreedyTokenIdRejectionWorkspace& workspace);
 
  private:
   // whether to return logprobs

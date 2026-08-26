@@ -256,6 +256,39 @@ DEFINE_COUNTER(speculative_num_draft_tokens_constrained_total,
 DEFINE_COUNTER(speculative_num_draft_tokens_plain_total,
                "Draft speculative tokens from plain rows");
 
+DEFINE_HISTOGRAM(prepared_task_prepare_cpu_latency_microseconds,
+                 "Prepared Task adapter CPU Prepare latency in microseconds");
+DEFINE_HISTOGRAM(
+    prepared_task_launch_submission_latency_microseconds,
+    "Prepared Task continuation and Launch submission latency in microseconds");
+DEFINE_HISTOGRAM(prepared_task_consume_latency_microseconds,
+                 "Prepared Task Device completion wait and Consume latency in "
+                 "microseconds");
+DEFINE_COUNTER(prepared_task_launch_submissions_total,
+               "Prepared Task Launch submissions");
+DEFINE_COUNTER(prepared_task_ready_queue_empty_at_launch_end_total,
+               "Two-slot Prepared Task Launch submissions ending without a "
+               "READY successor");
+DEFINE_COUNTER(prepared_task_execution_total_eager,
+               "Prepared Task invocations executed in Eager mode");
+DEFINE_COUNTER(prepared_task_execution_total_graph_capture,
+               "Prepared Task invocations executed as startup Graph capture");
+DEFINE_COUNTER(prepared_task_execution_total_graph_replay,
+               "Prepared Task invocations executed as Graph replay");
+DEFINE_COUNTER(prepared_task_graph_runtime_misses_total,
+               "Prepared Task Graph runtime misses using Eager fallback");
+DEFINE_COUNTER(
+    prepared_task_graph_address_mismatches_total,
+    "Prepared Task cached Graph input address mismatches using Eager fallback");
+DEFINE_COUNTER(prepared_task_staging_h2d_bytes_total,
+               "Prepared Task fixed Arena H2D bytes");
+DEFINE_COUNTER(prepared_task_staging_h2d_copies_total,
+               "Prepared Task fixed Arena H2D copy count");
+DEFINE_COUNTER(prepared_task_staging_d2d_bytes_total,
+               "Prepared Task Device source to fixed Arena D2D bytes");
+DEFINE_COUNTER(prepared_task_staging_d2d_copies_total,
+               "Prepared Task Device source to fixed Arena copy count");
+
 // proto metrics
 DEFINE_COUNTER(proto_latency_seconds_proto2i,
                "Latency of proto2i convert in seconds");

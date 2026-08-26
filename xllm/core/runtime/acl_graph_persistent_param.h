@@ -88,6 +88,13 @@ class GraphPersistentParam final {
                                          bool skip_token_update = false,
                                          bool for_capture = false);
 
+  torch::Tensor prepare_paged_attention_tiling_host(
+      const torch::Tensor& tokens,
+      const torch::Tensor& k_cache,
+      const torch::Tensor& v_cache,
+      const torch::Tensor& block_tables,
+      const ModelInputParams& input_params);
+
   void update_tokens(const torch::Tensor& tokens,
                      const ModelInputParams& params,
                      uint32_t actual_num_tokens,
@@ -258,7 +265,8 @@ class GraphPersistentParam final {
                                    const torch::Tensor& block_tables,
                                    const ModelInputParams& input_params,
                                    aclrtStream stream,
-                                   bool copy_to_device = true);
+                                   bool copy_to_device = true,
+                                   torch::Tensor* host_tiling = nullptr);
 
   std::vector<int32_t> update_expanded_spec_decode_attention(
       const ModelInputParams& input_params,

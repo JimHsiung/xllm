@@ -42,6 +42,8 @@ class ExecutionConfig final {
     static const OptionCategory kOptionCategory = {
         "EXECUTION OPTIONS",
         {"enable_graph",
+         "enable_prepared_task_pipeline",
+         "prepared_task_input_buffer_size",
          "disable_graph_warmup",
          "enable_graph_double_buffer",
          "enable_graph_mode_decode_no_padding",
@@ -59,6 +61,11 @@ class ExecutionConfig final {
   }
 
   PROPERTY(bool, enable_graph) = false;
+
+  PROPERTY(bool, enable_prepared_task_pipeline) = false;
+
+  // Capacity in MiB for each PreparedTaskPipeline input arena.
+  PROPERTY(uint64_t, prepared_task_input_buffer_size) = 64;
 
   PROPERTY(bool, disable_graph_warmup) = false;
 

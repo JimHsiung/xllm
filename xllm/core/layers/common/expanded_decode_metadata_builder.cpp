@@ -214,10 +214,15 @@ ExpandedDecodeMetadata ExpandedDecodeMetadataBuilder::build(
   metadata.paged_kv_last_page_len =
       params.graph.expanded_paged_kv_last_page_len;
   metadata.paged_attention_tiling_data = params.graph.expanded_tiling_data;
-  metadata.kv_seq_lens_host_vec = params.graph.expanded_kv_seq_lens_vec;
-  if (!params.graph.expanded_kv_seq_lens_vec.empty()) {
-    metadata.kv_seq_lens_host =
-        torch::tensor(params.graph.expanded_kv_seq_lens_vec, torch::kInt32);
+  // A Prepared continuation patches the final Arena KV tensor on Device after
+  // Host staging. Its Host vector remains the conservative planning template
+  // and must not become an attention runtime input.
+  if (!params.graph.prepared_spec_verify_direct_bind) {
+    metadata.kv_seq_lens_host_vec = params.graph.expanded_kv_seq_lens_vec;
+    if (!params.graph.expanded_kv_seq_lens_vec.empty()) {
+      metadata.kv_seq_lens_host =
+          torch::tensor(params.graph.expanded_kv_seq_lens_vec, torch::kInt32);
+    }
   }
   validate(metadata);
   return metadata;
@@ -262,8 +267,10 @@ void ExpandedDecodeMetadataBuilder::validate(
                      host_indptr.narrow(0, 0, offset_count))
               .item<bool>())
         << "paged_kv_indptr must be monotonic";
-    CHECK_EQ(host_indptr[host_indptr.numel() - 1].item<int32_t>(),
-             metadata.paged_kv_indices.numel());
+    CHECK_LE(host_indptr[host_indptr.numel() - 1].item<int32_t>(),
+             metadata.paged_kv_indices.numel())
+        << "paged_kv_indices may retain fixed-capacity trailing storage, but "
+           "must cover every active page";
   }
   if (metadata.paged_kv_last_page_len.device().is_cpu()) {
     const torch::Tensor& host_last_page_len = metadata.paged_kv_last_page_len;

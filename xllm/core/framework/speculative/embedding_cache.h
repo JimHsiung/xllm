@@ -79,6 +79,14 @@ class EmbeddingCache final {
                                    int32_t token_id,
                                    const torch::Tensor& embedding);
 
+  // Rewrites a freshly bootstrapped synthetic MTP state to represent one
+  // accepted-prefix Graph-key variant. Token/embedding values are placeholders
+  // during capture; offsets and the one/two-row topology match a real state.
+  void prepare_graph_warmup_accepted_state(int32_t embedding_id,
+                                           const std::string& request_id,
+                                           int32_t accepted_prefix_length,
+                                           int32_t num_speculative_tokens);
+
   // Writes target validate output after rejection sampling. accepted_tokens is
   // a contiguous accepted prefix padded by -1; accepted_embeddings keeps the
   // corresponding target hidden states for the next draft extend input.
@@ -98,6 +106,11 @@ class EmbeddingCache final {
   std::vector<DecodeState> read_decode_states(
       const std::vector<int32_t>& embedding_ids,
       const std::vector<std::string>& request_ids) const;
+  // Writes into caller-owned storage without replacing its allocation. The
+  // destination must reserve enough entries before entering the hot path.
+  void read_decode_states_out(const std::vector<int32_t>& embedding_ids,
+                              const std::vector<std::string>& request_ids,
+                              std::vector<DecodeState>& destination) const;
   std::vector<int32_t> read_accepted_prefix_lengths(
       const std::vector<int32_t>& embedding_ids,
       const std::vector<std::string>& request_ids) const;

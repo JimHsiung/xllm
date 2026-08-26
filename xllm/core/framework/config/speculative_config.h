@@ -63,6 +63,15 @@ class SpeculativeConfig final {
     return iequals(algorithm, "dflash") || iequals(algorithm, "dspark");
   }
 
+  // Prepared speculative adapters carry accepted-token state between
+  // consecutive tasks. The Engine must publish predecessor row mappings for
+  // every algorithm in this set. This classification does not open the
+  // production Prepared speculative startup gate.
+  static bool requires_prepared_predecessor_rows(std::string_view algorithm) {
+    return is_mtp_algorithm(algorithm) || algorithm == "Eagle3" ||
+           is_block_diffusion_algorithm(algorithm);
+  }
+
   void from_flags();
   void from_json(const JsonReader& json);
   void append_config_json(nlohmann::ordered_json& config_json) const;

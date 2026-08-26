@@ -19,6 +19,7 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "core/framework/config/speculative_config.h"
+#include "core/framework/speculative/mtp_async_state.h"
 #include "framework/model_loader.h"
 
 namespace xllm {
@@ -80,11 +81,38 @@ bool Eagle3WorkerImpl::init_model(const std::string& model_weights_path,
       if (d2t_tensor.defined()) {
         auto arange_tensor = torch::arange(d2t_tensor.size(0));
         hot_token_id_ = d2t_tensor + arange_tensor;
-        hot_token_id_ = hot_token_id_.to(device_);
+        hot_token_id_ = hot_token_id_.to(torch::kLong).to(device_);
         LOG(INFO) << "Eagle3WorkerImpl: Loaded d2t tensor from state_dict, "
                      "hot_token_id size: "
                   << hot_token_id_.size(0);
         break;
+      }
+    }
+
+    const int64_t draft_vocab_size =
+        draft_impl_->context_.get_model_args().vocab_size();
+    const int64_t target_vocab_size =
+        impl_->context_.get_model_args().vocab_size();
+    CHECK_GT(draft_vocab_size, 0);
+    CHECK_GT(target_vocab_size, 0);
+    if (!hot_token_id_.defined()) {
+      CHECK_EQ(draft_vocab_size, target_vocab_size)
+          << "Eagle3 draft vocab is a strict target subset but the draft "
+             "checkpoint has no root-level d2t token mapping.";
+    } else {
+      CHECK_EQ(hot_token_id_.dim(), 1)
+          << "Eagle3 d2t token mapping must be one-dimensional.";
+      CHECK_EQ(hot_token_id_.numel(), draft_vocab_size)
+          << "Eagle3 d2t token mapping must cover the complete draft vocab.";
+      if (hot_token_id_.numel() > 0) {
+        const int64_t minimum_target_token =
+            hot_token_id_.min().item<int64_t>();
+        const int64_t maximum_target_token =
+            hot_token_id_.max().item<int64_t>();
+        CHECK_GE(minimum_target_token, 0)
+            << "Eagle3 d2t token mapping contains a negative target token.";
+        CHECK_LT(maximum_target_token, target_vocab_size)
+            << "Eagle3 d2t token mapping exceeds the target vocab.";
       }
     }
   }
@@ -110,6 +138,22 @@ void Eagle3WorkerImpl::process_draft_sample_output(
 
   sample_output.next_tokens =
       hot_token_id_.index_select(0, sample_output.next_tokens);
+}
+
+void Eagle3WorkerImpl::process_prepared_draft_sample_output(
+    SampleOutput& sample_output,
+    torch::Tensor fixed_token_ids) {
+  MTPWorkerImpl::process_draft_sample_output(sample_output);
+  CHECK(sample_output.next_tokens.defined());
+  CHECK_EQ(sample_output.next_tokens.numel(), fixed_token_ids.numel());
+  if (hot_token_id_.defined() && sample_output.next_tokens.numel() > 0) {
+    mtp_async::map_draft_token_ids_to_target_out(
+        hot_token_id_, sample_output.next_tokens, fixed_token_ids);
+  } else {
+    mtp_async::copy_prepared_draft_token_ids_out(sample_output.next_tokens,
+                                                 fixed_token_ids);
+  }
+  sample_output.next_tokens = fixed_token_ids;
 }
 
 }  // namespace xllm

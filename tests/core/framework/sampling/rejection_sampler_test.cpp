@@ -46,6 +46,74 @@ torch::TensorOptions get_test_options(
 }
 }  // namespace
 
+TEST(SamplerTest, GreedyForwardWritesFixedOutput) {
+  torch::Tensor logits =
+      torch::tensor({{1.0F, 3.0F, 2.0F}, {4.0F, 0.0F, 5.0F}}, torch::kFloat);
+  torch::Tensor fixed_output = torch::empty({2}, torch::kLong);
+  const void* output_address = fixed_output.data_ptr();
+  SamplingParameters params;
+  params.all_greedy_sample = true;
+
+  Sampler sampler;
+  SampleOutput output = sampler.forward(logits,
+                                        params,
+                                        /*filter_mask=*/torch::Tensor(),
+                                        fixed_output);
+
+  EXPECT_EQ(output.next_tokens.data_ptr(), output_address);
+  EXPECT_TRUE(torch::equal(output.next_tokens, torch::tensor({1, 2})));
+}
+
+TEST(SamplerTest, GreedyForwardRejectsInvalidFixedOutputBeforeArgmax) {
+  SamplingParameters params;
+  params.all_greedy_sample = true;
+  Sampler sampler;
+
+  EXPECT_DEATH(
+      {
+        torch::Tensor logits = torch::zeros({2, 3}, torch::kFloat);
+        sampler.forward(logits,
+                        params,
+                        /*filter_mask=*/torch::Tensor(),
+                        torch::empty({1, 2}, torch::kLong));
+      },
+      "Fixed greedy output must be one-dimensional");
+  EXPECT_DEATH(
+      {
+        torch::Tensor logits = torch::zeros({2, 3}, torch::kFloat);
+        sampler.forward(logits,
+                        params,
+                        /*filter_mask=*/torch::Tensor(),
+                        torch::empty({2}, torch::kInt));
+      },
+      "Fixed greedy output must use int64 dtype");
+  EXPECT_DEATH(
+      {
+        torch::Tensor logits = torch::zeros({2, 3}, torch::kFloat);
+        sampler.forward(logits,
+                        params,
+                        /*filter_mask=*/torch::Tensor(),
+                        torch::empty({2},
+                                     torch::TensorOptions()
+                                         .dtype(torch::kLong)
+                                         .device(torch::Device("meta"))));
+      },
+      "Fixed greedy output must be on the logits device");
+  EXPECT_DEATH(
+      {
+        torch::Tensor logits = torch::zeros({2, 3}, torch::kFloat);
+        const torch::Tensor strided_output =
+            torch::empty({4}, torch::kLong)
+                .slice(
+                    /*dim=*/0, /*start=*/0, /*end=*/4, /*step=*/2);
+        sampler.forward(logits,
+                        params,
+                        /*filter_mask=*/torch::Tensor(),
+                        strided_output);
+      },
+      "Fixed greedy output must be contiguous");
+}
+
 TEST(RejectionSamplerTest, Basic) {
   // test with hand-crafted example
   const auto options = get_test_options(torch::kFloat32);
@@ -218,6 +286,125 @@ TEST(RejectionSamplerTest, GreedyFromTokenIds) {
       output, torch::tensor({{1, 4, 3, 5}, {3, 2, 0, 6}}, device)));
   EXPECT_TRUE(torch::equal(
       masked_output, torch::tensor({{1, 4, -1, -1}, {3, 2, -1, -1}}, device)));
+}
+
+TEST(RejectionSamplerTest, GreedyFromTokenIdsWritesFixedWorkspace) {
+  const torch::Device device = get_test_device();
+  const torch::TensorOptions token_options =
+      torch::TensorOptions().dtype(torch::kLong).device(device);
+  const torch::TensorOptions mask_options =
+      torch::TensorOptions().dtype(torch::kBool).device(device);
+  const torch::Tensor draft_token_ids =
+      torch::tensor({{1, 2, 3}, {3, 1, 0}}, token_options);
+  const torch::Tensor target_token_ids =
+      torch::tensor({{1, 4, 3}, {3, 2, 0}}, token_options);
+  const torch::Tensor bonus_token_ids =
+      torch::tensor({{5}, {6}}, token_options);
+
+  GreedyTokenIdRejectionWorkspace workspace{
+      torch::empty({2, 4}, token_options),
+      torch::empty({2, 3}, mask_options),
+      torch::empty({2, 4}, mask_options),
+      torch::full({2, 4}, -1, token_options),
+      torch::empty({2, 4}, token_options)};
+  const void* candidate_address = workspace.candidate_token_ids.data_ptr();
+  const void* draft_match_address = workspace.draft_matches.data_ptr();
+  const void* prefix_mask_address = workspace.accepted_prefix_mask.data_ptr();
+  const void* rejected_token_address = workspace.rejected_token_ids.data_ptr();
+  const void* output_address = workspace.masked_accepted_token_ids.data_ptr();
+
+  RejectionSampler::greedy_masked_sample_from_token_ids_out(
+      draft_token_ids, target_token_ids, bonus_token_ids, workspace);
+
+  EXPECT_EQ(workspace.candidate_token_ids.data_ptr(), candidate_address);
+  EXPECT_EQ(workspace.draft_matches.data_ptr(), draft_match_address);
+  EXPECT_EQ(workspace.accepted_prefix_mask.data_ptr(), prefix_mask_address);
+  EXPECT_EQ(workspace.rejected_token_ids.data_ptr(), rejected_token_address);
+  EXPECT_EQ(workspace.masked_accepted_token_ids.data_ptr(), output_address);
+  EXPECT_TRUE(torch::equal(
+      workspace.masked_accepted_token_ids,
+      torch::tensor({{1, 4, -1, -1}, {3, 2, -1, -1}}, token_options)));
+}
+
+TEST(RejectionSamplerTest, GreedyFixedWorkspaceBoundsContinuationHeadroom) {
+  const torch::Device device = get_test_device();
+  const torch::TensorOptions token_options =
+      torch::TensorOptions().dtype(torch::kLong).device(device);
+  const torch::TensorOptions mask_options =
+      torch::TensorOptions().dtype(torch::kBool).device(device);
+  const torch::Tensor draft_token_ids =
+      torch::tensor({{1, 2, 3}, {4, 5, 6}}, token_options);
+  const torch::Tensor target_token_ids =
+      torch::tensor({{9, 2, 3}, {4, 5, 6}}, token_options);
+  const torch::Tensor bonus_token_ids =
+      torch::tensor({{7}, {8}}, token_options);
+  GreedyTokenIdRejectionWorkspace workspace{
+      torch::empty({2, 4}, token_options),
+      torch::empty({2, 3}, mask_options),
+      torch::empty({2, 4}, mask_options),
+      torch::full({2, 4}, -1, token_options),
+      torch::empty({2, 4}, token_options)};
+
+  RejectionSampler::greedy_masked_sample_from_token_ids_out(
+      draft_token_ids, target_token_ids, bonus_token_ids, workspace);
+
+  EXPECT_TRUE(torch::equal(
+      workspace.masked_accepted_token_ids,
+      torch::tensor({{9, -1, -1, -1}, {4, 5, 6, 8}}, token_options)));
+  const torch::Tensor accepted_lengths =
+      workspace.masked_accepted_token_ids.ge(0).sum(/*dim=*/1);
+  EXPECT_TRUE(
+      torch::equal(accepted_lengths, torch::tensor({1, 4}, token_options)));
+  EXPECT_TRUE(
+      torch::equal(accepted_lengths - 1, torch::tensor({0, 3}, token_options)));
+}
+
+TEST(RejectionSamplerTest,
+     GreedyFixedWorkspaceRejectsDeviceDtypeAndUndefinedStorageBeforeWrites) {
+  const torch::TensorOptions token_options =
+      torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU);
+  const torch::TensorOptions mask_options =
+      torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU);
+  const torch::Tensor draft_token_ids =
+      torch::tensor({{1, 2, 3}}, token_options);
+  const torch::Tensor target_token_ids =
+      torch::tensor({{1, 4, 3}}, token_options);
+  const torch::Tensor bonus_token_ids = torch::tensor({{5}}, token_options);
+  GreedyTokenIdRejectionWorkspace workspace{
+      torch::empty({1, 4}, token_options),
+      torch::empty({1, 3}, mask_options),
+      torch::empty({1, 4}, mask_options),
+      torch::full({1, 4}, -1, token_options),
+      torch::empty({1, 4}, token_options)};
+
+  const torch::Tensor meta_draft_token_ids =
+      torch::empty({1, 3}, token_options.device(torch::Device("meta")));
+  EXPECT_DEATH(
+      RejectionSampler::greedy_masked_sample_from_token_ids_out(
+          meta_draft_token_ids, target_token_ids, bonus_token_ids, workspace),
+      "draft_token_ids.*workspace device");
+
+  workspace.draft_matches =
+      torch::empty({1, 3}, mask_options.device(torch::Device("meta")));
+  EXPECT_DEATH(
+      RejectionSampler::greedy_masked_sample_from_token_ids_out(
+          draft_token_ids, target_token_ids, bonus_token_ids, workspace),
+      "draft_matches.*workspace device");
+  workspace.draft_matches = torch::empty({1, 3}, mask_options);
+
+  const torch::Tensor int_target_token_ids = torch::tensor(
+      {{1, 4, 3}},
+      torch::TensorOptions().dtype(torch::kInt).device(torch::kCPU));
+  EXPECT_DEATH(
+      RejectionSampler::greedy_masked_sample_from_token_ids_out(
+          draft_token_ids, int_target_token_ids, bonus_token_ids, workspace),
+      "target_token_ids.scalar_type.*torch::kLong");
+
+  workspace.rejected_token_ids = torch::Tensor();
+  EXPECT_DEATH(
+      RejectionSampler::greedy_masked_sample_from_token_ids_out(
+          draft_token_ids, target_token_ids, bonus_token_ids, workspace),
+      "rejected_token_ids workspace must be defined");
 }
 
 TEST(RejectionSamplerTest, GreedyForwardAllowsUndefinedDraftProbs) {

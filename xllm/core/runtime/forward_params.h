@@ -93,14 +93,33 @@ struct ForwardInputBufferEntry {
   uint64_t aligned_bytes = 0;
 };
 
+struct ForwardInputHostCopyStats {
+  uint64_t bytes = 0;
+  int32_t copies = 0;
+};
+
 struct ForwardInputBufferPlan {
   std::vector<ForwardInputBufferEntry> entries;
 
   bool add(const torch::Tensor& tensor, torch::Tensor* target) {
+    return add_impl(tensor, target, /*allow_device_source=*/false);
+  }
+
+  // Device sources must be declared per field. This keeps newly added input
+  // metadata Host-only by default instead of silently introducing a D2D copy
+  // into PreparedInputArena staging.
+  bool add_external_device_source(const torch::Tensor& tensor,
+                                  torch::Tensor* target) {
+    return add_impl(tensor, target, /*allow_device_source=*/true);
+  }
+
+  bool add_impl(const torch::Tensor& tensor,
+                torch::Tensor* target,
+                bool allow_device_source) {
     if (!tensor.defined()) {
       return true;
     }
-    if (!tensor.device().is_cpu()) {
+    if (!tensor.device().is_cpu() && !allow_device_source) {
       return false;
     }
     entries.push_back({tensor.contiguous(), target, 0, 0});
@@ -120,27 +139,109 @@ struct ForwardInputBufferPlan {
     return total;
   }
 
+  uint64_t layout_signature() const {
+    constexpr uint64_t kFnvOffsetBasis = 1469598103934665603ULL;
+    uint64_t signature = kFnvOffsetBasis;
+    auto mix = [&signature](uint64_t value) {
+      constexpr uint64_t kLocalFnvPrime = 1099511628211ULL;
+      signature ^= value;
+      signature *= kLocalFnvPrime;
+    };
+    mix(static_cast<uint64_t>(entries.size()));
+    for (const ForwardInputBufferEntry& entry : entries) {
+      mix(entry.offset);
+      mix(entry.aligned_bytes);
+      mix(static_cast<uint64_t>(entry.host_tensor.scalar_type()));
+      mix(static_cast<uint64_t>(entry.host_tensor.dim()));
+      for (int64_t dimension : entry.host_tensor.sizes()) {
+        mix(static_cast<uint64_t>(dimension));
+      }
+    }
+    return signature;
+  }
+
   torch::Tensor build_host_buffer(uint64_t total_bytes) const {
     auto buffer = torch::empty({static_cast<int64_t>(total_bytes)},
                                torch::TensorOptions()
                                    .dtype(torch::kUInt8)
                                    .device(torch::kCPU)
                                    .pinned_memory(true));
-    auto* base = static_cast<char*>(buffer.data_ptr());
+    pack_host_buffer(buffer);
+    return buffer;
+  }
+
+  void pack_host_buffer(const torch::Tensor& buffer) const {
+    CHECK(buffer.defined());
+    CHECK(buffer.device().is_cpu());
+    CHECK_EQ(buffer.scalar_type(), torch::kUInt8);
+    char* base = static_cast<char*>(buffer.data_ptr());
     for (const auto& entry : entries) {
       const uint64_t bytes = static_cast<uint64_t>(
           entry.host_tensor.numel() * entry.host_tensor.element_size());
       if (bytes == 0) {
         continue;
       }
-      std::memcpy(base + entry.offset, entry.host_tensor.data_ptr(), bytes);
+      if (entry.host_tensor.device().is_cpu()) {
+        std::memcpy(base + entry.offset, entry.host_tensor.data_ptr(), bytes);
+      } else {
+        std::memset(base + entry.offset, 0, static_cast<size_t>(bytes));
+      }
       if (entry.aligned_bytes > bytes) {
         std::memset(base + entry.offset + bytes,
                     0,
                     static_cast<size_t>(entry.aligned_bytes - bytes));
       }
     }
-    return buffer;
+  }
+
+  ForwardInputHostCopyStats copy_host_sources(
+      const torch::Tensor& host_buffer,
+      const torch::Tensor& device_buffer) const {
+    CHECK(host_buffer.defined());
+    CHECK(device_buffer.defined());
+    CHECK(host_buffer.device().is_cpu());
+    CHECK_EQ(host_buffer.scalar_type(), torch::kUInt8);
+    CHECK_EQ(device_buffer.scalar_type(), torch::kUInt8);
+    CHECK_EQ(host_buffer.numel(), device_buffer.numel());
+
+    ForwardInputHostCopyStats stats;
+    uint64_t range_start = 0;
+    uint64_t range_end = 0;
+    bool has_range = false;
+    auto flush_range = [&]() {
+      if (!has_range || range_end <= range_start) {
+        has_range = false;
+        return;
+      }
+      const int64_t start = static_cast<int64_t>(range_start);
+      const int64_t length = static_cast<int64_t>(range_end - range_start);
+      device_buffer.narrow(/*dim=*/0, start, length)
+          .copy_(host_buffer.narrow(/*dim=*/0, start, length),
+                 /*non_blocking=*/true);
+      stats.bytes += range_end - range_start;
+      ++stats.copies;
+      has_range = false;
+    };
+
+    for (const ForwardInputBufferEntry& entry : entries) {
+      if (entry.aligned_bytes == 0) {
+        continue;
+      }
+      if (!entry.host_tensor.device().is_cpu()) {
+        flush_range();
+        continue;
+      }
+      if (!has_range) {
+        range_start = entry.offset;
+        has_range = true;
+      } else {
+        CHECK_EQ(range_end, entry.offset)
+            << "Host input ranges must remain contiguous";
+      }
+      range_end = entry.offset + entry.aligned_bytes;
+    }
+    flush_range();
+    return stats;
   }
 
   void bind_device_views(const torch::Tensor& device_buffer,
@@ -170,13 +271,55 @@ struct ForwardInputBufferPlan {
       }
 #endif
 #if defined(USE_NPU)
-      *entry.target = get_tensor_from_blob(entry.host_tensor.sizes().vec(),
-                                           entry.host_tensor.scalar_type(),
-                                           ptr);
-#else
-      (void)device;
+      if (device.type() == torch::kPrivateUse1) {
+        *entry.target = get_tensor_from_blob(entry.host_tensor.sizes().vec(),
+                                             entry.host_tensor.scalar_type(),
+                                             ptr);
+        continue;
+      }
 #endif
+      CHECK(device.is_cpu())
+          << "Unsupported contiguous input buffer device: " << device;
+      *entry.target =
+          torch::from_blob(const_cast<void*>(ptr),
+                           entry.host_tensor.sizes().vec(),
+                           torch::TensorOptions()
+                               .dtype(entry.host_tensor.scalar_type())
+                               .device(torch::kCPU));
     }
+  }
+
+  void copy_device_sources() const {
+    for (const ForwardInputBufferEntry& entry : entries) {
+      if (entry.target == nullptr || !entry.host_tensor.defined() ||
+          entry.host_tensor.device().is_cpu()) {
+        continue;
+      }
+      CHECK(entry.target->defined());
+      entry.target->copy_(entry.host_tensor, /*non_blocking=*/true);
+    }
+  }
+
+  uint64_t device_source_bytes() const {
+    uint64_t bytes = 0;
+    for (const ForwardInputBufferEntry& entry : entries) {
+      if (entry.host_tensor.defined() && !entry.host_tensor.device().is_cpu()) {
+        bytes += static_cast<uint64_t>(entry.host_tensor.numel() *
+                                       entry.host_tensor.element_size());
+      }
+    }
+    return bytes;
+  }
+
+  int32_t device_source_count() const {
+    int32_t count = 0;
+    for (const ForwardInputBufferEntry& entry : entries) {
+      if (entry.host_tensor.defined() && entry.host_tensor.numel() > 0 &&
+          !entry.host_tensor.device().is_cpu()) {
+        ++count;
+      }
+    }
+    return count;
   }
 };
 
@@ -219,14 +362,41 @@ inline bool has_contiguous_input_buffer_exclusions(
 
 inline void clear_contiguous_input_buffer_tensor_targets(
     ModelInputParams& params) {
+  params.attention.device.in_prefix_slots = torch::Tensor();
   params.embedding.input_embedding = torch::Tensor();
   params.embedding.linear_state_indices = torch::Tensor();
   params.embedding.mtp_bootstrap_embeddings = torch::Tensor();
+  params.embedding.predecessor_rows = torch::Tensor();
+  params.embedding.mtp_shifted_token_ids = torch::Tensor();
   params.block_copy.src_block_indices = torch::Tensor();
   params.block_copy.dst_block_indices = torch::Tensor();
   params.block_copy.cum_sum = torch::Tensor();
+  params.parallel.dp_ep_padding_data.attn_padding_idx() = torch::Tensor();
+  params.parallel.dp_ep_padding_data.attn_unpadding_idx() = torch::Tensor();
+  params.parallel.dp_ep_padding_data.ffn_padding_idx() = torch::Tensor();
+  params.parallel.dp_ep_padding_data.ffn_unpadding_idx() = torch::Tensor();
+  params.parallel.dp_ep_padding_data.lm_head_skip_padding_token_indices() =
+      torch::Tensor();
+  params.parallel.dp_ep_padding_data.gather_prenorm_idx() = torch::Tensor();
+  params.parallel.dp_ep_padding_data.padding_idx() = torch::Tensor();
+  params.parallel.dp_ep_padding_data.un_padding_idx() = torch::Tensor();
+  params.parallel.dp_ep_padding_data.dynamic_ep_idx() = torch::Tensor();
+  params.parallel.dp_ep_padding_data.moe_idx() = torch::Tensor();
+  params.parallel.dp_ep_padding_data.expert_array() = torch::Tensor();
+  params.parallel.dp_ep_padding_data.post_lmhead_gather_indices() =
+      torch::Tensor();
+  params.expert.expert_array = torch::Tensor();
+  params.expert.eplb_decode_token_mask = torch::Tensor();
   params.graph.attn_mask = torch::Tensor();
   params.graph.tiling_data = torch::Tensor();
+  params.graph.expanded_kv_seq_lens = torch::Tensor();
+  params.graph.expanded_block_tables = torch::Tensor();
+  params.graph.expanded_paged_kv_indptr = torch::Tensor();
+  params.graph.expanded_paged_kv_indices = torch::Tensor();
+  params.graph.expanded_paged_kv_last_page_len = torch::Tensor();
+  params.graph.expanded_tiling_data = torch::Tensor();
+  params.num_accepted_tokens = torch::Tensor();
+  params.mtp_shifted_token_ids = torch::Tensor();
 }
 
 inline bool add_attention_to_plan(const AttentionInput& source,
@@ -250,32 +420,107 @@ inline bool add_attention_to_plan(const AttentionInput& source,
                   &target.device.kv_cache_start_offsets) &&
          plan.add(source.device.kv_cache_tokens_nums,
                   &target.device.kv_cache_tokens_nums) &&
-         plan.add(source.device.history_compressed_kv,
-                  &target.device.history_compressed_kv) &&
-         plan.add(source.device.history_k_rope,
-                  &target.device.history_k_rope) &&
          plan.add(source.device.ring_cur_seqlen,
                   &target.device.ring_cur_seqlen) &&
          plan.add(source.device.ring_cache_seqlen,
-                  &target.device.ring_cache_seqlen);
+                  &target.device.ring_cache_seqlen) &&
+         plan.add(source.device.in_prefix_slots,
+                  &target.device.in_prefix_slots);
 }
 
-inline bool add_model_tensors_to_plan(const ModelInputParams& source,
-                                      ModelInputParams& target,
-                                      ForwardInputBufferPlan& plan) {
-  return plan.add(source.embedding.input_embedding,
-                  &target.embedding.input_embedding) &&
-         plan.add(source.embedding.linear_state_indices,
+struct ModelTensorPlanSourceOverrides {
+  const torch::Tensor* input_embedding = nullptr;
+  const torch::Tensor* linear_state_indices = nullptr;
+  const torch::Tensor* mtp_bootstrap_embeddings = nullptr;
+  const torch::Tensor* expanded_kv_seq_lens = nullptr;
+  const torch::Tensor* num_accepted_tokens = nullptr;
+};
+
+inline bool add_model_tensors_to_plan(
+    const ModelInputParams& source,
+    ModelInputParams& target,
+    ForwardInputBufferPlan& plan,
+    const ModelTensorPlanSourceOverrides* overrides = nullptr) {
+  const torch::Tensor& input_embedding =
+      overrides != nullptr && overrides->input_embedding != nullptr
+          ? *overrides->input_embedding
+          : source.embedding.input_embedding;
+  const torch::Tensor& linear_state_indices =
+      overrides != nullptr && overrides->linear_state_indices != nullptr
+          ? *overrides->linear_state_indices
+          : source.embedding.linear_state_indices;
+  const torch::Tensor& mtp_bootstrap_embeddings =
+      overrides != nullptr && overrides->mtp_bootstrap_embeddings != nullptr
+          ? *overrides->mtp_bootstrap_embeddings
+          : source.embedding.mtp_bootstrap_embeddings;
+  const torch::Tensor& expanded_kv_seq_lens =
+      overrides != nullptr && overrides->expanded_kv_seq_lens != nullptr
+          ? *overrides->expanded_kv_seq_lens
+          : source.graph.expanded_kv_seq_lens;
+  const torch::Tensor& num_accepted_tokens =
+      overrides != nullptr && overrides->num_accepted_tokens != nullptr
+          ? *overrides->num_accepted_tokens
+          : source.num_accepted_tokens;
+  return plan.add(input_embedding, &target.embedding.input_embedding) &&
+         plan.add(linear_state_indices,
                   &target.embedding.linear_state_indices) &&
-         plan.add(source.embedding.mtp_bootstrap_embeddings,
+         plan.add(mtp_bootstrap_embeddings,
                   &target.embedding.mtp_bootstrap_embeddings) &&
+         plan.add(source.embedding.predecessor_rows,
+                  &target.embedding.predecessor_rows) &&
+         plan.add(source.embedding.mtp_shifted_token_ids,
+                  &target.embedding.mtp_shifted_token_ids) &&
          plan.add(source.block_copy.src_block_indices,
                   &target.block_copy.src_block_indices) &&
          plan.add(source.block_copy.dst_block_indices,
                   &target.block_copy.dst_block_indices) &&
          plan.add(source.block_copy.cum_sum, &target.block_copy.cum_sum) &&
+         plan.add(source.parallel.dp_ep_padding_data.attn_padding_idx(),
+                  &target.parallel.dp_ep_padding_data.attn_padding_idx()) &&
+         plan.add(source.parallel.dp_ep_padding_data.attn_unpadding_idx(),
+                  &target.parallel.dp_ep_padding_data.attn_unpadding_idx()) &&
+         plan.add(source.parallel.dp_ep_padding_data.ffn_padding_idx(),
+                  &target.parallel.dp_ep_padding_data.ffn_padding_idx()) &&
+         plan.add(source.parallel.dp_ep_padding_data.ffn_unpadding_idx(),
+                  &target.parallel.dp_ep_padding_data.ffn_unpadding_idx()) &&
+         plan.add(source.parallel.dp_ep_padding_data
+                      .lm_head_skip_padding_token_indices(),
+                  &target.parallel.dp_ep_padding_data
+                       .lm_head_skip_padding_token_indices()) &&
+         plan.add(source.parallel.dp_ep_padding_data.gather_prenorm_idx(),
+                  &target.parallel.dp_ep_padding_data.gather_prenorm_idx()) &&
+         plan.add(source.parallel.dp_ep_padding_data.padding_idx(),
+                  &target.parallel.dp_ep_padding_data.padding_idx()) &&
+         plan.add(source.parallel.dp_ep_padding_data.un_padding_idx(),
+                  &target.parallel.dp_ep_padding_data.un_padding_idx()) &&
+         plan.add(source.parallel.dp_ep_padding_data.dynamic_ep_idx(),
+                  &target.parallel.dp_ep_padding_data.dynamic_ep_idx()) &&
+         plan.add(source.parallel.dp_ep_padding_data.moe_idx(),
+                  &target.parallel.dp_ep_padding_data.moe_idx()) &&
+         plan.add(source.parallel.dp_ep_padding_data.expert_array(),
+                  &target.parallel.dp_ep_padding_data.expert_array()) &&
+         plan.add(
+             source.parallel.dp_ep_padding_data.post_lmhead_gather_indices(),
+             &target.parallel.dp_ep_padding_data
+                  .post_lmhead_gather_indices()) &&
+         plan.add(source.expert.expert_array, &target.expert.expert_array) &&
+         plan.add(source.expert.eplb_decode_token_mask,
+                  &target.expert.eplb_decode_token_mask) &&
          plan.add(source.graph.attn_mask, &target.graph.attn_mask) &&
-         plan.add(source.graph.tiling_data, &target.graph.tiling_data);
+         plan.add(source.graph.tiling_data, &target.graph.tiling_data) &&
+         plan.add(expanded_kv_seq_lens, &target.graph.expanded_kv_seq_lens) &&
+         plan.add(source.graph.expanded_block_tables,
+                  &target.graph.expanded_block_tables) &&
+         plan.add(source.graph.expanded_paged_kv_indptr,
+                  &target.graph.expanded_paged_kv_indptr) &&
+         plan.add(source.graph.expanded_paged_kv_indices,
+                  &target.graph.expanded_paged_kv_indices) &&
+         plan.add(source.graph.expanded_paged_kv_last_page_len,
+                  &target.graph.expanded_paged_kv_last_page_len) &&
+         plan.add(source.graph.expanded_tiling_data,
+                  &target.graph.expanded_tiling_data) &&
+         plan.add(num_accepted_tokens, &target.num_accepted_tokens) &&
+         plan.add(source.mtp_shifted_token_ids, &target.mtp_shifted_token_ids);
 }
 
 inline torch::Tensor gather_tensor_by_indices(
@@ -517,6 +762,7 @@ struct ForwardInput {
     }
 
     const uint64_t total_bytes = plan.prepare_layout();
+    inputs.prepared_input_layout_signature = plan.layout_signature();
     if (total_bytes > 0) {
       inputs.input_host_buffer = plan.build_host_buffer(total_bytes);
       inputs.device_input_buffer =
@@ -543,6 +789,11 @@ struct ForwardInput {
     inputs.sample_prior_output_rows = sample_prior_output_rows;
     inputs.json_object_states = json_object_states;
     inputs.json_object_state_snapshots = json_object_state_snapshots;
+    inputs.prepared_input_layout_signature = prepared_input_layout_signature;
+    inputs.prepared_arena_h2d_bytes = prepared_arena_h2d_bytes;
+    inputs.prepared_arena_h2d_copies = prepared_arena_h2d_copies;
+    inputs.prepared_arena_d2d_bytes = prepared_arena_d2d_bytes;
+    inputs.prepared_arena_d2d_copies = prepared_arena_d2d_copies;
   }
 
   void set_host_views(ForwardInput& inputs) const {
@@ -629,6 +880,20 @@ struct ForwardInput {
   // already point to the device-side views for execution. Worker prepare can
   // then skip rebuilding/H2D in ForwardInput::to().
   bool device_tensors_ready = false;
+
+  // Stable fingerprint of the field offsets, dtypes, and shapes inside a
+  // PreparedInputArena. It lets Prepared Graph bind only captures whose tensor
+  // addresses have the same fixed layout.
+  uint64_t prepared_input_layout_signature = 0;
+
+  // Transfer volume submitted while binding this input to its fixed Prepared
+  // Arena. H2D includes aligned padding in Host-only ranges and skips explicit
+  // Device-source ranges. D2D covers only sources that cannot be reconstructed
+  // from Host.
+  uint64_t prepared_arena_h2d_bytes = 0;
+  int32_t prepared_arena_h2d_copies = 0;
+  uint64_t prepared_arena_d2d_bytes = 0;
+  int32_t prepared_arena_d2d_copies = 0;
 
   // new_cache_slots layout; flip after one-shot CP remap.
   KvSlotLayout kv_slot_layout = KvSlotLayout::LOGICAL_REAL;
